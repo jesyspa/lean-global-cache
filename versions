@@ -1,0 +1,10 @@
+# Lean/mathlib versions kept in the shared cache.
+#
+# One version per line (blank lines and # comments ignored). On deploy,
+# deploy.sh ensures each listed version is installed (idempotent — already
+# present versions are skipped). This is a floor, not an exact set: versions
+# installed ad-hoc via `lean-cache install` are left alone, never auto-removed.
+# Pruning is manual via `lean-cache uninstall`.
+
+4.28.0
+4.30.0

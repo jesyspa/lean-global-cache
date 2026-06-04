@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+# lean-cache — manage the shared Lean/mathlib package cache under /opt/bots/lean.
+#
+# The cache is single-writer: every file is owned by `hostbot` and is NOT
+# group-writable, so consuming bots can only read it and can never clobber it.
+# Mutating subcommands (install/uninstall) therefore re-exec themselves as
+# hostbot via sudo (see admin/install-sudoers.sh); read-only subcommands
+# (link/use/list/resolve) run as any bots-group user.
+#
+# Layout it manages:
+#   /opt/bots/lean/elan/                      ELAN_HOME (lean toolchains)
+#   /opt/bots/lean/lakes/<slug>/packages/     per-version package cache
+# where <slug> is the toolchain version with dots->dashes, e.g. v4-30-0.
+#
+# Consumers point a project's .lake/packages symlink at
+#   /opt/bots/lean/lakes/<slug>/packages
+# (use `lean-cache use` to set that up). Their own build artifacts live in the
+# project-local .lake/build, so read-only access to the cache is sufficient.
+
+set -euo pipefail
+
+# --- Constants ---------------------------------------------------------------
+
+OWNER="hostbot"
+ROOT="/opt/bots/lean"
+LAKES="$ROOT/lakes"
+export ELAN_HOME="$ROOT/elan"
+# Absolute path the sudoers rule pins; re-exec must use exactly this.
+INSTALLED_SELF="/opt/bots/bin/lean-cache"
+PATH="$ELAN_HOME/bin:$PATH"
+
+PROG="lean-cache"
+
+# --- Helpers -----------------------------------------------------------------
+
+die()  { echo "$PROG: $*" >&2; exit 1; }
+log()  { echo "==> $*" >&2; }
+
+usage() {
+  cat >&2 <<EOF
+Usage: $PROG <command> [args]
+
+  install <version>     Build & install a mathlib version into the shared cache.
+  uninstall <version>   Remove a version from the shared cache.
+  link <version>        Print the packages path to symlink a project's
+                        .lake/packages at.
+  use [version] [path]  Symlink .lake/packages of the project at <path> (default
+                        cwd) to the cache. Version defaults to the project's
+                        lean-toolchain. Also installs a post-checkout hook.
+  list                  List installed versions with disk usage.
+  resolve <version>     Print the normalized toolchain / rev / slug for a
+                        version string (no side effects).
+
+Version accepts: 4.30  4.30.0  v4.30.0  leanprover/lean4:v4.30.0  4.30.0-rc2
+EOF
+  exit "${1:-2}"
+}
+
+# Normalize a user-supplied version into its three canonical forms and set the
+# globals TCVER (v4.30.0), TOOLCHAIN (leanprover/lean4:v4.30.0), REV (v4.30.0),
+# SLUG (v4-30-0). "exact version" policy: major.minor is expanded to
+# major.minor.0; anything else is taken verbatim (incl. -rcN suffixes).
+normalize_version() {
+  local v="$1"
+  v="${v#leanprover/lean4:}"   # strip toolchain prefix if present
+  v="${v#v}"                   # strip leading v
+  [[ -n "$v" ]] || die "empty version"
+  # Expand bare major.minor (e.g. 4.30 -> 4.30.0), leaving rc suffixes alone.
+  if [[ "$v" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    v="$v.0"
+  fi
+  # Validate: X.Y.Z optionally followed by -rcN / -<word>.
+  [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]] \
+    || die "not a valid version: '$1'"
+  TCVER="v$v"
+  TOOLCHAIN="leanprover/lean4:v$v"
+  REV="v$v"
+  SLUG="v${v//./-}"
+}
+
+dest_for()     { echo "$LAKES/$1"; }          # arg: slug
+packages_for() { echo "$LAKES/$1/packages"; } # arg: slug
+
+# Re-exec the current invocation as the cache owner. Used by mutating commands.
+require_owner() {
+  if [[ "$(id -un)" != "$OWNER" ]]; then
+    [[ -x "$INSTALLED_SELF" ]] \
+      || die "must run as $OWNER and $INSTALLED_SELF is not installed"
+    log "re-executing as $OWNER via sudo"
+    exec sudo -n -u "$OWNER" "$INSTALLED_SELF" "$@"
+  fi
+}
+
+# Force cache contents to: owner-writable, group/other read+traverse only,
+# setgid on dirs so files land in group `bots`. This is the deterministic pass
+# that replaces the per-session umask lottery.
+normalize_perms() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 0
+  chmod -R u=rwX,go=rX "$dir"
+  find "$dir" -type d -exec chmod g+s {} +
+}
+
+# --- Commands ----------------------------------------------------------------
+
+cmd_resolve() {
+  [[ $# -eq 1 ]] || usage
+  normalize_version "$1"
+  echo "toolchain: $TOOLCHAIN"
+  echo "rev:       $REV"
+  echo "slug:      $SLUG"
+  echo "packages:  $(packages_for "$SLUG")"
+}
+
+cmd_link() {
+  [[ $# -eq 1 ]] || usage
+  normalize_version "$1"
+  local pkgs; pkgs="$(packages_for "$SLUG")"
+  [[ -d "$pkgs" ]] || die "version $TCVER is not installed (no $pkgs)"
+  echo "$pkgs"
+}
+
+cmd_list() {
+  [[ -d "$LAKES" ]] || { echo "(no versions installed)"; return 0; }
+  local found=0 d slug
+  for d in "$LAKES"/*/; do
+    [[ -d "${d}packages" ]] || continue
+    slug="$(basename "$d")"
+    found=1
+    printf '%s\t%s\n' "$(du -sh "${d}packages" 2>/dev/null | cut -f1)" "$slug"
+  done
+  [[ "$found" -eq 1 ]] || echo "(no versions installed)"
+}
+
+cmd_install() {
+  [[ $# -eq 1 ]] || usage
+  normalize_version "$1"
+  require_owner install "$1"
+
+  umask 022
+  local dest pkgs; dest="$(dest_for "$SLUG")"; pkgs="$(packages_for "$SLUG")"
+
+  if [[ -d "$pkgs" ]]; then
+    log "$TCVER already installed at $pkgs (nothing to do)"
+    return 0
+  fi
+
+  # Serialize installs of the same version.
+  mkdir -p "$LAKES"
+  exec 9>"$LAKES/.$SLUG.lock"
+  flock -n 9 || die "another install of $SLUG is in progress"
+
+  log "ensuring toolchain $TOOLCHAIN"
+  elan toolchain install "$TOOLCHAIN"
+
+  # Build in a temp project on the SAME filesystem as $dest so the final move
+  # is atomic.
+  local build
+  build="$(mktemp -d "$LAKES/.build.$SLUG.XXXXXX")"
+  trap 'rm -rf "$build"' EXIT
+
+  printf '%s\n' "$TOOLCHAIN" > "$build/lean-toolchain"
+  cat > "$build/lakefile.toml" <<EOF
+name = "leancache"
+defaultTargets = []
+
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4"
+rev = "$REV"
+EOF
+
+  log "resolving mathlib $REV and its dependency closure (lake update)"
+  ( cd "$build" && lake update mathlib )
+
+  log "fetching prebuilt oleans (lake exe cache get)"
+  ( cd "$build" && lake exe cache get )
+
+  # Integrity check: mathlib oleans must be present, else the cache is useless.
+  local olean_count
+  olean_count="$(find "$build/.lake/packages/mathlib/.lake/build" -name '*.olean' 2>/dev/null | head -n 1000 | wc -l)"
+  [[ "$olean_count" -gt 0 ]] || die "no mathlib oleans after cache get — aborting"
+
+  log "publishing to $pkgs"
+  mkdir -p "$dest"
+  local incoming="$dest/.packages.incoming.$$"
+  rm -rf "$incoming"
+  mv "$build/.lake/packages" "$incoming"
+  normalize_perms "$incoming"
+  mv "$incoming" "$pkgs"          # atomic swap into place
+
+  rm -rf "$build"; trap - EXIT
+  normalize_perms "$dest"
+  log "installed $TCVER -> $pkgs"
+}
+
+cmd_uninstall() {
+  [[ $# -eq 1 ]] || usage
+  normalize_version "$1"
+  require_owner uninstall "$1"
+
+  local dest; dest="$(dest_for "$SLUG")"
+  [[ -d "$dest" ]] || { log "$TCVER not installed (nothing to do)"; return 0; }
+  local dest_owner; dest_owner="$(stat -c '%U' "$dest")"
+  [[ "$dest_owner" == "$OWNER" ]] \
+    || die "$dest is owned by $dest_owner, not $OWNER — refusing to remove"
+  log "removing $dest"
+  rm -rf "$dest"
+  log "uninstalled $TCVER"
+}
+
+cmd_use() {
+  [[ $# -le 2 ]] || usage
+  local version="" proj="."
+  # Args: [version] [path]. A single arg is a path if it's an existing dir or
+  # ".", otherwise a version. (Two args are unambiguous: version then path.)
+  if [[ $# -ge 1 ]]; then
+    if [[ -d "$1" || "$1" == "." ]]; then proj="$1"
+    else version="$1"; fi
+  fi
+  [[ $# -eq 2 ]] && proj="$2"
+  proj="$(cd "$proj" && pwd)" || die "no such directory"
+
+  if [[ -z "$version" ]]; then
+    [[ -f "$proj/lean-toolchain" ]] \
+      || die "no version given and no $proj/lean-toolchain to derive it from"
+    version="$(cat "$proj/lean-toolchain")"
+  fi
+  normalize_version "$version"
+  local pkgs; pkgs="$(packages_for "$SLUG")"
+  [[ -d "$pkgs" ]] || die "version $TCVER is not installed; run: $PROG install $TCVER"
+
+  mkdir -p "$proj/.lake"
+  ln -sfn "$pkgs" "$proj/.lake/packages"
+  log "linked $proj/.lake/packages -> $pkgs"
+  install_hook "$proj"
+}
+
+# Install a post-checkout hook so new worktrees re-establish the symlink.
+install_hook() {
+  local proj="$1" gitdir hook
+  gitdir="$(git -C "$proj" rev-parse --git-common-dir 2>/dev/null)" || return 0
+  [[ "$gitdir" = /* ]] || gitdir="$proj/$gitdir"
+  hook="$gitdir/hooks/post-checkout"
+  [[ -e "$hook" ]] && return 0
+  mkdir -p "$gitdir/hooks"
+  cat > "$hook" <<'HOOKEOF'
+#!/usr/bin/env bash
+# Re-link .lake/packages to the shared Lean cache after checkout.
+# Installed by `lean-cache use`.
+root="$(git rev-parse --show-toplevel)"
+if [[ -f "$root/lean-toolchain" && ! -L "$root/.lake/packages" ]]; then
+  /opt/bots/bin/lean-cache use "$root" >/dev/null 2>&1 || true
+fi
+HOOKEOF
+  chmod +x "$hook"
+  log "installed post-checkout hook: $hook"
+}
+
+# --- Dispatch ----------------------------------------------------------------
+
+[[ $# -ge 1 ]] || usage
+cmd="$1"; shift
+case "$cmd" in
+  install)   cmd_install   "$@" ;;
+  uninstall) cmd_uninstall "$@" ;;
+  link)      cmd_link      "$@" ;;
+  use)       cmd_use       "$@" ;;
+  list)      cmd_list      "$@" ;;
+  resolve)   cmd_resolve   "$@" ;;
+  -h|--help|help) usage 0 ;;
+  *) die "unknown command: $cmd (try --help)" ;;
+esac

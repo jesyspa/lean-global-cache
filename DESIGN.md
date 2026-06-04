@@ -36,13 +36,14 @@ subcommands run unprivileged.
 
 ### Why read-only is enough for consumers
 
-A consuming project symlinks its `.lake/packages` at the shared
-`lakes/<slug>/packages`. Lake reads mathlib's prebuilt oleans from there but
-writes the project's *own* build artifacts into the project-local `.lake/build`.
-Nothing in a normal consumer build needs to write into `packages/`. The cases
-that used to write there — `lake update`, `cache get`, dependency rebuilds —
-are exactly the clobbering we are removing; under this model they happen once,
-at install time, performed by the owner.
+A consuming project overlays its `.lake/packages` onto the shared
+`lakes/<slug>/packages` (see "Consumer overlay" below). Lake reads mathlib's
+prebuilt oleans from the shared tree but writes the project's *own* build
+artifacts into the project-local `.lake/build`. Nothing in a normal consumer
+build needs to write into the shared `packages/`. The cases that used to write
+there — `lake update`, `cache get`, dependency rebuilds — are exactly the
+clobbering we are removing; under this model they happen once, at install time,
+performed by the owner.
 
 A direct consequence worth stating: a project pinned to a mathlib rev/toolchain
 that is **not installed** will no longer silently rebuild into the shared tree.
@@ -68,6 +69,31 @@ best-effort — which is the intended outcome.
    permissions.
 
 Idempotent: a version that already exists is a no-op.
+
+## Consumer overlay
+
+`lean-cache use` does **not** make `.lake/packages` a single symlink to the
+shared tree. Instead it builds an *overlay*: `.lake/packages` is a real
+directory holding one symlink per shared package
+(`.lake/packages/mathlib -> .../lakes/<slug>/packages/mathlib`, etc.). The
+directory itself is project-owned and writable, so a project that requires
+packages beyond mathlib's closure lets `lake` clone those in alongside the
+symlinks; they live in the project, not the shared cache, so they never collide
+with another project's revs. This was chosen over installing extras into the
+shared cache precisely to avoid cross-project conflicts.
+
+`use` is idempotent and version-aware:
+
+- A legacy whole-directory symlink (or `--clean`) is replaced with a fresh
+  overlay.
+- Symlinks pointing into *any* shared cache are dropped and recreated from the
+  current version's tree, so a toolchain bump repoints cleanly and removed
+  packages disappear.
+- A package name the project provides as its own *real* directory is treated as
+  an intentional override/extra and left untouched.
+
+A post-checkout hook re-runs `use` so fresh worktrees re-establish the overlay
+automatically.
 
 ## Version normalization
 
@@ -100,14 +126,13 @@ cache or the network.
 
 ## Known limitations / open points
 
-- **Mathlib closure only.** `install` provisions mathlib and its transitive
-  dependencies. A project that requires *extra* packages not in that closure
-  (e.g. a standalone `Cli`) cannot add them to the read-only shared cache the
-  way it used to. Such projects need those deps provided another way. If this
-  becomes common, the manifest could grow per-version "extra package" lists.
-- **Orphan RC toolchains.** `v4.29.0-rc7` and `v4.30.0-rc2` exist under
-  `elan/toolchains` with no corresponding lake cache. Left in place for now;
-  drop if confirmed unused.
+- **Shared cache is the mathlib closure.** `install` provisions mathlib and its
+  transitive dependencies. Packages beyond that closure are handled per-project
+  by the consumer overlay (above), not added to the shared cache — so they
+  cost a few project-local symlinks and a local clone, never a shared-tree
+  conflict.
+- **Orphan RC toolchains.** `v4.29.0-rc7` and `v4.30.0-rc2` are dropped by
+  `admin/migrate-ownership.sh` (no corresponding lake cache).
 - **Disk.** Each version is ~7–9 GB. No automatic GC; `uninstall` is manual.
 - **Toolchain reuse.** `uninstall` removes a version's packages but leaves its
   elan toolchain (cheap, possibly shared). A `--purge-toolchain` flag could be

@@ -39,10 +39,19 @@ from any bots-group user while always producing hostbot-owned files. `link`,
 
 ```bash
 cd ~/dev/my-lean-project          # has a lean-toolchain file
-lean-cache use                    # links .lake/packages to the shared cache
+lean-cache use                    # overlays .lake/packages onto the shared cache
 lake exe cache get                # near-instant; oleans already present
 lake build                        # builds your code into project-local .lake/build
 ```
+
+`use` makes `.lake/packages` a real directory containing one symlink per shared
+package (mathlib + its closure). Because the directory itself is writable, a
+project that requires extra packages beyond mathlib's closure can let `lake`
+clone them in alongside the symlinks — those live in the project, so they never
+conflict with other projects in the read-only shared tree. Re-running `use`
+repoints the shared symlinks (e.g. after a version bump) and leaves the
+project's own package dirs untouched; `lean-cache use --clean` rebuilds the
+overlay from scratch.
 
 Your project's own build artifacts live in `.lake/build`; only mathlib's
 prebuilt oleans are read from the shared cache, so read-only access is enough.

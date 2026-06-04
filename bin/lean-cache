@@ -209,8 +209,22 @@ cmd_uninstall() {
   log "uninstalled $TCVER"
 }
 
+# Build an overlay: .lake/packages is a real directory holding one symlink per
+# shared package, leaving the project free to add its own extra packages
+# alongside (lake writes those as real dirs). This keeps the shared cache
+# read-only while letting projects carry deps beyond mathlib's closure — with
+# no risk of cross-project rev conflicts in the shared tree.
 cmd_use() {
+  local clean=0 rest=()
+  for a in "$@"; do
+    case "$a" in
+      --clean) clean=1 ;;
+      *) rest+=("$a") ;;
+    esac
+  done
+  set -- ${rest[@]+"${rest[@]}"}
   [[ $# -le 2 ]] || usage
+
   local version="" proj="."
   # Args: [version] [path]. A single arg is a path if it's an existing dir or
   # ".", otherwise a version. (Two args are unambiguous: version then path.)
@@ -227,16 +241,39 @@ cmd_use() {
     version="$(cat "$proj/lean-toolchain")"
   fi
   normalize_version "$version"
-  local pkgs; pkgs="$(packages_for "$SLUG")"
-  [[ -d "$pkgs" ]] || die "version $TCVER is not installed; run: $PROG install $TCVER"
+  local shared; shared="$(packages_for "$SLUG")"
+  [[ -d "$shared" ]] || die "version $TCVER is not installed; run: $PROG install $TCVER"
 
-  mkdir -p "$proj/.lake"
-  ln -sfn "$pkgs" "$proj/.lake/packages"
-  log "linked $proj/.lake/packages -> $pkgs"
+  local pkgdir="$proj/.lake/packages"
+  # Replace a legacy whole-dir symlink, or wipe entirely with --clean.
+  if [[ -L "$pkgdir" ]] || { [[ "$clean" -eq 1 && -e "$pkgdir" ]]; }; then
+    rm -rf "$pkgdir"
+  fi
+  mkdir -p "$pkgdir"
+
+  # Drop stale symlinks pointing into any shared cache, so a version switch
+  # repoints cleanly and dropped packages disappear. The project's own real
+  # package dirs are left untouched.
+  local ent
+  for ent in "$pkgdir"/* "$pkgdir"/.[!.]*; do
+    [[ -L "$ent" && "$(readlink "$ent")" == "$LAKES/"* ]] && rm -f "$ent"
+  done
+
+  # Link each shared package in, unless the project already provides its own
+  # real directory of that name (an intentional override or extra).
+  local pkg name linked=0
+  for pkg in "$shared"/*/; do
+    name="$(basename "$pkg")"
+    [[ -e "$pkgdir/$name" && ! -L "$pkgdir/$name" ]] && continue
+    ln -sfn "${pkg%/}" "$pkgdir/$name"
+    linked=$((linked + 1))
+  done
+
+  log "overlaid $linked shared package(s) into $pkgdir (-> $shared)"
   install_hook "$proj"
 }
 
-# Install a post-checkout hook so new worktrees re-establish the symlink.
+# Install a post-checkout hook so new worktrees re-establish the overlay.
 install_hook() {
   local proj="$1" gitdir hook
   gitdir="$(git -C "$proj" rev-parse --git-common-dir 2>/dev/null)" || return 0
@@ -246,10 +283,10 @@ install_hook() {
   mkdir -p "$gitdir/hooks"
   cat > "$hook" <<'HOOKEOF'
 #!/usr/bin/env bash
-# Re-link .lake/packages to the shared Lean cache after checkout.
-# Installed by `lean-cache use`.
+# Re-establish the .lake/packages overlay onto the shared Lean cache after
+# checkout. Installed by `lean-cache use`.
 root="$(git rev-parse --show-toplevel)"
-if [[ -f "$root/lean-toolchain" && ! -L "$root/.lake/packages" ]]; then
+if [[ -f "$root/lean-toolchain" ]]; then
   /opt/bots/bin/lean-cache use "$root" >/dev/null 2>&1 || true
 fi
 HOOKEOF

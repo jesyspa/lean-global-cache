@@ -150,14 +150,18 @@ cmd_install() {
   exec 9>"$LAKES/.$SLUG.lock"
   flock -n 9 || die "another install of $SLUG is in progress"
 
+  # Clear stale build dirs from a previously-interrupted install of this version
+  # (safe under the lock — only this slug's build dirs are touched).
+  rm -rf "$LAKES"/.build."$SLUG".* 2>/dev/null || true
+
   log "ensuring toolchain $TOOLCHAIN"
   elan toolchain install "$TOOLCHAIN"
 
   # Build in a temp project on the SAME filesystem as $dest so the final move
-  # is atomic.
-  local build
+  # is atomic. `build` is intentionally NOT `local`: the EXIT trap runs in
+  # global scope, where a local would be invisible (and would trip `set -u`).
   build="$(mktemp -d "$LAKES/.build.$SLUG.XXXXXX")"
-  trap 'rm -rf "$build"' EXIT
+  trap 'rm -rf "${build:-}"' EXIT
 
   printf '%s\n' "$TOOLCHAIN" > "$build/lean-toolchain"
   cat > "$build/lakefile.toml" <<EOF
@@ -173,13 +177,23 @@ EOF
   log "resolving mathlib $REV and its dependency closure (lake update)"
   ( cd "$build" && lake update mathlib )
 
+  # `lake update`'s post-update hook already runs a cache fetch, so this explicit
+  # `cache get` is often a no-op and can exit nonzero ("No files to download").
+  # That's not a failure — the olean integrity check below is the real gate, so
+  # don't let a benign nonzero exit abort the install under `set -e`.
   log "fetching prebuilt oleans (lake exe cache get)"
-  ( cd "$build" && lake exe cache get )
+  ( cd "$build" && lake exe cache get ) \
+    || log "cache get exited nonzero; verifying oleans directly"
 
   # Integrity check: mathlib oleans must be present, else the cache is useless.
-  local olean_count
-  olean_count="$(find "$build/.lake/packages/mathlib/.lake/build" -name '*.olean' 2>/dev/null | head -n 1000 | wc -l)"
-  [[ "$olean_count" -gt 0 ]] || die "no mathlib oleans after cache get — aborting"
+  # `-print -quit` stops at the first match, so there's no pipe (a `… | head`
+  # would SIGPIPE find and, under pipefail+set -e, abort the whole install).
+  local first_olean
+  first_olean="$(find "$build/.lake/packages/mathlib/.lake/build" -name '*.olean' -print -quit 2>/dev/null)"
+  [[ -n "$first_olean" ]] || die "no mathlib oleans after cache get — aborting"
+
+  [[ -d "$build/.lake/packages" ]] \
+    || die "lake produced no .lake/packages directory — aborting"
 
   log "publishing to $pkgs"
   mkdir -p "$dest"

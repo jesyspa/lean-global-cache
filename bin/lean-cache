@@ -154,8 +154,14 @@ cmd_install() {
   # (safe under the lock — only this slug's build dirs are touched).
   rm -rf "$LAKES"/.build."$SLUG".* 2>/dev/null || true
 
+  # `elan toolchain install` errors (nonzero) if the toolchain already exists,
+  # which would abort under `set -e`; only install when it's actually missing.
   log "ensuring toolchain $TOOLCHAIN"
-  elan toolchain install "$TOOLCHAIN"
+  if elan toolchain list 2>/dev/null | grep -qxF "$TOOLCHAIN"; then
+    log "toolchain $TOOLCHAIN already present"
+  else
+    elan toolchain install "$TOOLCHAIN"
+  fi
 
   # Build in a temp project on the SAME filesystem as $dest so the final move
   # is atomic. `build` is intentionally NOT `local`: the EXIT trap runs in

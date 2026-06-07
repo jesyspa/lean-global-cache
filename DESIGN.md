@@ -92,8 +92,34 @@ shared cache precisely to avoid cross-project conflicts.
 - A package name the project provides as its own *real* directory is treated as
   an intentional override/extra and left untouched.
 
-A post-checkout hook re-runs `use` so fresh worktrees re-establish the overlay
-automatically.
+### Keeping the overlay fresh across git operations
+
+The overlay is toolchain-specific: it points at `lakes/<slug>/packages`, and a
+commit that changes `lean-toolchain` needs the overlay repointed at the new
+slug, or lake sees the deps as missing and tries (and fails) to fetch them.
+`use` installs git hooks that repoint automatically. They all funnel through
+`lean-cache refresh`, which compares the slug embedded in the live overlay
+(`readlink .lake/packages/mathlib`) against the slug the current `lean-toolchain`
+normalizes to and re-overlays only on a mismatch. The check reads a single
+symlink — no fetch, no guess — so it is cheap enough to run on every ref update.
+
+Two stock hooks are installed:
+
+- **post-checkout** — `git checkout` / `switch` / `worktree add`.
+- **reference-transaction** — the only stock hook that also fires on
+  `git reset --hard` and `git cherry-pick`, which post-checkout never sees. It
+  fires on nearly every ref update (and several times per operation), so the
+  hook itself filters to the `committed` phase of a HEAD-or-local-branch update
+  and otherwise exits immediately; `refresh`'s staleness check is the second
+  cheap gate. Because it also covers rebase and `commit --amend` (both move a
+  local branch), no separate `post-rewrite` hook is installed.
+
+Both hooks no-op outside a Lean project and while the CLI is mid-overlay
+(`LEAN_CACHE_NO_HOOK`), so they can never recurse through their own ref updates.
+
+Each hook carries a sentinel comment line. Re-running `use` regenerates the
+hooks it owns — and upgrades a pre-sentinel legacy `post-checkout` hook in
+place — but never overwrites a hook some other tool installed.
 
 ## Version normalization
 

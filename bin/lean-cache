@@ -22,12 +22,18 @@ set -euo pipefail
 # --- Constants ---------------------------------------------------------------
 
 OWNER="hostbot"
-ROOT="/opt/bots/lean"
+# LEAN_CACHE_ROOT lets the test suite point the whole layout at a throwaway
+# directory; in production it is unset and the cache lives under /opt/bots/lean.
+ROOT="${LEAN_CACHE_ROOT:-/opt/bots/lean}"
 LAKES="$ROOT/lakes"
 export ELAN_HOME="$ROOT/elan"
 # Absolute path the sudoers rule pins; re-exec must use exactly this.
 INSTALLED_SELF="/opt/bots/bin/lean-cache"
 PATH="$ELAN_HOME/bin:$PATH"
+
+# Path the installed hooks invoke to refresh the overlay. Overridable so the
+# test suite can drive its in-tree copy; defaults to the deployed CLI.
+HOOK_BIN="${LEAN_CACHE_BIN:-/opt/bots/bin/lean-cache}"
 
 PROG="lean-cache"
 
@@ -46,7 +52,10 @@ Usage: $PROG <command> [args]
                         .lake/packages at.
   use [version] [path]  Symlink .lake/packages of the project at <path> (default
                         cwd) to the cache. Version defaults to the project's
-                        lean-toolchain. Also installs a post-checkout hook.
+                        lean-toolchain. Also installs the overlay git hooks.
+  refresh [path]        Re-overlay only if the live overlay's toolchain differs
+                        from the project's lean-toolchain (a cheap no-op
+                        otherwise). This is what the git hooks call.
   list                  List installed versions with disk usage.
   resolve <version>     Print the normalized toolchain / rev / slug for a
                         version string (no side effects).
@@ -235,6 +244,10 @@ cmd_uninstall() {
 # read-only while letting projects carry deps beyond mathlib's closure — with
 # no risk of cross-project rev conflicts in the shared tree.
 cmd_use() {
+  # Suppress the overlay hooks for any git command we run while overlaying, so a
+  # re-overlay can never recurse back into itself through a ref update.
+  export LEAN_CACHE_NO_HOOK=1
+
   local clean=0 rest=()
   for a in "$@"; do
     case "$a" in
@@ -290,28 +303,96 @@ cmd_use() {
   done
 
   log "overlaid $linked shared package(s) into $pkgdir (-> $shared)"
-  install_hook "$proj"
+  install_hooks "$proj"
 }
 
-# Install a post-checkout hook so new worktrees re-establish the overlay.
-install_hook() {
-  local proj="$1" gitdir hook
+# Print the cache slug embedded in the live overlay's mathlib symlink, or
+# nothing if the overlay is absent, legacy (a whole-dir symlink), or otherwise
+# not pointing into the shared cache. This is the cheap staleness signal the
+# hooks rely on: it reads one symlink target and never fetches or guesses.
+live_overlay_slug() {
+  local link; link="$(readlink "$1/mathlib" 2>/dev/null || true)"
+  [[ "$link" == "$LAKES/"* ]] || return 0
+  link="${link#"$LAKES"/}"
+  printf '%s' "${link%%/*}"
+}
+
+# Re-overlay the project only when its live overlay is stale — i.e. points at a
+# different toolchain than the one its lean-toolchain now pins (or has no overlay
+# yet). On a match this is a one-symlink-read no-op, which is what makes it safe
+# to call from a high-frequency hook. A non-Lean project is silently skipped.
+cmd_refresh() {
+  [[ $# -le 1 ]] || usage
+  export LEAN_CACHE_NO_HOOK=1
+  local proj="${1:-.}"
+  proj="$(cd "$proj" 2>/dev/null && pwd)" || return 0
+  [[ -f "$proj/lean-toolchain" ]] || return 0
+  normalize_version "$(cat "$proj/lean-toolchain")"
+  [[ "$(live_overlay_slug "$proj/.lake/packages")" == "$SLUG" ]] && return 0
+  cmd_use "$proj"
+}
+
+# Marker on every hook this CLI writes, so a later `use` may regenerate its own
+# hooks while never touching a hook some other tool installed.
+HOOK_SENTINEL="lean-cache-managed-hook"
+
+# True if $1 is a hook we own: either it carries the current sentinel, or it is
+# a pre-sentinel legacy post-checkout hook (recognized by its body) that we
+# should upgrade in place.
+hook_is_ours() {
+  grep -qF "$HOOK_SENTINEL" "$1" 2>/dev/null && return 0
+  grep -qF "Re-establish the .lake/packages overlay" "$1" 2>/dev/null
+}
+
+# Write our version of a single hook unless a foreign hook already occupies the
+# slot. Idempotent: regenerating an unchanged hook leaves identical bytes.
+install_one_hook() {
+  local hook="$1" body="$2"
+  if [[ -e "$hook" ]] && ! hook_is_ours "$hook"; then
+    log "leaving foreign hook untouched: $hook"
+    return 0
+  fi
+  printf '%s\n' "$body" > "$hook"
+  chmod +x "$hook"
+}
+
+# Install the overlay-maintenance hooks into the project's (worktree-shared)
+# hooks directory:
+#   post-checkout         — checkout, switch, worktree-add
+#   reference-transaction — the only stock hook that also fires on
+#                           `git reset --hard` and `git cherry-pick`; it covers
+#                           rebase/amend too, so no separate post-rewrite hook
+#                           is needed.
+# Both defer to `lean-cache refresh`, whose staleness check keeps the
+# high-frequency reference-transaction path a cheap no-op.
+install_hooks() {
+  local proj="$1" gitdir
   gitdir="$(git -C "$proj" rev-parse --git-common-dir 2>/dev/null)" || return 0
   [[ "$gitdir" = /* ]] || gitdir="$proj/$gitdir"
-  hook="$gitdir/hooks/post-checkout"
-  [[ -e "$hook" ]] && return 0
   mkdir -p "$gitdir/hooks"
-  cat > "$hook" <<'HOOKEOF'
-#!/usr/bin/env bash
-# Re-establish the .lake/packages overlay onto the shared Lean cache after
-# checkout. Installed by `lean-cache use`.
-root="$(git rev-parse --show-toplevel)"
-if [[ -f "$root/lean-toolchain" ]]; then
-  /opt/bots/bin/lean-cache use "$root" >/dev/null 2>&1 || true
-fi
-HOOKEOF
-  chmod +x "$hook"
-  log "installed post-checkout hook: $hook"
+
+  install_one_hook "$gitdir/hooks/post-checkout" "#!/usr/bin/env bash
+# $HOOK_SENTINEL: re-establish the .lake/packages overlay after checkout.
+[[ -n \"\${LEAN_CACHE_NO_HOOK:-}\" ]] && exit 0
+root=\"\$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0
+[[ -f \"\$root/lean-toolchain\" ]] || exit 0
+\"\${LEAN_CACHE_BIN:-$HOOK_BIN}\" refresh \"\$root\" >/dev/null 2>&1 || true"
+
+  install_one_hook "$gitdir/hooks/reference-transaction" "#!/usr/bin/env bash
+# $HOOK_SENTINEL: re-establish the .lake/packages overlay when HEAD or a local
+# branch moves — covers \`git reset --hard\` and \`git cherry-pick\`, which
+# post-checkout misses. Drains stdin and acts only on the committed phase for a
+# HEAD/branch update, so unrelated ref churn (fetches, tags) stays a no-op.
+[[ -n \"\${LEAN_CACHE_NO_HOOK:-}\" ]] && { cat >/dev/null 2>&1; exit 0; }
+state=\"\$1\"
+relevant=0
+while read -r _old _new ref; do
+  case \"\$ref\" in HEAD|refs/heads/*) relevant=1 ;; esac
+done
+[[ \"\$state\" == committed && \"\$relevant\" -eq 1 ]] || exit 0
+root=\"\$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0
+[[ -f \"\$root/lean-toolchain\" ]] || exit 0
+\"\${LEAN_CACHE_BIN:-$HOOK_BIN}\" refresh \"\$root\" >/dev/null 2>&1 || true"
 }
 
 # --- Dispatch ----------------------------------------------------------------
@@ -323,6 +404,7 @@ case "$cmd" in
   uninstall) cmd_uninstall "$@" ;;
   link)      cmd_link      "$@" ;;
   use)       cmd_use       "$@" ;;
+  refresh)   cmd_refresh   "$@" ;;
   list)      cmd_list      "$@" ;;
   resolve)   cmd_resolve   "$@" ;;
   -h|--help|help) usage 0 ;;

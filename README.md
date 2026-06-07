@@ -23,6 +23,7 @@ lean-cache install <version>     # build & install a mathlib version
 lean-cache uninstall <version>   # remove a version
 lean-cache link <version>        # print the packages path to symlink against
 lean-cache use [version] [path]  # set up .lake/packages in a project
+lean-cache refresh [path]        # re-overlay only if the toolchain changed
 lean-cache list                  # installed versions + sizes
 lean-cache resolve <version>     # show normalized toolchain/rev/slug
 ```
@@ -33,7 +34,8 @@ otherwise the version is exact (no "latest patch" resolution).
 
 `install` and `uninstall` re-exec themselves as `hostbot` via sudo, so they work
 from any bots-group user while always producing hostbot-owned files. `link`,
-`use`, `list`, and `resolve` are read-only and need no privilege.
+`use`, `refresh`, `list`, and `resolve` only read the shared cache (writing at
+most into the consuming project) and need no privilege.
 
 ### Consuming the cache from a project
 
@@ -52,6 +54,12 @@ conflict with other projects in the read-only shared tree. Re-running `use`
 repoints the shared symlinks (e.g. after a version bump) and leaves the
 project's own package dirs untouched; `lean-cache use --clean` rebuilds the
 overlay from scratch.
+
+`use` also installs git hooks (`post-checkout` and `reference-transaction`) that
+repoint the overlay automatically whenever HEAD moves to a commit pinning a
+different toolchain — including via `git reset --hard` and `git cherry-pick`.
+They call `lean-cache refresh`, which re-overlays only on an actual toolchain
+mismatch and is otherwise a cheap no-op. See [DESIGN.md](DESIGN.md) for details.
 
 Your project's own build artifacts live in `.lake/build`; only mathlib's
 prebuilt oleans are read from the shared cache, so read-only access is enough.

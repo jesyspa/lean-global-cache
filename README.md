@@ -1,7 +1,7 @@
 # lean-global-cache
 
-Owns the shared Lean/mathlib package cache under `/opt/bots/lean` and exposes a
-CLI (`lean-cache`) that bots use to install, remove, and link mathlib versions.
+Owns a shared Lean/mathlib package cache and exposes a CLI (`lean-cache`) that
+bots use to install, remove, and link mathlib versions.
 
 ## Why
 
@@ -11,10 +11,10 @@ publish each version. Bots wrote into it directly — stray `lake update`/
 and a publish under the wrong umask once left an entire version unreadable to
 the rest of the group.
 
-This repo makes the cache **single-writer**: every file is owned by `hostbot`
-and is not group-writable. Consumers can only read it, so they cannot clobber
-it. All mutation goes through one CLI that applies a deterministic umask and
-permission pass every time.
+This repo makes the cache **single-writer**: every file is owned by the
+configured owner and is not group-writable. Consumers can only read it, so
+they cannot clobber it. All mutation goes through one CLI that applies a
+deterministic umask and permission pass every time.
 
 ## CLI
 
@@ -26,16 +26,19 @@ lean-cache use [version] [path]  # set up .lake/packages in a project
 lean-cache refresh [path]        # re-overlay only if the toolchain changed
 lean-cache list                  # installed versions + sizes
 lean-cache resolve <version>     # show normalized toolchain/rev/slug
+lean-cache config                # show resolved owner/group/root/bin
 ```
 
 `<version>` accepts `4.30`, `4.30.0`, `v4.30.0`, `leanprover/lean4:v4.30.0`, or
 an RC like `4.30.0-rc2`. Bare `major.minor` expands to `major.minor.0`;
 otherwise the version is exact (no "latest patch" resolution).
 
-`install` and `uninstall` re-exec themselves as `hostbot` via sudo, so they work
-from any bots-group user while always producing hostbot-owned files. `link`,
-`use`, `refresh`, `list`, and `resolve` only read the shared cache (writing at
-most into the consuming project) and need no privilege.
+`install` and `uninstall` re-exec themselves as the cache owner via sudo on a
+multi-user host, so they work from any group member while always producing
+owner-owned files. On a single-user host the current user IS the owner, so no
+sudo is needed. `link`, `use`, `refresh`, `list`, `config`, and `resolve` only
+read the shared cache (writing at most into the consuming project) and need no
+privilege.
 
 ### Consuming the cache from a project
 
@@ -67,21 +70,55 @@ prebuilt oleans are read from the shared cache, so read-only access is enough.
 ## Layout it manages
 
 ```
-/opt/bots/lean/elan/                    ELAN_HOME — lean toolchains
-/opt/bots/lean/lakes/<slug>/packages/   per-version package cache (mathlib + deps)
+<root>/elan/                    ELAN_HOME — lean toolchains
+<root>/lakes/<slug>/packages/   per-version package cache (mathlib + deps)
 ```
 
-`<slug>` is the toolchain version with dots replaced by dashes, e.g.
-`v4-30-0`. Consumers symlink `.lake/packages` at
-`/opt/bots/lean/lakes/<slug>/packages`.
+`<slug>` is the toolchain version with dots replaced by dashes, e.g. `v4-30-0`.
+Consumers symlink `.lake/packages` at `<root>/lakes/<slug>/packages`.
+
+On the fleet these paths are under `/opt/bots/lean` (see [Configuration](#configuration)).
+
+## Configuration
+
+Four settings control the host layout:
+
+| Setting | Env var             | Default (single-user)                              |
+|---------|---------------------|----------------------------------------------------|
+| OWNER   | LEAN_CACHE_OWNER    | current user (`id -un`)                            |
+| GROUP   | LEAN_CACHE_GROUP    | current group (`id -gn`)                           |
+| ROOT    | LEAN_CACHE_ROOT     | `$HOME/.local/share/lean-global-cache`             |
+| BIN     | LEAN_CACHE_BIN      | realpath of the running `lean-cache` script itself |
+
+**Precedence:** env var > config file > built-in default.
+
+**Config file:** sourced if readable at `${LEAN_CACHE_CONF:-/etc/lean-cache.conf}`.
+It may set any subset of `OWNER`, `GROUP`, `ROOT`, `BIN` as plain shell
+assignments. See [`lean-cache.conf.example`](lean-cache.conf.example) for the
+fleet's values.
+
+**Single-user host:** no setup needed. Just put `bin/lean-cache` on your PATH
+(or install it anywhere). The cache lands in `~/.local/share/lean-global-cache`,
+you already own it, and no sudo or admin scripts are required.
+
+```bash
+lean-cache config    # show the four resolved values
+```
+
+**Multi-user (fleet) host:** copy `lean-cache.conf.example` to
+`/etc/lean-cache.conf` and edit to taste (the fleet values are
+`OWNER=hostbot GROUP=bots ROOT=/opt/bots/lean BIN=/opt/bots/bin/lean-cache`),
+then follow [admin/README.md](admin/README.md) for the one-time root setup.
 
 ## Setup & deployment
 
-One-time root setup (ownership migration + sudoers) — see
+**Single-user:** no setup — just use the CLI.
+
+**Multi-user:** one-time root setup (ownership migration + sudoers) — see
 [admin/README.md](admin/README.md). After that, deploy through the hostbot
-deploy-handler: `deploy.sh` installs the CLI to `/opt/bots/bin/lean-cache` and
-reconciles the [`versions`](versions) manifest (a floor of versions to keep
-present — it never auto-removes).
+deploy-handler: `deploy.sh` installs the CLI to `BIN` and reconciles the
+[`versions`](versions) manifest (a floor of versions to keep present — it never
+auto-removes).
 
 See [DESIGN.md](DESIGN.md) for the full rationale, install internals, and known
 limitations.

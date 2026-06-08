@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
-# deploy.sh — runs as hostbot from ~hostbot/deployments/lean-global-cache/.
+# deploy.sh — install the lean-cache CLI and reconcile the versions manifest.
 #
-# Installs the `lean-cache` CLI to /opt/bots/bin and reconciles the versions
-# listed in ./versions against the shared cache (idempotent). All cache files
-# end up hostbot-owned and not group-writable.
+# Installs the CLI to BIN (default: $HOME/.local/bin/lean-cache on a
+# single-user host; /opt/bots/bin/lean-cache on the fleet via
+# /etc/lean-cache.conf) and reconciles ./versions against the shared cache
+# (idempotent). All cache files end up OWNER-owned and not group-writable.
 #
 # One-time root setup (ownership migration + sudoers) lives in admin/ and is
 # NOT run here — see admin/README.md. deploy.sh never needs root.
 set -euo pipefail
 
-if [[ "$(id -un)" != "hostbot" ]]; then
-  echo "deploy.sh: must run as hostbot (got $(id -un))" >&2
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/config.sh
+. "$REPO_DIR/lib/config.sh"
+
+if [[ "$(id -un)" != "$OWNER" ]]; then
+  echo "deploy.sh: must run as $OWNER (got $(id -un))" >&2
   exit 1
 fi
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN_DST="/opt/bots/bin/lean-cache"
-ROOT="/opt/bots/lean"
+BIN_DST="$BIN"
 
 umask 022
 log() { echo "==> $*"; }
@@ -24,9 +27,10 @@ log() { echo "==> $*"; }
 # --- 1. Install the CLI -------------------------------------------------------
 
 log "installing $BIN_DST"
+mkdir -p "$(dirname "$BIN_DST")"
 install -m 0755 "$REPO_DIR/bin/lean-cache" "$BIN_DST"
 
-# --- 2. Ensure the cache root exists, hostbot-owned, not group-writable --------
+# --- 2. Ensure the cache root exists, OWNER-owned, not group-writable --------
 # (Ownership of any pre-existing tree is fixed once by admin/migrate-ownership.sh;
 #  here we only create-if-missing and set modes on what we own.)
 

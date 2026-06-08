@@ -14,7 +14,8 @@ check() { # check <description> <expected> <actual>
 
 echo "== bash syntax =="
 for f in "$CLI" "$REPO_DIR/deploy.sh" "$REPO_DIR/test.sh" \
-         "$REPO_DIR"/admin/*.sh; do
+         "$REPO_DIR/lib/config.sh" "$REPO_DIR"/admin/*.sh \
+         "$REPO_DIR/lean-cache.conf.example"; do
   [[ -e "$f" ]] || continue
   bash -n "$f" && note "ok: $f"
 done
@@ -22,7 +23,7 @@ done
 if command -v shellcheck >/dev/null 2>&1; then
   echo "== shellcheck =="
   shellcheck -S warning "$CLI" "$REPO_DIR/deploy.sh" "$REPO_DIR/test.sh" \
-    "$REPO_DIR"/admin/*.sh && note "ok: shellcheck clean"
+    "$REPO_DIR/lib/config.sh" "$REPO_DIR"/admin/*.sh && note "ok: shellcheck clean"
 else
   echo "== shellcheck (skipped, not installed) =="
 fi
@@ -45,6 +46,23 @@ for bad in "" "4" "foo" "4.x" "../etc" "4.30.0; rm -rf /"; do
     note "ok: rejected '$bad'"
   fi
 done
+
+echo "== config resolution =="
+cfg_field() { # cfg_field <env...> <field>
+  local field="${@: -1}"
+  local env_args=("${@:1:$#-1}")
+  env "${env_args[@]}" LEAN_CACHE_CONF=/nonexistent "$CLI" config \
+    | awk -v f="$field:" '$1==f{print $2}'
+}
+check "default owner = current user" \
+  "$(id -un)" \
+  "$(cfg_field owner)"
+check "LEAN_CACHE_OWNER override" \
+  "somebody" \
+  "$(cfg_field LEAN_CACHE_OWNER=somebody owner)"
+check "LEAN_CACHE_ROOT override" \
+  "/tmp/x" \
+  "$(cfg_field LEAN_CACHE_ROOT=/tmp/x root)"
 
 echo "== overlay staleness & hooks (hermetic) =="
 # Everything here runs against a throwaway cache and throwaway git repos, so it

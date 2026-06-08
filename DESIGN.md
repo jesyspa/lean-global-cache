@@ -16,11 +16,26 @@ it directly. Two failure modes followed:
    oleans mode 600 and the whole version unreadable to the rest of the group
    until it was hand-repaired with `setfacl`.
 
+## Portability / configuration
+
+The single-writer model is opt-in via configuration. Four settings — `OWNER`,
+`GROUP`, `ROOT`, `BIN` — are resolved at runtime with the precedence env var >
+`/etc/lean-cache.conf` > built-in default.
+
+The built-in defaults target a **single-user host**: `OWNER` is the current
+user, `ROOT` is `~/.local/share/lean-global-cache`. Because `require_owner`
+no-ops when the caller already IS `OWNER`, a single-user host never invokes
+sudo and needs no sudoers rule or admin scripts.
+
+The fleet sets `OWNER=hostbot GROUP=bots ROOT=/opt/bots/lean
+BIN=/opt/bots/bin/lean-cache` via `/etc/lean-cache.conf`. The admin scripts
+read the same config file so the sudoers rule always matches the CLI.
+
 ## Model: single writer
 
-Exactly one user — `hostbot`, the deploy user — owns and mutates the cache.
-Every file is `hostbot`-owned, group `bots`, and **not group-writable**. Other
-bots can only read. This is enforced two ways:
+Exactly one user — the configured `OWNER` — owns and mutates the cache.
+Every file is `OWNER`-owned and **not group-writable**. Other group members can
+only read. This is enforced two ways:
 
 - One-time root migration (`admin/migrate-ownership.sh`) takes ownership,
   strips the per-file ACLs, and removes group/other write.
@@ -29,10 +44,11 @@ bots can only read. This is enforced two ways:
   dirs) on everything it writes — so readability no longer depends on the
   caller's environment.
 
-Mutating subcommands (`install`/`uninstall`) re-exec as `hostbot` via a
-tightly-scoped sudoers rule (`admin/install-sudoers.sh`), so a bot can still
-*invoke* them, but the resulting files are always hostbot-owned. Read-only
-subcommands run unprivileged.
+Mutating subcommands (`install`/`uninstall`) re-exec as `OWNER` via a
+tightly-scoped sudoers rule (`admin/install-sudoers.sh`), so any group member
+can still *invoke* them, but the resulting files are always OWNER-owned.
+Read-only subcommands run unprivileged. On a single-user host where the caller
+IS already `OWNER`, the re-exec is skipped entirely.
 
 ### Why read-only is enough for consumers
 
@@ -138,10 +154,10 @@ rejected — this is also what keeps the sudoers wildcard safe.
 
 ## Deployment
 
-Standard hostbot deploy-handler repo. `deploy.sh` (as hostbot):
+Standard hostbot deploy-handler repo. `deploy.sh` (as `OWNER`):
 
-1. installs `bin/lean-cache` to `/opt/bots/bin/lean-cache`,
-2. ensures `/opt/bots/lean/{lakes,elan}` exist `2755`,
+1. installs `bin/lean-cache` to `BIN`,
+2. ensures `ROOT/{lakes,elan}` exist `2755`,
 3. reconciles the `versions` manifest — each listed version is `install`ed
    (idempotent). The manifest is a **floor**: ad-hoc installs are never
    auto-removed, and pruning is manual via `uninstall`.

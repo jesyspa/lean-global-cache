@@ -3,17 +3,20 @@
 # Lean cache to the single-writer model. Run by a human with sudo, once, at
 # adoption time. NOT run by deploy.sh (deploy never needs root).
 #
+# ROOT, OWNER, and GROUP are read from the config (env vars or
+# /etc/lean-cache.conf). See lean-cache.conf.example for the fleet's settings.
+#
 #   sudo ./admin/migrate-ownership.sh
 #
-# Effect: hostbot owns everything under /opt/bots/lean; group `bots` can read
-# but not write; the per-file ACLs that caused the v4-30-0 "unreadable cache"
-# incident are stripped. Best run when no bot is mid-build, since anything that
-# was (incorrectly) writing into the cache will start failing afterwards.
+# Effect: OWNER owns everything under ROOT; GROUP can read but not write; the
+# per-file ACLs that caused the v4-30-0 "unreadable cache" incident are
+# stripped. Best run when no bot is mid-build, since anything that was
+# (incorrectly) writing into the cache will start failing afterwards.
 set -euo pipefail
 
-ROOT="/opt/bots/lean"
-OWNER="hostbot"
-GROUP="bots"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/config.sh
+. "$REPO_DIR/lib/config.sh"
 
 [[ "$(id -u)" -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
 [[ -d "$ROOT" ]] || { echo "$ROOT does not exist" >&2; exit 1; }

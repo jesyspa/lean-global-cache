@@ -1,39 +1,50 @@
 #!/usr/bin/env bash
-# lean-cache — manage the shared Lean/mathlib package cache under /opt/bots/lean.
+# lean-cache — manage the shared Lean/mathlib package cache.
 #
-# The cache is single-writer: every file is owned by `hostbot` and is NOT
-# group-writable, so consuming bots can only read it and can never clobber it.
+# The cache is single-writer: every file is owned by OWNER and is NOT
+# group-writable, so consumers can only read it and can never clobber it.
 # Mutating subcommands (install/uninstall) therefore re-exec themselves as
-# hostbot via sudo (see admin/install-sudoers.sh); read-only subcommands
-# (link/use/list/resolve) run as any bots-group user.
+# OWNER via sudo (see admin/install-sudoers.sh); read-only subcommands
+# (link/use/list/resolve) run as any group-member user.
 #
-# Layout it manages:
-#   /opt/bots/lean/elan/                      ELAN_HOME (lean toolchains)
-#   /opt/bots/lean/lakes/<slug>/packages/     per-version package cache
+# Layout it manages (paths under the configured cache root):
+#   <root>/elan/                      ELAN_HOME (lean toolchains)
+#   <root>/lakes/<slug>/packages/     per-version package cache
 # where <slug> is the toolchain version with dots->dashes, e.g. v4-30-0.
+# Default root on the fleet: /opt/bots/lean.
+# Default root for a single-user host: $HOME/.local/share/lean-global-cache.
 #
 # Consumers point a project's .lake/packages symlink at
-#   /opt/bots/lean/lakes/<slug>/packages
+#   <root>/lakes/<slug>/packages
 # (use `lean-cache use` to set that up). Their own build artifacts live in the
 # project-local .lake/build, so read-only access to the cache is sufficient.
 
 set -euo pipefail
 
-# --- Constants ---------------------------------------------------------------
+# --- Config resolution -------------------------------------------------------
+# Precedence: env var > /etc/lean-cache.conf (or LEAN_CACHE_CONF) > built-in default.
+# This block is inlined (not sourced from lib/config.sh) so the CLI stays a
+# single self-contained file installable via `install bin/lean-cache`.
 
-OWNER="hostbot"
-# LEAN_CACHE_ROOT lets the test suite point the whole layout at a throwaway
-# directory; in production it is unset and the cache lives under /opt/bots/lean.
-ROOT="${LEAN_CACHE_ROOT:-/opt/bots/lean}"
+# shellcheck source=/dev/null
+[[ -r "${LEAN_CACHE_CONF:-/etc/lean-cache.conf}" ]] \
+  && . "${LEAN_CACHE_CONF:-/etc/lean-cache.conf}"
+
+OWNER="${LEAN_CACHE_OWNER:-${OWNER:-$(id -un)}}"
+GROUP="${LEAN_CACHE_GROUP:-${GROUP:-$(id -gn)}}"
+ROOT="${LEAN_CACHE_ROOT:-${ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/lean-global-cache}}"
+
+SELF="$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+BIN="${LEAN_CACHE_BIN:-${BIN:-$SELF}}"
+
 LAKES="$ROOT/lakes"
 export ELAN_HOME="$ROOT/elan"
-# Absolute path the sudoers rule pins; re-exec must use exactly this.
-INSTALLED_SELF="/opt/bots/bin/lean-cache"
 PATH="$ELAN_HOME/bin:$PATH"
 
-# Path the installed hooks invoke to refresh the overlay. Overridable so the
-# test suite can drive its in-tree copy; defaults to the deployed CLI.
-HOOK_BIN="${LEAN_CACHE_BIN:-/opt/bots/bin/lean-cache}"
+# Absolute path the sudoers rule pins; re-exec must use exactly this.
+INSTALLED_SELF="$BIN"
+# Path the installed hooks invoke to refresh the overlay.
+HOOK_BIN="$BIN"
 
 PROG="lean-cache"
 
@@ -59,6 +70,7 @@ Usage: $PROG <command> [args]
   list                  List installed versions with disk usage.
   resolve <version>     Print the normalized toolchain / rev / slug for a
                         version string (no side effects).
+  config                Print the four resolved config values (owner/group/root/bin).
 
 Version accepts: 4.30  4.30.0  v4.30.0  leanprover/lean4:v4.30.0  4.30.0-rc2
 EOF
@@ -101,7 +113,7 @@ require_owner() {
 }
 
 # Force cache contents to: owner-writable, group/other read+traverse only,
-# setgid on dirs so files land in group `bots`. This is the deterministic pass
+# setgid on dirs so new files inherit the group. This is the deterministic pass
 # that replaces the per-session umask lottery.
 normalize_perms() {
   local dir="$1"
@@ -395,6 +407,12 @@ root=\"\$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0
 \"\${LEAN_CACHE_BIN:-$HOOK_BIN}\" refresh \"\$root\" >/dev/null 2>&1 || true"
 }
 
+cmd_config() {
+  [[ $# -eq 0 ]] || usage
+  printf 'owner: %s\ngroup: %s\nroot:  %s\nbin:   %s\n' \
+    "$OWNER" "$GROUP" "$ROOT" "$BIN"
+}
+
 # --- Dispatch ----------------------------------------------------------------
 
 [[ $# -ge 1 ]] || usage
@@ -407,6 +425,7 @@ case "$cmd" in
   refresh)   cmd_refresh   "$@" ;;
   list)      cmd_list      "$@" ;;
   resolve)   cmd_resolve   "$@" ;;
+  config)    cmd_config    "$@" ;;
   -h|--help|help) usage 0 ;;
   *) die "unknown command: $cmd (try --help)" ;;
 esac

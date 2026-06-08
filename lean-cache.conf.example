@@ -1,0 +1,20 @@
+# lean-cache.conf — host configuration for the lean-global-cache CLI and scripts.
+#
+# This file is sourced as plain shell by bin/lean-cache, deploy.sh, and
+# admin/*.sh. It may set any subset of the four variables below.
+#
+# Precedence (highest to lowest):
+#   1. Environment variables: LEAN_CACHE_OWNER, LEAN_CACHE_GROUP,
+#                             LEAN_CACHE_ROOT, LEAN_CACHE_BIN
+#   2. This file (or the file at $LEAN_CACHE_CONF if set)
+#   3. Built-in defaults (current user, ~/.local/share/lean-global-cache)
+#
+# A single-user host does NOT need this file at all: the built-in defaults
+# target the current user and require no sudo or admin scripts. Copy this file
+# to /etc/lean-cache.conf only when configuring a shared (multi-user) host.
+#
+# Fleet values:
+OWNER=hostbot
+GROUP=bots
+ROOT=/opt/bots/lean
+BIN=/opt/bots/bin/lean-cache

@@ -119,7 +119,7 @@ slug, or lake sees the deps as missing and tries (and fails) to fetch them.
 normalizes to and re-overlays only on a mismatch. The check reads a single
 symlink — no fetch, no guess — so it is cheap enough to run on every ref update.
 
-Two stock hooks are installed:
+Three hooks are installed:
 
 - **post-checkout** — `git checkout` / `switch` / `worktree add`.
 - **reference-transaction** — the only stock hook that also fires on
@@ -129,9 +129,102 @@ Two stock hooks are installed:
   and otherwise exits immediately; `refresh`'s staleness check is the second
   cheap gate. Because it also covers rebase and `commit --amend` (both move a
   local branch), no separate `post-rewrite` hook is installed.
+- **pre-push** — the project build gate (see "Pre-push build gate" below).
 
-Both hooks no-op outside a Lean project and while the CLI is mid-overlay
-(`LEAN_CACHE_NO_HOOK`), so they can never recurse through their own ref updates.
+The two overlay hooks no-op outside a Lean project and while the CLI is
+mid-overlay (`LEAN_CACHE_NO_HOOK`), so they can never recurse through their own
+ref updates.
+
+## Project build seeding
+
+`.lake/packages` (mathlib) is shared, but `.lake/build` — the project's own
+oleans — is per-worktree. Every fresh worktree of a repo therefore cold-builds
+the entire project cone from scratch, even when a byte-identical warm build
+already exists in a sibling worktree at the same commit. On a large project that
+is many minutes per worktree, and under multi-instance load (several worktrees
+cold-building the same cone at once) it caused repeated long single-file
+compiles and memory pressure. Seeding eliminates the redundant work.
+
+### Store
+
+A per-user store under `BUILDS` (default `~/.cache/lean-global-cache/builds`)
+holds warm `.lake/build` trees keyed by **(repo identity, exact commit,
+toolchain slug)**:
+
+```
+<BUILDS>/<repo>-<hash>/<full-commit-sha>/<slug>/{lib,ir,.seed-manifest}
+```
+
+`<repo>-<hash>` is the basename of the repo's shared git dir plus a short hash of
+its realpath, so all worktrees of one repo share a key while distinct repos
+never collide. The store is **single-writer, owner-owned, read-only**: dirs
+`755`, files `444`, owned by the publishing user.
+
+Unlike the mathlib package cache, this store is **per-user**, not owned by a
+fleet-wide cache owner. A project's `.lake/build` is reproducible and the
+worktrees that share it belong to one user; the clobbering hazards that made the
+package cache single-owner (`lake update` / `cache get` mutating shared
+checkouts) do not apply to immutable content-addressed build snapshots. Keeping
+it per-user also sidesteps a cross-user wrinkle: the publishing user's worktrees
+are not readable by a different cache owner, so an owner-builds-it path would
+have to rebuild from scratch. (`BUILDS` is configurable, so a shared
+owner-owned store with an owner-path publish remains possible if ever needed.)
+
+### `publish-build`
+
+`lean-cache publish-build [path]` runs `lake build` to completion first — so a
+partial or stale tree is never stored (which would later replay as a false
+green) — then snapshots `.lake/build/{lib,ir}` into the store under a per-build
+`flock`, normalizes permissions, and atomically swaps it into place (an existing
+entry is replaced, so it doubles as "refresh after main advances").
+
+### `seed-build`
+
+`lean-cache seed-build [path]` is called automatically at the end of `use` (and
+thus by the post-checkout hook). It seeds a worktree's `.lake/build` from the
+store **only** when the worktree's HEAD exactly matches a stored build's commit
+**and** the toolchain slug matches **and** the worktree has no project build
+yet. On any mismatch — or no stored build — it seeds nothing and lets the normal
+cold/incremental build run. It never approximates, so it can never make Lake
+replay a stale olean as a false green. The exact-(commit, slug) gate is the
+whole safety argument: identical commit ⇒ byte-identical sources ⇒ every module
+legitimately replays.
+
+Two artifact classes are handled differently:
+
+- **`*.olean`** — hardlinked from the read-only store. They are large (the bulk
+  of the disk), and `lean` always writes a rebuilt olean via unlink+create (a
+  fresh inode), never in place — so a read-only hardlink to the shared store is
+  safe: an in-worktree edit can't mutate the shared inode, and a rebuild simply
+  replaces the link. The seed first verifies the store is owned by the caller
+  and has no group/other-writable file, refusing to link out of a store it
+  cannot vouch for.
+- **everything else** (`.trace`, `.hash`, `.setup.json`, `.ilean`, `.c`, …) —
+  copied as writable, worktree-owned files. Lake rewrites this bookkeeping *in
+  place* when it rebuilds a module, so these must never be links back to the
+  shared store.
+
+The net effect: a fresh worktree at a stored commit replays the whole project in
+seconds instead of cold-building it; editing one `.lean` file rebuilds exactly
+that file's cone (its olean replaced with a fresh worktree-owned inode) and
+nothing stale slips through.
+
+## Pre-push build gate
+
+A targeted check (`lake build <submodule>`, `lake env lean <file>`) can report
+green on non-compiling code via stale-olean replay, which once let a
+non-compiling commit reach `main`. The `pre-push` hook closes that gap: for any
+project with a lakefile, before allowing a push that changes `*.lean`, it
+
+1. computes the changed `*.lean` across the pushed range,
+2. `touch`es them (bumping mtime invalidates their traces — defeating replay),
+3. runs the bare default `lake build`,
+4. aborts the push if the build fails.
+
+A bare `lake build` can take minutes; that latency is the intended cost of the
+gate. It is generic (no project-specific paths), no-ops when the push changes no
+`*.lean`, and is bypassable with `SKIP_LEAN_PUSH_GATE=1` for when the user has
+just run a clean build themselves.
 
 Each hook carries a sentinel comment line. Re-running `use` regenerates the
 hooks it owns — and upgrades a pre-sentinel legacy `post-checkout` hook in
@@ -163,8 +256,13 @@ Standard hostbot deploy-handler repo. `deploy.sh` (as `OWNER`):
    auto-removed, and pruning is manual via `uninstall`.
 
 `test.sh` runs first in an isolated worktree: bash syntax + shellcheck, version
-resolution unit tests, and validation-rejects-junk tests. It does not touch the
-cache or the network.
+resolution unit tests, validation-rejects-junk tests, the overlay/hooks
+scenarios, and the build-seeding + push-gate scenarios (with a stub `lake`). It
+does not touch the real cache or the network.
+
+`publish-build` / `seed-build` are not part of `deploy.sh`: they are per-user,
+per-project operations a bot runs in its own worktrees, not a host-level deploy
+step.
 
 ## Known limitations / open points
 
@@ -176,6 +274,10 @@ cache or the network.
 - **Orphan RC toolchains.** `v4.29.0-rc7` and `v4.30.0-rc2` are dropped by
   `admin/migrate-ownership.sh` (no corresponding lake cache).
 - **Disk.** Each version is ~7–9 GB. No automatic GC; `uninstall` is manual.
+- **Build store GC.** The warm-build store is keyed by exact commit, so entries
+  for superseded commits accumulate and are never auto-removed. Each entry is
+  modest (the project build, oleans hardlinked across worktrees), but pruning
+  old commits is currently manual (`rm -rf` under `BUILDS`).
 - **Toolchain reuse.** `uninstall` removes a version's packages but leaves its
   elan toolchain (cheap, possibly shared). A `--purge-toolchain` flag could be
   added if needed.

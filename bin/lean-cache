@@ -41,6 +41,15 @@ LAKES="$ROOT/lakes"
 export ELAN_HOME="$ROOT/elan"
 PATH="$ELAN_HOME/bin:$PATH"
 
+# Per-user store of warm PROJECT build artifacts (.lake/build), keyed by
+# (repo, commit, toolchain slug). Unlike the mathlib package cache above, this
+# is owned by the invoking user, not the shared cache OWNER: a project's
+# .lake/build is per-worktree and reproducible, and the worktrees that share it
+# all belong to one user. Defaults under the user's cache dir, on the same
+# filesystem as the worktrees so artifacts can be hardlinked in. Override with
+# LEAN_CACHE_BUILDS (or BUILDS in the config file).
+BUILDS="${LEAN_CACHE_BUILDS:-${BUILDS:-${XDG_CACHE_HOME:-$HOME/.cache}/lean-global-cache/builds}}"
+
 # Absolute path the sudoers rule pins; re-exec must use exactly this.
 INSTALLED_SELF="$BIN"
 # Path the installed hooks invoke to refresh the overlay.
@@ -67,6 +76,13 @@ Usage: $PROG <command> [args]
   refresh [path]        Re-overlay only if the live overlay's toolchain differs
                         from the project's lean-toolchain (a cheap no-op
                         otherwise). This is what the git hooks call.
+  seed-build [path]     Seed a cold worktree's .lake/build from a stored warm
+                        build, but only when HEAD exactly matches a stored
+                        (commit, toolchain) build. A no-op otherwise. Called
+                        automatically by \`use\` / the post-checkout hook.
+  publish-build [path]  Build the project to completion and store its warm
+                        .lake/build for the current (commit, toolchain), so
+                        future fresh worktrees can be seeded from it.
   list                  List installed versions with disk usage.
   resolve <version>     Print the normalized toolchain / rev / slug for a
                         version string (no side effects).
@@ -101,6 +117,60 @@ normalize_version() {
 
 dest_for()     { echo "$LAKES/$1"; }          # arg: slug
 packages_for() { echo "$LAKES/$1/packages"; } # arg: slug
+
+# Stable identity for the repo a worktree belongs to. All worktrees of one repo
+# share a common git dir, so its realpath identifies the repo on this host; we
+# slugify it as "<workdir-basename>-<short-hash>" so two repos that happen to
+# share a basename never collide on one key.
+repo_identity() {
+  local proj="$1" gitdir
+  gitdir="$(git -C "$proj" rev-parse --git-common-dir 2>/dev/null)" || return 1
+  [[ "$gitdir" = /* ]] || gitdir="$(cd "$proj" && cd "$gitdir" && pwd)"
+  gitdir="$(realpath "$gitdir" 2>/dev/null || echo "$gitdir")"
+  local base hash
+  base="$(basename "$(dirname "$gitdir")")"
+  [[ -n "$base" && "$base" != "." && "$base" != "/" ]] || base="repo"
+  hash="$(printf '%s' "$gitdir" | sha1sum | cut -c1-12)"
+  printf '%s-%s' "$base" "$hash"
+}
+
+# Store dir for a (proj, commit, slug). Echoes the path; nonzero if the repo has
+# no identity (not a git repo).
+build_store_for() { # args: proj commit slug
+  local rid; rid="$(repo_identity "$1")" || return 1
+  printf '%s/%s/%s/%s' "$BUILDS" "$rid" "$2" "$3"
+}
+
+# Normalize a build-store tree to single-writer read-only: dirs traversable,
+# files read-only. The owner can still refresh/remove (it owns the dirs); a
+# consumer that hardlinks an artifact in can only read it, so an in-worktree
+# edit cannot mutate the shared inode (and a rebuild replaces the link via a
+# fresh inode rather than writing through).
+normalize_build_store() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 0
+  find "$dir" -type d -exec chmod u=rwx,go=rx {} +
+  find "$dir" -type f -exec chmod a=r {} +
+}
+
+# Hardlink (*.olean) or copy (everything else) a build tree from src into dst.
+# Oleans are large and are always replaced by `lean` via unlink+create on a
+# rebuild, so a read-only hardlink to the shared store is safe and saves the
+# disk. The smaller bookkeeping files (.trace/.hash/.setup.json/...) are
+# rewritten *in place* by Lake when it rebuilds a module, so they are copied as
+# writable, worktree-owned files — never linked back to the shared store.
+seed_tree() { # args: src dst
+  local src="$1" dst="$2" f rel
+  [[ -d "$src" ]] || return 0
+  while IFS= read -r -d '' f; do
+    rel="${f#"$src"}"; mkdir -p "$dst$(dirname "$rel")"
+    if [[ "$f" == *.olean ]]; then
+      ln -f "$f" "$dst$rel" 2>/dev/null || { cp -p "$f" "$dst$rel"; chmod u+w "$dst$rel"; }
+    else
+      cp -p "$f" "$dst$rel"; chmod u+w "$dst$rel"
+    fi
+  done < <(find "$src" -type f -print0)
+}
 
 # Re-exec the current invocation as the cache owner. Used by mutating commands.
 require_owner() {
@@ -316,6 +386,9 @@ cmd_use() {
 
   log "overlaid $linked shared package(s) into $pkgdir (-> $shared)"
   install_hooks "$proj"
+  # Seed a warm project build if one is stored for this exact (commit, slug).
+  # A no-op when the worktree already has a build or none is stored.
+  cmd_seed_build "$proj" || true
 }
 
 # Print the cache slug embedded in the live overlay's mathlib symlink, or
@@ -344,6 +417,86 @@ cmd_refresh() {
   cmd_use "$proj"
 }
 
+# True if the project already has any built project olean — i.e. not a cold
+# worktree. Used to avoid clobbering a build that already exists.
+project_build_present() {
+  local hit; hit="$(find "$1/.lake/build/lib" -name '*.olean' -print -quit 2>/dev/null)"
+  [[ -n "$hit" ]]
+}
+
+# Seed a cold worktree's .lake/build from a stored warm build, but ONLY when the
+# worktree's HEAD exactly matches a stored (commit, slug) build. On any mismatch
+# (or no stored build, or an existing build) this is a silent no-op and the
+# normal cold/incremental build runs — we never approximate, so we can never
+# replay a stale olean as a false green. Safe to call from a hook.
+cmd_seed_build() {
+  [[ $# -le 1 ]] || usage
+  local proj="${1:-.}"
+  proj="$(cd "$proj" 2>/dev/null && pwd)" || return 0
+  [[ -f "$proj/lean-toolchain" ]] || return 0
+  local commit; commit="$(git -C "$proj" rev-parse HEAD 2>/dev/null)" || return 0
+  [[ -n "$commit" ]] || return 0
+  normalize_version "$(cat "$proj/lean-toolchain")"
+
+  local store; store="$(build_store_for "$proj" "$commit" "$SLUG")" || return 0
+  [[ -d "$store/lib" ]] || return 0           # no warm build stored for this exact (commit, slug)
+  project_build_present "$proj" && return 0   # never clobber an existing build
+
+  # Safety: only hardlink out of a store we own and that is not group/other
+  # writable — otherwise a hardlinked artifact could be mutated underneath a
+  # worktree. On any doubt, skip seeding rather than risk a poisoned link.
+  local owner; owner="$(stat -c '%U' "$store" 2>/dev/null)"
+  [[ "$owner" == "$(id -un)" ]] || { log "build store $store not owned by $(id -un); skipping seed"; return 0; }
+  if find "$store" \( -perm -0020 -o -perm -0002 \) -print -quit 2>/dev/null | grep -q .; then
+    log "build store $store has group/other-writable files; skipping seed"; return 0
+  fi
+
+  mkdir -p "$proj/.lake/build"
+  seed_tree "$store/lib" "$proj/.lake/build/lib"
+  seed_tree "$store/ir"  "$proj/.lake/build/ir"
+  log "seeded warm build for $TCVER @ ${commit:0:12} into $proj/.lake/build"
+}
+
+# Build the project to completion and publish its warm .lake/build for the
+# current (commit, slug), so future fresh worktrees can be seeded from it.
+# Running the build first guarantees we never store a partial or stale tree
+# (which would later replay as a false green).
+cmd_publish_build() {
+  [[ $# -le 1 ]] || usage
+  local proj="${1:-.}"
+  proj="$(cd "$proj" 2>/dev/null && pwd)" || die "no such directory: ${1:-.}"
+  [[ -f "$proj/lean-toolchain" ]] || die "no $proj/lean-toolchain"
+  local commit; commit="$(git -C "$proj" rev-parse HEAD 2>/dev/null)" \
+    || die "$proj is not a git repository"
+  [[ -n "$commit" ]] || die "no HEAD commit in $proj"
+  normalize_version "$(cat "$proj/lean-toolchain")"
+
+  log "building $proj to completion before publishing (this can take minutes)"
+  ( cd "$proj" && lake build ) || die "lake build failed; refusing to publish a broken build"
+  [[ -d "$proj/.lake/build/lib" ]] || die "$proj has no .lake/build/lib to publish"
+
+  local store; store="$(build_store_for "$proj" "$commit" "$SLUG")"
+  mkdir -p "$BUILDS"
+  exec 9>"$BUILDS/.$(repo_identity "$proj")-$commit-$SLUG.lock" 2>/dev/null \
+    || exec 9>"$BUILDS/.publish.lock"
+  flock -n 9 || die "another publish for this build is in progress"
+
+  mkdir -p "$(dirname "$store")"
+  local incoming="${store}.incoming.$$"
+  rm -rf "$incoming"; mkdir -p "$incoming"
+  cp -a "$proj/.lake/build/lib" "$incoming/lib"
+  [[ -d "$proj/.lake/build/ir" ]] && cp -a "$proj/.lake/build/ir" "$incoming/ir"
+  printf 'repo=%s\ncommit=%s\ntoolchain=%s\nslug=%s\noleans=%s\npublished_by=%s\n' \
+    "$(repo_identity "$proj")" "$commit" "$TOOLCHAIN" "$SLUG" \
+    "$(find "$incoming/lib" -name '*.olean' 2>/dev/null | wc -l)" "$(id -un)" \
+    > "$incoming/.seed-manifest"
+  normalize_build_store "$incoming"
+
+  rm -rf "$store"
+  mv "$incoming" "$store"
+  log "published warm build for $TCVER @ ${commit:0:12} -> $store"
+}
+
 # Marker on every hook this CLI writes, so a later `use` may regenerate its own
 # hooks while never touching a hook some other tool installed.
 HOOK_SENTINEL="lean-cache-managed-hook"
@@ -368,15 +521,16 @@ install_one_hook() {
   chmod +x "$hook"
 }
 
-# Install the overlay-maintenance hooks into the project's (worktree-shared)
-# hooks directory:
+# Install the project hooks into the (worktree-shared) hooks directory:
 #   post-checkout         — checkout, switch, worktree-add
 #   reference-transaction — the only stock hook that also fires on
 #                           `git reset --hard` and `git cherry-pick`; it covers
 #                           rebase/amend too, so no separate post-rewrite hook
 #                           is needed.
-# Both defer to `lean-cache refresh`, whose staleness check keeps the
-# high-frequency reference-transaction path a cheap no-op.
+#   pre-push              — gate the push on a clean full `lake build`.
+# post-checkout / reference-transaction defer to `lean-cache refresh`, whose
+# staleness check keeps the high-frequency reference-transaction path a cheap
+# no-op. pre-push only runs when the push changes a *.lean file.
 install_hooks() {
   local proj="$1" gitdir
   gitdir="$(git -C "$proj" rev-parse --git-common-dir 2>/dev/null)" || return 0
@@ -405,12 +559,50 @@ done
 root=\"\$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0
 [[ -f \"\$root/lean-toolchain\" ]] || exit 0
 \"\${LEAN_CACHE_BIN:-$HOOK_BIN}\" refresh \"\$root\" >/dev/null 2>&1 || true"
+
+  install_one_hook "$gitdir/hooks/pre-push" "#!/usr/bin/env bash
+# $HOOK_SENTINEL: gate a push on a clean full \`lake build\`. Before allowing a
+# push that changes any *.lean, bump the mtime of the changed files (so Lake
+# cannot replay a stale olean and report a false green) and run the bare default
+# \`lake build\`; abort the push if it fails. A full build can take minutes —
+# that latency is the intended cost of the gate. Bypass with
+# SKIP_LEAN_PUSH_GATE=1 (e.g. right after you have run a clean build yourself).
+[[ -n \"\${SKIP_LEAN_PUSH_GATE:-}\" ]] && exit 0
+root=\"\$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0
+[[ -f \"\$root/lakefile.toml\" || -f \"\$root/lakefile.lean\" ]] || exit 0
+remote=\"\$1\"
+changed=\"\"
+while read -r _lref loid _rref roid; do
+  [[ \"\$loid\" =~ ^0+\$ ]] && continue
+  if [[ \"\$roid\" =~ ^0+\$ ]]; then
+    base=\"\$(git rev-list \"\$loid\" --not --remotes=\"\$remote\" 2>/dev/null | tail -1)\"
+    [[ -n \"\$base\" ]] || continue
+    parent=\"\$(git rev-parse -q --verify \"\$base^\" 2>/dev/null || true)\"
+    if [[ -n \"\$parent\" ]]; then
+      new=\"\$(git diff --name-only \"\$parent\" \"\$loid\" -- '*.lean' 2>/dev/null)\"
+    else
+      new=\"\$(git diff-tree --no-commit-id --name-only -r --root \"\$loid\" -- '*.lean' 2>/dev/null)\"
+    fi
+  else
+    new=\"\$(git diff --name-only \"\$roid\" \"\$loid\" -- '*.lean' 2>/dev/null)\"
+  fi
+  changed=\"\$changed\$new
+\"
+done
+changed=\"\$(printf '%s\\n' \"\$changed\" | sort -u | sed '/^\$/d')\"
+[[ -n \"\$changed\" ]] || exit 0
+while IFS= read -r f; do [[ -n \"\$f\" && -f \"\$root/\$f\" ]] && touch \"\$root/\$f\"; done <<< \"\$changed\"
+command -v lake >/dev/null 2>&1 || { echo 'lean push gate: lake not found in PATH (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; exit 1; }
+echo \"lean push gate: \$(printf '%s\\n' \"\$changed\" | grep -c .) changed .lean file(s); running full 'lake build' (may take minutes)...\" >&2
+( cd \"\$root\" && lake build ) || { echo 'lean push gate: lake build FAILED — push aborted (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; exit 1; }
+echo 'lean push gate: build OK — allowing push' >&2
+exit 0"
 }
 
 cmd_config() {
   [[ $# -eq 0 ]] || usage
-  printf 'owner: %s\ngroup: %s\nroot:  %s\nbin:   %s\n' \
-    "$OWNER" "$GROUP" "$ROOT" "$BIN"
+  printf 'owner:  %s\ngroup:  %s\nroot:   %s\nbin:    %s\nbuilds: %s\n' \
+    "$OWNER" "$GROUP" "$ROOT" "$BIN" "$BUILDS"
 }
 
 # --- Dispatch ----------------------------------------------------------------
@@ -421,8 +613,10 @@ case "$cmd" in
   install)   cmd_install   "$@" ;;
   uninstall) cmd_uninstall "$@" ;;
   link)      cmd_link      "$@" ;;
-  use)       cmd_use       "$@" ;;
-  refresh)   cmd_refresh   "$@" ;;
+  use)          cmd_use           "$@" ;;
+  refresh)      cmd_refresh       "$@" ;;
+  seed-build)   cmd_seed_build    "$@" ;;
+  publish-build) cmd_publish_build "$@" ;;
   list)      cmd_list      "$@" ;;
   resolve)   cmd_resolve   "$@" ;;
   config)    cmd_config    "$@" ;;

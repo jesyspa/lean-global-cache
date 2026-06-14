@@ -141,6 +141,103 @@ rc=0; "$CLI" refresh "$B" >/dev/null 2>&1 || rc=$?
 check "refresh when fresh exits 0"            "0" "$rc"
 check "refresh when fresh changes nothing"    "v4-31-0" "$(live_slug "$B")"
 
+echo "== build seeding & push gate (hermetic) =="
+# No real Lean here: a stub `lake` stands in for the build so publish/seed and
+# the push gate can be exercised without the toolchain or the network. The store
+# is redirected to a throwaway dir via LEAN_CACHE_BUILDS.
+export LEAN_CACHE_BUILDS="$TMP/builds"
+STUB="$TMP/stub"; mkdir -p "$STUB"
+cat > "$STUB/lake" <<'LK'
+#!/usr/bin/env bash
+# Stub: record the call; succeed unless LAKE_RC says otherwise.
+echo "lake $*" >> "${LAKE_LOG:-/dev/null}"
+exit "${LAKE_RC:-0}"
+LK
+chmod +x "$STUB/lake"
+inode() { stat -c '%i' "$1" 2>/dev/null; }
+mode()  { stat -c '%a' "$1" 2>/dev/null; }
+
+# A fake project with a pre-staged "warm build" tree.
+P="$TMP/proj"; mkdir -p "$P/Proj"; gitc "$P" init -q
+pin v4.30.0 "$P"; printf 'name="p"\n' > "$P/lakefile.toml"
+printf 'def a := 1\n' > "$P/Proj/A.lean"
+gitc "$P" add -A; gitc "$P" commit -qm init
+pcommit="$(gitc "$P" rev-parse HEAD)"
+mkdir -p "$P/.lake/build/lib/lean/Proj" "$P/.lake/build/ir/Proj"
+printf 'OLEAN-A'  > "$P/.lake/build/lib/lean/Proj/A.olean"
+printf 'TRACE-A'  > "$P/.lake/build/lib/lean/Proj/A.trace"
+printf 'IR-A'     > "$P/.lake/build/ir/Proj/A.c"
+
+# publish-build snapshots that tree into the store (lake build is the stub).
+PATH="$STUB:$PATH" LAKE_LOG="$TMP/pub.log" "$CLI" publish-build "$P" >/dev/null 2>&1
+store="$(find "$LEAN_CACHE_BUILDS" -name .seed-manifest -printf '%h\n' 2>/dev/null | head -1)"
+check "publish-build ran lake build first"    "1" "$(grep -c '^lake' "$TMP/pub.log" 2>/dev/null)"
+check "publish-build stored the olean"        "OLEAN-A" "$(cat "$store/lib/lean/Proj/A.olean" 2>/dev/null)"
+check "stored manifest records the commit"    "commit=$pcommit" "$(grep '^commit=' "$store/.seed-manifest" 2>/dev/null)"
+check "store has no group/other-writable file" "0" \
+  "$(find "$store" -type f \( -perm -0020 -o -perm -0002 \) 2>/dev/null | wc -l)"
+check "stored olean is read-only"             "444" "$(mode "$store/lib/lean/Proj/A.olean")"
+
+# Seed a cold sibling worktree at the SAME commit.
+Q="$TMP/q"; gitc "$P" worktree add -q "$Q" HEAD 2>/dev/null
+"$CLI" seed-build "$Q" >/dev/null 2>&1
+check "seed-build populated the olean"        "OLEAN-A" "$(cat "$Q/.lake/build/lib/lean/Proj/A.olean" 2>/dev/null)"
+check "seeded olean is a hardlink to store"   "$(inode "$store/lib/lean/Proj/A.olean")" \
+                                              "$(inode "$Q/.lake/build/lib/lean/Proj/A.olean")"
+check "seeded olean is read-only"             "444" "$(mode "$Q/.lake/build/lib/lean/Proj/A.olean")"
+qti="$(inode "$Q/.lake/build/lib/lean/Proj/A.trace")"
+check "seeded trace is a writable copy (not the store inode)" "yes" \
+  "$([[ -n "$qti" && "$qti" != "$(inode "$store/lib/lean/Proj/A.trace")" ]] && echo yes || echo no)"
+
+# Idempotent: re-seeding a worktree that already has a build changes nothing.
+before="$(inode "$Q/.lake/build/lib/lean/Proj/A.olean")"
+"$CLI" seed-build "$Q" >/dev/null 2>&1
+check "seed-build no-ops when a build exists"  "$before" "$(inode "$Q/.lake/build/lib/lean/Proj/A.olean")"
+
+# Safety: on a commit mismatch, seed NOTHING (never approximate a stale build).
+R="$TMP/r"; mkdir -p "$R/Proj"; gitc "$R" init -q
+pin v4.30.0 "$R"; printf 'name="p"\n' > "$R/lakefile.toml"
+printf 'def a := 2\n' > "$R/Proj/A.lean"     # different content -> different commit
+gitc "$R" add -A; gitc "$R" commit -qm other
+"$CLI" seed-build "$R" >/dev/null 2>&1
+check "seed-build no-ops on commit mismatch"   "0" \
+  "$(find "$R/.lake/build" -name '*.olean' 2>/dev/null | wc -l)"
+
+# Push gate: stub lake decides pass/fail; a bare remote receives the push.
+"$CLI" use "$P" >/dev/null 2>&1                   # installs hooks (+ re-seeds, a no-op)
+check "pre-push hook installed"               "yes" \
+  "$(grep -ql lean-cache-managed-hook "$P/.git/hooks/pre-push" && echo yes || echo no)"
+git init -q --bare "$TMP/remote.git"
+gitc "$P" remote add origin "$TMP/remote.git"
+
+# Establish the baseline on the remote (the first push carries A.lean, so the
+# gate runs the build once here).
+: > "$TMP/g.log"
+PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
+check "gate: initial push (new .lean) runs lake" "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
+
+# (a) An incremental push whose diff has no *.lean must not invoke lake.
+printf 'hi\n' > "$P/README.md"; gitc "$P" add -A; gitc "$P" commit -qm doc
+: > "$TMP/g.log"
+PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
+check "gate: doc-only push skips lake"         "0" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
+
+# (b) A push that changes *.lean and fails to build is rejected.
+printf 'def a := 3\n' > "$P/Proj/A.lean"; gitc "$P" add -A; gitc "$P" commit -qm edit
+remote_before="$(gitc "$P" ls-remote origin refs/heads/main | cut -f1)"
+: > "$TMP/g.log"
+PATH="$STUB:$PATH" LAKE_RC=1 LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
+check "gate: failing build invokes lake"       "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
+check "gate: failing build blocks the push"    "$remote_before" \
+  "$(gitc "$P" ls-remote origin refs/heads/main | cut -f1)"
+
+# (c) SKIP_LEAN_PUSH_GATE bypasses the gate entirely.
+: > "$TMP/g.log"
+PATH="$STUB:$PATH" SKIP_LEAN_PUSH_GATE=1 LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
+check "gate: SKIP_LEAN_PUSH_GATE skips lake"    "0" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
+check "gate: SKIP_LEAN_PUSH_GATE lets push through" \
+  "$(gitc "$P" rev-parse HEAD)" "$(gitc "$P" ls-remote origin refs/heads/main | cut -f1)"
+
 echo
 if [[ "$fail" -eq 0 ]]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; fi
 exit "$fail"

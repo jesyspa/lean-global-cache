@@ -24,9 +24,11 @@ lean-cache uninstall <version>   # remove a version
 lean-cache link <version>        # print the packages path to symlink against
 lean-cache use [version] [path]  # set up .lake/packages in a project
 lean-cache refresh [path]        # re-overlay only if the toolchain changed
+lean-cache seed-build [path]     # seed .lake/build from a stored warm build
+lean-cache publish-build [path]  # store this project's warm build for reuse
 lean-cache list                  # installed versions + sizes
 lean-cache resolve <version>     # show normalized toolchain/rev/slug
-lean-cache config                # show resolved owner/group/root/bin
+lean-cache config                # show resolved owner/group/root/builds/bin
 ```
 
 `<version>` accepts `4.30`, `4.30.0`, `v4.30.0`, `leanprover/lean4:v4.30.0`, or
@@ -66,6 +68,42 @@ mismatch and is otherwise a cheap no-op. See [DESIGN.md](DESIGN.md) for details.
 
 Your project's own build artifacts live in `.lake/build`; only mathlib's
 prebuilt oleans are read from the shared cache, so read-only access is enough.
+
+### Seeding a fresh worktree's project build
+
+`.lake/build` is per-worktree, so every fresh worktree of a repo cold-builds the
+entire project from scratch — even when a byte-identical warm build already
+exists in a sibling worktree at the same commit. To avoid that, `lean-cache`
+keeps a per-user store of warm project builds keyed by **(repo, exact commit,
+toolchain slug)**:
+
+```bash
+lean-cache publish-build           # build to completion, then store the warm
+                                   # .lake/build for the current commit+toolchain
+# … later, in any fresh worktree at that same commit …
+lean-cache use                     # overlays packages AND seeds .lake/build
+lake build                         # re-elaborates only the files you edit
+```
+
+`use` (and the post-checkout hook) call `seed-build` automatically. Seeding
+happens **only** when the worktree's HEAD exactly matches a stored build's
+commit and the toolchain matches; on any mismatch it seeds nothing and the
+normal cold/incremental build runs, so a stale build can never replay as a false
+green. Oleans are hardlinked from the read-only store (so they cost no disk and
+can't be mutated through the worktree — a rebuild replaces the link with a fresh
+file); the small bookkeeping files Lake rewrites in place are copied. The store
+lives under `~/.cache/lean-global-cache/builds` by default (`LEAN_CACHE_BUILDS`
+to override); it is per-user because a project's build is reproducible and the
+worktrees that share it belong to one user — unlike the cross-bot mathlib cache.
+
+### Pre-push build gate
+
+`use` also installs a `pre-push` hook. Before allowing a push that changes any
+`*.lean`, it bumps the mtime of the changed files (defeating stale-olean replay)
+and runs a bare `lake build`, aborting the push if the build fails. This catches
+the "pushed non-compiling code that targeted checks falsely reported green" case.
+A full `lake build` can take minutes — that latency is the intended cost. Set
+`SKIP_LEAN_PUSH_GATE=1` to bypass it (e.g. right after a known-clean build).
 
 ## Layout it manages
 

@@ -26,6 +26,7 @@ lean-cache use [version] [path]  # set up .lake/packages in a project
 lean-cache refresh [path]        # re-overlay only if the toolchain changed
 lean-cache seed-build [path]     # seed .lake/build from a stored warm build
 lean-cache publish-build [path]  # store this project's warm build for reuse
+lean-cache prune-builds [--keep-days N]  # rotate the warm-build store
 lean-cache list                  # installed versions + sizes
 lean-cache resolve <version>     # show normalized toolchain/rev/slug
 lean-cache config                # show resolved owner/group/root/builds/bin
@@ -95,6 +96,12 @@ file); the small bookkeeping files Lake rewrites in place are copied. The store
 lives under `~/.cache/lean-global-cache/builds` by default (`LEAN_CACHE_BUILDS`
 to override); it is per-user because a project's build is reproducible and the
 worktrees that share it belong to one user — unlike the cross-bot mathlib cache.
+
+The store is rotated automatically: `publish-build` keeps the newest build per
+`(repo, toolchain)` indefinitely (that is "latest main") and drops any older one
+past a window (`LEAN_CACHE_BUILD_KEEP_DAYS`, default 7). `lean-cache prune-builds
+[--keep-days N]` applies the same policy across the whole store on demand (cron-
+friendly).
 
 ### Pre-push build gate
 

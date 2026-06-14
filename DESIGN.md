@@ -176,7 +176,19 @@ owner-owned store with an owner-path publish remains possible if ever needed.)
 partial or stale tree is never stored (which would later replay as a false
 green) — then snapshots `.lake/build/{lib,ir}` into the store under a per-build
 `flock`, normalizes permissions, and atomically swaps it into place (an existing
-entry is replaced, so it doubles as "refresh after main advances").
+entry is replaced, so it doubles as "refresh after main advances"). It records a
+`published_at` epoch in the manifest and then rotates the store (below).
+
+### Rotation
+
+The store would otherwise grow unbounded as `main` advances. The policy: keep
+the **newest build per (repo, toolchain) indefinitely** — that is "latest main",
+the build fresh worktrees will actually seed from — and drop any *other* build
+published more than `BUILD_KEEP_DAYS` (default 7) ago. "Latest" is defined by
+publish time rather than git topology, which needs no repo access and matches the
+workflow (you publish exactly when main advances, so the newest publish is latest
+main). `publish-build` rotates the repo it just wrote; `lean-cache prune-builds
+[--keep-days N]` applies the policy across the whole store and is safe to cron.
 
 ### `seed-build`
 
@@ -274,10 +286,11 @@ step.
 - **Orphan RC toolchains.** `v4.29.0-rc7` and `v4.30.0-rc2` are dropped by
   `admin/migrate-ownership.sh` (no corresponding lake cache).
 - **Disk.** Each version is ~7–9 GB. No automatic GC; `uninstall` is manual.
-- **Build store GC.** The warm-build store is keyed by exact commit, so entries
-  for superseded commits accumulate and are never auto-removed. Each entry is
-  modest (the project build, oleans hardlinked across worktrees), but pruning
-  old commits is currently manual (`rm -rf` under `BUILDS`).
+- **Build store rotation.** The warm-build store keeps the newest build per
+  (repo, toolchain) indefinitely and drops other builds past `BUILD_KEEP_DAYS`
+  (default 7), rotated after each `publish-build` and on demand via
+  `prune-builds`. There is no scheduled sweep — a store that stops being
+  published to keeps its last build; a cron `prune-builds` covers that if wanted.
 - **Toolchain reuse.** `uninstall` removes a version's packages but leaves its
   elan toolchain (cheap, possibly shared). A `--purge-toolchain` flag could be
   added if needed.

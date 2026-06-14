@@ -238,6 +238,27 @@ check "gate: SKIP_LEAN_PUSH_GATE skips lake"    "0" "$(grep -c '^lake' "$TMP/g.l
 check "gate: SKIP_LEAN_PUSH_GATE lets push through" \
   "$(gitc "$P" rev-parse HEAD)" "$(gitc "$P" ls-remote origin refs/heads/main | cut -f1)"
 
+echo "== build-store rotation (hermetic) =="
+# Fabricate builds with controlled publish times and check the keep/drop policy.
+mkbuild() { # mkbuild <repodir> <commit> <slug> <age_days>
+  local d="$1/$2/$3"; mkdir -p "$d/lib"
+  printf 'OLE' > "$d/lib/x.olean"
+  printf 'commit=%s\nslug=%s\npublished_at=%s\n' "$2" "$3" "$(( $(date +%s) - $4 * 86400 ))" \
+    > "$d/.seed-manifest"
+}
+RB="$LEAN_CACHE_BUILDS/rot-repo"
+mkbuild "$RB" newcommit v9-9-9 0    # newest for v9-9-9      -> keep
+mkbuild "$RB" midcommit v9-9-9 3    # non-latest, within 7d  -> keep
+mkbuild "$RB" oldcommit v9-9-9 10   # non-latest, older 7d   -> prune
+mkbuild "$RB" loneold   v8-8-8 30   # only build for v8-8-8  -> newest -> keep
+exists() { [[ -d "$1" ]] && echo yes || echo no; }
+"$CLI" prune-builds --keep-days 7 >/dev/null 2>&1
+check "rotation keeps newest per toolchain"      "yes" "$(exists "$RB/newcommit/v9-9-9")"
+check "rotation keeps non-latest within window"  "yes" "$(exists "$RB/midcommit/v9-9-9")"
+check "rotation drops non-latest past window"    "no"  "$(exists "$RB/oldcommit/v9-9-9")"
+check "rotation keeps lone latest even if old"   "yes" "$(exists "$RB/loneold/v8-8-8")"
+check "rotation removes emptied commit dir"      "no"  "$(exists "$RB/oldcommit")"
+
 echo
 if [[ "$fail" -eq 0 ]]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; fi
 exit "$fail"

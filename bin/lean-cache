@@ -50,6 +50,11 @@ PATH="$ELAN_HOME/bin:$PATH"
 # LEAN_CACHE_BUILDS (or BUILDS in the config file).
 BUILDS="${LEAN_CACHE_BUILDS:-${BUILDS:-${XDG_CACHE_HOME:-$HOME/.cache}/lean-global-cache/builds}}"
 
+# Rotation window for stored builds: the newest build per (repo, toolchain) is
+# kept indefinitely (it is "latest main"); any other build published more than
+# this many days ago is pruned. Override with LEAN_CACHE_BUILD_KEEP_DAYS.
+BUILD_KEEP_DAYS="${LEAN_CACHE_BUILD_KEEP_DAYS:-${BUILD_KEEP_DAYS:-7}}"
+
 # Absolute path the sudoers rule pins; re-exec must use exactly this.
 INSTALLED_SELF="$BIN"
 # Path the installed hooks invoke to refresh the overlay.
@@ -83,6 +88,10 @@ Usage: $PROG <command> [args]
   publish-build [path]  Build the project to completion and store its warm
                         .lake/build for the current (commit, toolchain), so
                         future fresh worktrees can be seeded from it.
+  prune-builds [--keep-days N]
+                        Rotate the warm-build store: keep the newest build per
+                        (repo, toolchain) indefinitely, drop any other older than
+                        N days (default $BUILD_KEEP_DAYS). Runs after each publish.
   list                  List installed versions with disk usage.
   resolve <version>     Print the normalized toolchain / rev / slug for a
                         version string (no side effects).
@@ -486,15 +495,77 @@ cmd_publish_build() {
   rm -rf "$incoming"; mkdir -p "$incoming"
   cp -a "$proj/.lake/build/lib" "$incoming/lib"
   [[ -d "$proj/.lake/build/ir" ]] && cp -a "$proj/.lake/build/ir" "$incoming/ir"
-  printf 'repo=%s\ncommit=%s\ntoolchain=%s\nslug=%s\noleans=%s\npublished_by=%s\n' \
+  printf 'repo=%s\ncommit=%s\ntoolchain=%s\nslug=%s\noleans=%s\npublished_by=%s\npublished_at=%s\n' \
     "$(repo_identity "$proj")" "$commit" "$TOOLCHAIN" "$SLUG" \
-    "$(find "$incoming/lib" -name '*.olean' 2>/dev/null | wc -l)" "$(id -un)" \
+    "$(find "$incoming/lib" -name '*.olean' 2>/dev/null | wc -l)" "$(id -un)" "$(date +%s)" \
     > "$incoming/.seed-manifest"
   normalize_build_store "$incoming"
 
   rm -rf "$store"
   mv "$incoming" "$store"
   log "published warm build for $TCVER @ ${commit:0:12} -> $store"
+
+  # Rotate this repo's store: the build just published is now "latest" and is
+  # kept; older non-latest builds past the window are dropped.
+  prune_builds_under "$BUILDS/$(repo_identity "$proj")" "$BUILD_KEEP_DAYS" || true
+}
+
+# Epoch at which a stored build was published: from the manifest's published_at,
+# else the manifest file's mtime (for entries written before that field existed).
+build_published_at() {
+  local m="$1/.seed-manifest" t=""
+  [[ -f "$m" ]] && t="$(sed -n 's/^published_at=//p' "$m" 2>/dev/null)"
+  [[ -n "$t" ]] || t="$(stat -c '%Y' "$m" 2>/dev/null || stat -c '%Y' "$1" 2>/dev/null || echo 0)"
+  printf '%s' "$t"
+}
+
+# Rotate one repo's store dir ($BUILDS/<repo>): keep the newest build per slug
+# (toolchain) indefinitely; remove any other build published more than
+# keep_days ago. A build dir is <repo>/<commit>/<slug>.
+prune_builds_under() {
+  local repo="$1" keep_days="$2"
+  [[ -d "$repo" ]] || return 0
+  local now cutoff; now="$(date +%s)"; cutoff=$(( now - keep_days * 86400 ))
+  local -A latest=()
+  local d slug ts
+  # Pass 1: newest publish time per slug.
+  while IFS= read -r -d '' d; do
+    case "$d" in *.incoming.*) continue ;; esac
+    [[ -e "$d/.seed-manifest" || -d "$d/lib" ]] || continue
+    slug="$(basename "$d")"; ts="$(build_published_at "$d")"
+    [[ -z "${latest[$slug]:-}" || "$ts" -gt "${latest[$slug]}" ]] && latest[$slug]="$ts"
+  done < <(find "$repo" -mindepth 2 -maxdepth 2 -type d -print0 2>/dev/null)
+  # Pass 2: drop non-latest builds older than the window.
+  while IFS= read -r -d '' d; do
+    case "$d" in *.incoming.*) continue ;; esac
+    [[ -e "$d/.seed-manifest" || -d "$d/lib" ]] || continue
+    slug="$(basename "$d")"; ts="$(build_published_at "$d")"
+    [[ "$ts" -eq "${latest[$slug]:-0}" ]] && continue   # newest per slug: keep
+    [[ "$ts" -lt "$cutoff" ]] || continue               # within window: keep
+    log "pruning stale build $(basename "$(dirname "$d")")/$slug (~$(( (now - ts) / 86400 ))d old)"
+    rm -rf "$d"
+  done < <(find "$repo" -mindepth 2 -maxdepth 2 -type d -print0 2>/dev/null)
+  # Drop commit dirs left empty by pruning.
+  find "$repo" -mindepth 1 -maxdepth 1 -type d -empty -delete 2>/dev/null || true
+}
+
+# Rotate every repo's store by the policy above. Safe to run from cron.
+cmd_prune_builds() {
+  local keep_days="$BUILD_KEEP_DAYS"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --keep-days) keep_days="${2:-}"; shift 2 ;;
+      --keep-days=*) keep_days="${1#*=}"; shift ;;
+      *) usage ;;
+    esac
+  done
+  [[ "$keep_days" =~ ^[0-9]+$ ]] || die "--keep-days must be a non-negative integer"
+  [[ -d "$BUILDS" ]] || return 0
+  local repo
+  for repo in "$BUILDS"/*/; do
+    [[ -d "$repo" ]] || continue
+    prune_builds_under "${repo%/}" "$keep_days"
+  done
 }
 
 # Marker on every hook this CLI writes, so a later `use` may regenerate its own
@@ -617,6 +688,7 @@ case "$cmd" in
   refresh)      cmd_refresh       "$@" ;;
   seed-build)   cmd_seed_build    "$@" ;;
   publish-build) cmd_publish_build "$@" ;;
+  prune-builds) cmd_prune_builds  "$@" ;;
   list)      cmd_list      "$@" ;;
   resolve)   cmd_resolve   "$@" ;;
   config)    cmd_config    "$@" ;;

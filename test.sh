@@ -141,6 +141,18 @@ rc=0; "$CLI" refresh "$B" >/dev/null 2>&1 || rc=$?
 check "refresh when fresh exits 0"            "0" "$rc"
 check "refresh when fresh changes nothing"    "v4-31-0" "$(live_slug "$B")"
 
+# Scenario: a project pinning an UN-installed version. `use` auto-installs by
+# default, but with auto-install off it must hard-fail; `refresh` (the hook
+# path) must stay a silent no-op rather than kick off an install on checkout.
+U="$TMP/uninstalled"; mkdir -p "$U"; gitc "$U" init -q
+pin v4.99.0 "$U"; gitc "$U" add -A; gitc "$U" commit -qm u
+rc=0; LEAN_CACHE_AUTO_INSTALL=0 "$CLI" use "$U" >/dev/null 2>&1 || rc=$?
+check "use of uninstalled ver hard-fails (opt-out)" "1" "$rc"
+check "failed use created no overlay"         "" "$(live_slug "$U")"
+rc=0; "$CLI" refresh "$U" >/dev/null 2>&1 || rc=$?
+check "refresh of uninstalled ver exits 0"    "0" "$rc"
+check "refresh of uninstalled ver no overlay" "" "$(live_slug "$U")"
+
 echo "== build seeding & push gate (hermetic) =="
 # No real Lean here: a stub `lake` stands in for the build so publish/seed and
 # the push gate can be exercised without the toolchain or the network. The store

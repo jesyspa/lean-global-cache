@@ -77,7 +77,9 @@ Usage: $PROG <command> [args]
                         .lake/packages at.
   use [version] [path]  Symlink .lake/packages of the project at <path> (default
                         cwd) to the cache. Version defaults to the project's
-                        lean-toolchain. Also installs the overlay git hooks.
+                        lean-toolchain. Auto-installs the version if it is not
+                        in the cache yet (set LEAN_CACHE_AUTO_INSTALL=0 to
+                        hard-fail instead). Also installs the overlay git hooks.
   refresh [path]        Re-overlay only if the live overlay's toolchain differs
                         from the project's lean-toolchain (a cheap no-op
                         otherwise). This is what the git hooks call.
@@ -370,7 +372,24 @@ cmd_use() {
   fi
   normalize_version "$version"
   local shared; shared="$(packages_for "$SLUG")"
-  [[ -d "$shared" ]] || die "version $TCVER is not installed; run: $PROG install $TCVER"
+  if [[ ! -d "$shared" ]]; then
+    # On-demand provisioning: a standalone host installs no versions up front
+    # (admin/setup-standalone.sh deliberately skips it), so the first `use` of a
+    # toolchain installs it. `install` re-execs as OWNER via the NOPASSWD
+    # sudoers rule, so this works for any caller. The hook path never reaches
+    # here (cmd_refresh returns early when the version is absent), so a checkout
+    # can't trigger a multi-minute build. Set LEAN_CACHE_AUTO_INSTALL=0 to keep
+    # the old hard-fail.
+    if [[ "${LEAN_CACHE_AUTO_INSTALL:-1}" == 1 ]]; then
+      log "$TCVER not installed; provisioning it into the shared cache (first use)"
+      "$INSTALLED_SELF" install "$TCVER" \
+        || die "auto-install of $TCVER failed; run: $PROG install $TCVER"
+      [[ -d "$shared" ]] \
+        || die "version $TCVER still not installed after install — aborting"
+    else
+      die "version $TCVER is not installed; run: $PROG install $TCVER"
+    fi
+  fi
 
   local pkgdir="$proj/.lake/packages"
   # Replace a legacy whole-dir symlink, or wipe entirely with --clean.
@@ -426,6 +445,10 @@ cmd_refresh() {
   proj="$(cd "$proj" 2>/dev/null && pwd)" || return 0
   [[ -f "$proj/lean-toolchain" ]] || return 0
   normalize_version "$(cat "$proj/lean-toolchain")"
+  # Never provision from the hook path: refreshing an overlay to a version that
+  # isn't installed is a no-op, not a trigger for a multi-minute build inside a
+  # git hook. Direct `use` (not refresh) is what auto-installs.
+  [[ -d "$(packages_for "$SLUG")" ]] || return 0
   [[ "$(live_overlay_slug "$proj/.lake/packages")" == "$SLUG" ]] && return 0
   cmd_use "$proj"
 }

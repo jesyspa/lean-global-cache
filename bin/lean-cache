@@ -92,6 +92,10 @@ Usage: $PROG <command> [args]
                         Rotate the warm-build store: keep the newest build per
                         (repo, toolchain) indefinitely, drop any other older than
                         N days (default $BUILD_KEEP_DAYS). Runs after each publish.
+  pre-push-gate <remote>
+                        Run the push build gate (reads the pushed ref list on
+                        stdin). This is what the pre-push git hook calls; not
+                        meant to be run by hand.
   list                  List installed versions with disk usage.
   resolve <version>     Print the normalized toolchain / rev / slug for a
                         version string (no side effects).
@@ -632,42 +636,60 @@ root=\"\$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0
 \"\${LEAN_CACHE_BIN:-$HOOK_BIN}\" refresh \"\$root\" >/dev/null 2>&1 || true"
 
   install_one_hook "$gitdir/hooks/pre-push" "#!/usr/bin/env bash
-# $HOOK_SENTINEL: gate a push on a clean full \`lake build\`. Before allowing a
-# push that changes any *.lean, bump the mtime of the changed files (so Lake
-# cannot replay a stale olean and report a false green) and run the bare default
-# \`lake build\`; abort the push if it fails. A full build can take minutes —
-# that latency is the intended cost of the gate. Bypass with
-# SKIP_LEAN_PUSH_GATE=1 (e.g. right after you have run a clean build yourself).
+# $HOOK_SENTINEL: gate a push on a clean full \`lake build\`. The gate logic
+# lives in \`lean-cache pre-push-gate\` (as post-checkout/reference-transaction
+# delegate to \`refresh\`) so a fix to the gate reaches every worktree without
+# regenerating this hook. Bypass with SKIP_LEAN_PUSH_GATE=1.
 [[ -n \"\${SKIP_LEAN_PUSH_GATE:-}\" ]] && exit 0
 root=\"\$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0
 [[ -f \"\$root/lakefile.toml\" || -f \"\$root/lakefile.lean\" ]] || exit 0
-remote=\"\$1\"
-changed=\"\"
-while read -r _lref loid _rref roid; do
-  [[ \"\$loid\" =~ ^0+\$ ]] && continue
-  if [[ \"\$roid\" =~ ^0+\$ ]]; then
-    base=\"\$(git rev-list \"\$loid\" --not --remotes=\"\$remote\" 2>/dev/null | tail -1)\"
-    [[ -n \"\$base\" ]] || continue
-    parent=\"\$(git rev-parse -q --verify \"\$base^\" 2>/dev/null || true)\"
-    if [[ -n \"\$parent\" ]]; then
-      new=\"\$(git diff --name-only \"\$parent\" \"\$loid\" -- '*.lean' 2>/dev/null)\"
+exec \"\${LEAN_CACHE_BIN:-$HOOK_BIN}\" pre-push-gate \"\$@\""
+}
+
+# The push build gate, invoked by the pre-push hook as `pre-push-gate <remote>`
+# with the pushed ref list on stdin. Before allowing a push that changes any
+# *.lean, bump the mtime of the changed files (so Lake cannot replay a stale
+# olean and report a false green) and run the bare default `lake build`; abort
+# the push (nonzero exit) if it fails. A full build can take minutes — that
+# latency is the intended cost of the gate.
+cmd_pre_push_gate() {
+  local remote="${1:-}" root changed new base parent f
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+  [[ -f "$root/lakefile.toml" || -f "$root/lakefile.lean" ]] || exit 0
+  changed=""
+  while read -r _lref loid _rref roid; do
+    [[ "$loid" =~ ^0+$ ]] && continue
+    if [[ "$roid" =~ ^0+$ ]]; then
+      base="$(git rev-list "$loid" --not --remotes="$remote" 2>/dev/null | tail -1)"
+      [[ -n "$base" ]] || continue
+      parent="$(git rev-parse -q --verify "$base^" 2>/dev/null || true)"
+      if [[ -n "$parent" ]]; then
+        new="$(git diff --name-only "$parent" "$loid" -- '*.lean' 2>/dev/null)"
+      else
+        new="$(git diff-tree --no-commit-id --name-only -r --root "$loid" -- '*.lean' 2>/dev/null)"
+      fi
     else
-      new=\"\$(git diff-tree --no-commit-id --name-only -r --root \"\$loid\" -- '*.lean' 2>/dev/null)\"
+      new="$(git diff --name-only "$roid" "$loid" -- '*.lean' 2>/dev/null)"
     fi
-  else
-    new=\"\$(git diff --name-only \"\$roid\" \"\$loid\" -- '*.lean' 2>/dev/null)\"
-  fi
-  changed=\"\$changed\$new
-\"
-done
-changed=\"\$(printf '%s\\n' \"\$changed\" | sort -u | sed '/^\$/d')\"
-[[ -n \"\$changed\" ]] || exit 0
-while IFS= read -r f; do [[ -n \"\$f\" && -f \"\$root/\$f\" ]] && touch \"\$root/\$f\"; done <<< \"\$changed\"
-command -v lake >/dev/null 2>&1 || { echo 'lean push gate: lake not found in PATH (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; exit 1; }
-echo \"lean push gate: \$(printf '%s\\n' \"\$changed\" | grep -c .) changed .lean file(s); running full 'lake build' (may take minutes)...\" >&2
-( cd \"\$root\" && lake build ) || { echo 'lean push gate: lake build FAILED — push aborted (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; exit 1; }
-echo 'lean push gate: build OK — allowing push' >&2
-exit 0"
+    changed="$changed$new
+"
+  done
+  changed="$(printf '%s\n' "$changed" | sort -u | sed '/^$/d')"
+  [[ -n "$changed" ]] || exit 0
+  while IFS= read -r f; do [[ -n "$f" && -f "$root/$f" ]] && touch "$root/$f"; done <<< "$changed"
+  command -v lake >/dev/null 2>&1 || { echo 'lean push gate: lake not found in PATH (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; exit 1; }
+  echo "lean push gate: $(printf '%s\n' "$changed" | grep -c .) changed .lean file(s); running full 'lake build' (may take minutes)..." >&2
+  # Build in a clean git environment. git push from a linked worktree exports
+  # GIT_DIR/GIT_WORK_TREE into the hook (and so into here); if Lake inherits
+  # them, each 'git remote get-url' it runs to validate a dependency resolves
+  # against the superproject instead of the package's own checkout, so Lake sees
+  # a bogus URL mismatch and tries to re-clone the (read-only, cache-symlinked)
+  # package. Scrubbing the injected vars makes the gate build match a plain
+  # interactive lake build.
+  ( cd "$root" && env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX \
+      -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY -u GIT_QUARANTINE_PATH lake build ) \
+    || { echo 'lean push gate: lake build FAILED — push aborted (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; exit 1; }
+  echo 'lean push gate: build OK — allowing push' >&2
 }
 
 cmd_config() {
@@ -689,6 +711,7 @@ case "$cmd" in
   seed-build)   cmd_seed_build    "$@" ;;
   publish-build) cmd_publish_build "$@" ;;
   prune-builds) cmd_prune_builds  "$@" ;;
+  pre-push-gate) cmd_pre_push_gate "$@" ;;
   list)      cmd_list      "$@" ;;
   resolve)   cmd_resolve   "$@" ;;
   config)    cmd_config    "$@" ;;

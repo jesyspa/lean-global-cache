@@ -238,6 +238,26 @@ gate. It is generic (no project-specific paths), no-ops when the push changes no
 `*.lean`, and is bypassable with `SKIP_LEAN_PUSH_GATE=1` for when the user has
 just run a clean build themselves.
 
+Like the two overlay hooks (which delegate to `refresh`), the installed
+`pre-push` hook is a thin stub: it does the cheap guards (`SKIP_LEAN_PUSH_GATE`,
+lakefile present) and then `exec`s `lean-cache pre-push-gate`, where the actual
+gate lives. Keeping the logic in the CLI rather than inlined in the hook means a
+fix to the gate reaches every already-installed worktree the moment the CLI is
+upgraded — no hook regeneration. (Existing inline hooks still need one `use`/
+`refresh` to switch over to the stub; after that they track the CLI.)
+
+The gate runs `lake build` with git's hook-injected environment scrubbed
+(`env -u GIT_DIR -u GIT_WORK_TREE …`). `git push` from a *linked worktree*
+exports `GIT_DIR`/`GIT_WORK_TREE` into the hook; without scrubbing, the `git`
+processes Lake spawns to validate each dependency inherit them and resolve
+against the superproject's git dir instead of the package's own checkout. Lake
+reads back the superproject's remote URL, decides the package URL "has changed",
+and tries to re-clone it — which fails hard against a read-only cache symlink and
+would silently re-clone every dependency otherwise. The gate's own git plumbing
+(diffing the pushed range) is left on the superproject deliberately; only the
+`lake build` is run in the scrubbed environment, matching a plain interactive
+`lake build`.
+
 Each hook carries a sentinel comment line. Re-running `use` regenerates the
 hooks it owns — and upgrades a pre-sentinel legacy `post-checkout` hook in
 place — but never overwrites a hook some other tool installed.

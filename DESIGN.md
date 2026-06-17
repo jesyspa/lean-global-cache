@@ -238,6 +238,17 @@ gate. It is generic (no project-specific paths), no-ops when the push changes no
 `*.lean`, and is bypassable with `SKIP_LEAN_PUSH_GATE=1` for when the user has
 just run a clean build themselves.
 
+The gate runs `lake build` with git's hook-injected environment scrubbed
+(`env -u GIT_DIR -u GIT_WORK_TREE …`). `git push` from a *linked worktree*
+exports `GIT_DIR`/`GIT_WORK_TREE` into the hook; without scrubbing, the `git`
+processes Lake spawns to validate each dependency inherit them and resolve
+against the superproject's git dir instead of the package's own checkout. Lake
+reads back the superproject's remote URL, decides the package URL "has changed",
+and tries to re-clone it — which fails hard against a read-only cache symlink and
+would silently re-clone every dependency otherwise. Scrubbing makes the gate's
+build environment match a plain interactive `lake build`, which never sets these
+vars.
+
 Each hook carries a sentinel comment line. Re-running `use` regenerates the
 hooks it owns — and upgrades a pre-sentinel legacy `post-checkout` hook in
 place — but never overwrites a hook some other tool installed.

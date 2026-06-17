@@ -665,7 +665,13 @@ changed=\"\$(printf '%s\\n' \"\$changed\" | sort -u | sed '/^\$/d')\"
 while IFS= read -r f; do [[ -n \"\$f\" && -f \"\$root/\$f\" ]] && touch \"\$root/\$f\"; done <<< \"\$changed\"
 command -v lake >/dev/null 2>&1 || { echo 'lean push gate: lake not found in PATH (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; exit 1; }
 echo \"lean push gate: \$(printf '%s\\n' \"\$changed\" | grep -c .) changed .lean file(s); running full 'lake build' (may take minutes)...\" >&2
-( cd \"\$root\" && lake build ) || { echo 'lean push gate: lake build FAILED — push aborted (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; exit 1; }
+# Build in a clean git environment. git push from a linked worktree exports
+# GIT_DIR/GIT_WORK_TREE into this hook; if Lake inherits them, each
+# 'git remote get-url' it runs to validate a dependency resolves against THIS
+# repo instead of the package's own checkout, so Lake sees a bogus URL mismatch
+# and tries to re-clone the (read-only, cache-symlinked) package. Scrubbing the
+# injected vars makes the gate build match a plain interactive lake build.
+( cd \"\$root\" && env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY -u GIT_QUARANTINE_PATH lake build ) || { echo 'lean push gate: lake build FAILED — push aborted (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; exit 1; }
 echo 'lean push gate: build OK — allowing push' >&2
 exit 0"
 }

@@ -149,8 +149,9 @@ export LEAN_CACHE_BUILDS="$TMP/builds"
 STUB="$TMP/stub"; mkdir -p "$STUB"
 cat > "$STUB/lake" <<'LK'
 #!/usr/bin/env bash
-# Stub: record the call; succeed unless LAKE_RC says otherwise.
+# Stub: record the call and the git-relevant env; succeed unless LAKE_RC says so.
 echo "lake $*" >> "${LAKE_LOG:-/dev/null}"
+echo "GIT_DIR=${GIT_DIR-<unset>} GIT_WORK_TREE=${GIT_WORK_TREE-<unset>}" >> "${LAKE_ENV_LOG:-/dev/null}"
 exit "${LAKE_RC:-0}"
 LK
 chmod +x "$STUB/lake"
@@ -237,6 +238,21 @@ PATH="$STUB:$PATH" SKIP_LEAN_PUSH_GATE=1 LAKE_LOG="$TMP/g.log" gitc "$P" push -q
 check "gate: SKIP_LEAN_PUSH_GATE skips lake"    "0" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
 check "gate: SKIP_LEAN_PUSH_GATE lets push through" \
   "$(gitc "$P" rev-parse HEAD)" "$(gitc "$P" ls-remote origin refs/heads/main | cut -f1)"
+
+# (d) Linked-worktree regression. `git push` from a linked worktree exports
+# GIT_DIR (and friends) into the hook; if the gate lets `lake build` inherit
+# them, every `git remote get-url` Lake runs to validate a dependency resolves
+# against the superproject instead of the package's own checkout — a bogus URL
+# mismatch that makes Lake re-clone a read-only cache-symlinked package. The gate
+# must scrub those vars so its build matches a plain interactive `lake build`.
+W="$TMP/wt"; gitc "$P" worktree add -q -b wt-branch "$W" main 2>/dev/null
+printf 'def b := 1\n' > "$W/Proj/B.lean"; gitc "$W" add -A; gitc "$W" commit -qm wt
+: > "$TMP/g.log"; : > "$TMP/genv.log"
+PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" LAKE_ENV_LOG="$TMP/genv.log" \
+  gitc "$W" push -q origin HEAD:refs/heads/wt-branch >/dev/null 2>&1 || true
+check "gate (linked worktree): lake ran"          "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
+check "gate scrubs GIT_DIR for lake build"        "0" "$(grep -c 'GIT_DIR=[^<]' "$TMP/genv.log" 2>/dev/null)"
+check "gate scrubs GIT_WORK_TREE for lake build"  "0" "$(grep -c 'GIT_WORK_TREE=[^<]' "$TMP/genv.log" 2>/dev/null)"
 
 echo "== build-store rotation (hermetic) =="
 # Fabricate builds with controlled publish times and check the keep/drop policy.

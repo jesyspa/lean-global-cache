@@ -153,6 +153,23 @@ rc=0; "$CLI" refresh "$U" >/dev/null 2>&1 || rc=$?
 check "refresh of uninstalled ver exits 0"    "0" "$rc"
 check "refresh of uninstalled ver no overlay" "" "$(live_slug "$U")"
 
+echo "== fix-filemode (hermetic) =="
+# The cache normalizes permissions, which flips the exec bit on tracked files;
+# fix-filemode must set core.fileMode=false on each package repo so `git status`
+# stops reporting that as a change. OWNER defaults to the current user here, so
+# require_owner passes without sudo (OWNER pinned to the current user).
+FM="$TMP/cache/lakes/v4-30-0/packages"
+for p in mathlib batteries; do
+  gitc "$FM/$p" init -q
+  printf 'x\n' > "$FM/$p/f.txt"; gitc "$FM/$p" add -A; gitc "$FM/$p" commit -qm seed
+  chmod +x "$FM/$p/f.txt"   # mimic the cache's normalized exec bit
+done
+check "exec bit shows as dirty before fix" " M f.txt" "$(gitc "$FM/mathlib" status --short)"
+LEAN_CACHE_OWNER="$(id -un)" "$CLI" fix-filemode >/dev/null 2>&1
+check "fix-filemode silences mathlib mode diff"   "" "$(gitc "$FM/mathlib" status --short)"
+check "fix-filemode silences batteries mode diff" "" "$(gitc "$FM/batteries" status --short)"
+check "core.fileMode set to false" "false" "$(gitc "$FM/mathlib" config --get core.fileMode)"
+
 echo "== build seeding & push gate (hermetic) =="
 # No real Lean here: a stub `lake` stands in for the build so publish/seed and
 # the push gate can be exercised without the toolchain or the network. The store

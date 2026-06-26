@@ -98,6 +98,10 @@ Usage: $PROG <command> [args]
                         Run the push build gate (reads the pushed ref list on
                         stdin). This is what the pre-push git hook calls; not
                         meant to be run by hand.
+  fix-filemode          Set core.fileMode=false on every installed package repo
+                        so the read-only cache's normalized exec bits stop
+                        showing as \`lake build\` "local changes" warnings. New
+                        installs do this automatically; this backfills old ones.
   list                  List installed versions with disk usage.
   resolve <version>     Print the normalized toolchain / rev / slug for a
                         version string (no side effects).
@@ -207,6 +211,21 @@ normalize_perms() {
   find "$dir" -type d -exec chmod g+s {} +
 }
 
+# Tell each cached package repo to ignore file-mode (exec-bit) differences.
+# normalize_perms rewrites permissions for single-writer read-only sharing,
+# which flips the exec bit on tracked files; without this every `lake build`
+# warns that each dependency "has local changes". The bit is meaningless in a
+# read-only source cache, so untracking it keeps `git status` clean while still
+# surfacing any real content drift from the pinned revision.
+ignore_filemode() { # arg: packages dir
+  local dir="$1" repo
+  [[ -d "$dir" ]] || return 0
+  for repo in "$dir"/*/; do
+    [[ -e "$repo/.git" ]] || continue
+    git -C "$repo" config core.fileMode false
+  done
+}
+
 # --- Commands ----------------------------------------------------------------
 
 cmd_resolve() {
@@ -236,6 +255,23 @@ cmd_list() {
     printf '%s\t%s\n' "$(du -sh "${d}packages" 2>/dev/null | cut -f1)" "$slug"
   done
   [[ "$found" -eq 1 ]] || echo "(no versions installed)"
+}
+
+# Backfill: set core.fileMode=false on every package repo of every installed
+# version. New installs do this automatically; this fixes caches built before
+# the setting existed.
+cmd_fix_filemode() {
+  [[ $# -eq 0 ]] || usage
+  require_owner fix-filemode
+  [[ -d "$LAKES" ]] || { log "(no versions installed)"; return 0; }
+  local d slug found=0
+  for d in "$LAKES"/*/; do
+    [[ -d "${d}packages" ]] || continue
+    slug="$(basename "$d")"; found=1
+    log "untracking file-mode in $slug"
+    ignore_filemode "${d}packages"
+  done
+  [[ "$found" -eq 1 ]] || log "(no versions installed)"
 }
 
 cmd_install() {
@@ -313,6 +349,7 @@ EOF
   rm -rf "$incoming"
   mv "$build/.lake/packages" "$incoming"
   normalize_perms "$incoming"
+  ignore_filemode "$incoming"
   mv "$incoming" "$pkgs"          # atomic swap into place
 
   rm -rf "$build"; trap - EXIT
@@ -734,6 +771,7 @@ case "$cmd" in
   seed-build)   cmd_seed_build    "$@" ;;
   publish-build) cmd_publish_build "$@" ;;
   prune-builds) cmd_prune_builds  "$@" ;;
+  fix-filemode) cmd_fix_filemode  "$@" ;;
   pre-push-gate) cmd_pre_push_gate "$@" ;;
   list)      cmd_list      "$@" ;;
   resolve)   cmd_resolve   "$@" ;;

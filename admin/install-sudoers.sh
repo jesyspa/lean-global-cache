@@ -28,7 +28,8 @@ cat > "$TMP" <<EOF
 # Managed by lean-global-cache (admin/install-sudoers.sh).
 # Allow $GROUP-group users to manage the shared Lean cache as its owner, $OWNER.
 %$GROUP ALL=($OWNER) NOPASSWD: $BIN install *, \\
-$(printf '%*s' ${#GROUP} '')            $BIN uninstall *
+$(printf '%*s' ${#GROUP} '')            $BIN uninstall *, \\
+$(printf '%*s' ${#GROUP} '')            $BIN fix-filemode
 EOF
 
 visudo -cf "$TMP" >/dev/null || { echo "sudoers syntax check failed" >&2; exit 1; }

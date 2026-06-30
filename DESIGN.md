@@ -232,6 +232,19 @@ seconds instead of cold-building it; editing one `.lean` file rebuilds exactly
 that file's cone (its olean replaced with a fresh worktree-owned inode) and
 nothing stale slips through.
 
+### `clean`
+
+`lean-cache clean [path]` removes a worktree's `.lake/build`, resetting it to a
+cold state. It exists for long-lived worktrees that are recycled across tenants:
+such a worktree carries a `.lake/build` from a previous tenant's commit, and the
+recycler should `clean` it on handoff so the next tenant starts cold and seeds
+cleanly. Seeding already *replaces* a stale build when HEAD lands on a stored
+commit, so `clean` is belt-and-suspenders — it also covers the case where the
+next checkout is a commit with no stored build, where there is nothing to seed
+and the stale leftover would otherwise linger. It leaves `.lake/packages` (the
+overlay) alone, since that is just symlinks the hooks refresh, and is a no-op off
+a Lake project so a recycler can call it unconditionally.
+
 ## Pre-push build gate
 
 A targeted check (`lake build <submodule>`, `lake env lean <file>`) can report

@@ -91,6 +91,10 @@ Usage: $PROG <command> [args]
   publish-build [path]  Build the project to completion and store its warm
                         .lake/build for the current (commit, toolchain), so
                         future fresh worktrees can be seeded from it.
+  clean [path]          Remove the worktree's project build (.lake/build) to
+                        reset it to a cold state, e.g. before a reused worktree
+                        is handed to a new tenant. Leaves the package overlay
+                        (.lake/packages) in place. A no-op off a Lake project.
   prune-builds [--keep-days N]
                         Rotate the warm-build store: keep the newest build per
                         (repo, toolchain) indefinitely, drop any other older than
@@ -539,6 +543,23 @@ cmd_seed_build() {
   log "seeded warm build for $TCVER @ ${commit:0:12} into $proj/.lake/build"
 }
 
+# Reset a worktree to a cold state by removing its project build (.lake/build),
+# so a long-lived worktree reused across tenants does not carry a stale build
+# from an earlier commit into the next tenant. The package overlay
+# (.lake/packages) is left in place — it is just symlinks the hooks refresh on
+# the next checkout, and a later seed/build re-establishes .lake/build. Per-user
+# (the worktree's build is owned by the invoking user), so it needs no sudo. A
+# silent no-op off a Lake project, so a recycler can call it unconditionally.
+cmd_clean() {
+  [[ $# -le 1 ]] || usage
+  local proj="${1:-.}"
+  proj="$(cd "$proj" 2>/dev/null && pwd)" || return 0
+  [[ -f "$proj/lakefile.toml" || -f "$proj/lakefile.lean" || -f "$proj/lean-toolchain" ]] || return 0
+  [[ -e "$proj/.lake/build" ]] || return 0
+  rm -rf "$proj/.lake/build"
+  log "removed $proj/.lake/build"
+}
+
 # Build the project to completion and publish its warm .lake/build for the
 # current (commit, slug), so future fresh worktrees can be seeded from it.
 # Running the build first guarantees we never store a partial or stale tree
@@ -778,6 +799,7 @@ case "$cmd" in
   use)          cmd_use           "$@" ;;
   refresh)      cmd_refresh       "$@" ;;
   seed-build)   cmd_seed_build    "$@" ;;
+  clean)        cmd_clean         "$@" ;;
   publish-build) cmd_publish_build "$@" ;;
   prune-builds) cmd_prune_builds  "$@" ;;
   fix-filemode) cmd_fix_filemode  "$@" ;;

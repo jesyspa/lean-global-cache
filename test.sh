@@ -253,6 +253,17 @@ printf 'STALE-A' > "$P/.lake/build/lib/lean/Proj/A.olean"
 check "refresh seeds when overlay already current" "OLEAN-A" \
   "$(cat "$P/.lake/build/lib/lean/Proj/A.olean" 2>/dev/null)"
 
+# clean wipes .lake/build (cold reset) but leaves the package overlay in place.
+check "clean: build present before"            "yes" \
+  "$([[ -d "$P/.lake/build" ]] && echo yes || echo no)"
+ovl_before="$(live_slug "$P")"
+"$CLI" clean "$P" >/dev/null 2>&1
+check "clean removed .lake/build"              "no" \
+  "$([[ -e "$P/.lake/build" ]] && echo yes || echo no)"
+check "clean left the package overlay"         "$ovl_before" "$(live_slug "$P")"
+rc=0; "$CLI" clean "$TMP" >/dev/null 2>&1 || rc=$?   # non-Lake dir
+check "clean on non-Lake dir exits 0"          "0" "$rc"
+
 # Push gate: stub lake decides pass/fail; a bare remote receives the push.
 "$CLI" use "$P" >/dev/null 2>&1                   # installs hooks (+ re-seeds)
 check "pre-push hook installed"               "yes" \

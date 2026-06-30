@@ -26,6 +26,7 @@ lean-cache use [version] [path]  # set up .lake/packages in a project
 lean-cache refresh [path]        # re-overlay only if the toolchain changed
 lean-cache seed-build [path]     # seed .lake/build from a stored warm build
 lean-cache publish-build [path]  # store this project's warm build for reuse
+lean-cache clean [path]          # wipe .lake/build (cold-reset a reused worktree)
 lean-cache prune-builds [--keep-days N]  # rotate the warm-build store
 lean-cache list                  # installed versions + sizes
 lean-cache resolve <version>     # show normalized toolchain/rev/slug

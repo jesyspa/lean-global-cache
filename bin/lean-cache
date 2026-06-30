@@ -83,10 +83,11 @@ Usage: $PROG <command> [args]
   refresh [path]        Re-overlay only if the live overlay's toolchain differs
                         from the project's lean-toolchain (a cheap no-op
                         otherwise). This is what the git hooks call.
-  seed-build [path]     Seed a cold worktree's .lake/build from a stored warm
-                        build, but only when HEAD exactly matches a stored
-                        (commit, toolchain) build. A no-op otherwise. Called
-                        automatically by \`use\` / the post-checkout hook.
+  seed-build [path]     Seed .lake/build from a stored warm build when HEAD
+                        exactly matches a stored (commit, toolchain) build,
+                        replacing any existing build. A no-op when none is
+                        stored. Called automatically by \`use\` / \`refresh\` /
+                        the post-checkout hook.
   publish-build [path]  Build the project to completion and store its warm
                         .lake/build for the current (commit, toolchain), so
                         future fresh worktrees can be seeded from it.
@@ -456,7 +457,7 @@ cmd_use() {
   log "overlaid $linked shared package(s) into $pkgdir (-> $shared)"
   install_hooks "$proj"
   # Seed a warm project build if one is stored for this exact (commit, slug).
-  # A no-op when the worktree already has a build or none is stored.
+  # A no-op when none is stored.
   cmd_seed_build "$proj" || true
 }
 
@@ -486,22 +487,28 @@ cmd_refresh() {
   # isn't installed is a no-op, not a trigger for a multi-minute build inside a
   # git hook. Direct `use` (not refresh) is what auto-installs.
   [[ -d "$(packages_for "$SLUG")" ]] || return 0
-  [[ "$(live_overlay_slug "$proj/.lake/packages")" == "$SLUG" ]] && return 0
-  cmd_use "$proj"
+  if [[ "$(live_overlay_slug "$proj/.lake/packages")" == "$SLUG" ]]; then
+    # Overlay is already current, so no re-overlay is needed — but a checkout can
+    # land HEAD on a published commit without changing the overlay slug, so still
+    # try to seed a warm build for the new HEAD.
+    cmd_seed_build "$proj" || true
+    return 0
+  fi
+  cmd_use "$proj"   # re-overlays and then seeds
 }
 
-# True if the project already has any built project olean — i.e. not a cold
-# worktree. Used to avoid clobbering a build that already exists.
-project_build_present() {
-  local hit; hit="$(find "$1/.lake/build/lib" -name '*.olean' -print -quit 2>/dev/null)"
-  [[ -n "$hit" ]]
-}
-
-# Seed a cold worktree's .lake/build from a stored warm build, but ONLY when the
+# Seed the worktree's .lake/build from a stored warm build, but ONLY when the
 # worktree's HEAD exactly matches a stored (commit, slug) build. On any mismatch
-# (or no stored build, or an existing build) this is a silent no-op and the
-# normal cold/incremental build runs — we never approximate, so we can never
-# replay a stale olean as a false green. Safe to call from a hook.
+# (or no stored build) this is a silent no-op and the normal cold/incremental
+# build runs — we never approximate, so we can never replay a stale olean as a
+# false green.
+#
+# When HEAD does match, the stored tree IS the true full build of this exact
+# commit, so we replace whatever .lake/build holds (typically a stale leftover
+# from a reused worktree) rather than preserving it: the replacement can't be a
+# false green (lake re-elaborates any module whose source differs from committed
+# HEAD), and preserving a stale build is exactly what forces a needless full
+# rebuild. Safe to call from a hook.
 cmd_seed_build() {
   [[ $# -le 1 ]] || usage
   local proj="${1:-.}"
@@ -513,7 +520,6 @@ cmd_seed_build() {
 
   local store; store="$(build_store_for "$proj" "$commit" "$SLUG")" || return 0
   [[ -d "$store/lib" ]] || return 0           # no warm build stored for this exact (commit, slug)
-  project_build_present "$proj" && return 0   # never clobber an existing build
 
   # Safety: only hardlink out of a store we own and that is not group/other
   # writable — otherwise a hardlinked artifact could be mutated underneath a
@@ -524,7 +530,10 @@ cmd_seed_build() {
     log "build store $store has group/other-writable files; skipping seed"; return 0
   fi
 
+  # Replace, don't merge: drop any existing lib/ir first so a stale leftover
+  # leaves no orphan oleans behind the seeded tree.
   mkdir -p "$proj/.lake/build"
+  rm -rf "$proj/.lake/build/lib" "$proj/.lake/build/ir"
   seed_tree "$store/lib" "$proj/.lake/build/lib"
   seed_tree "$store/ir"  "$proj/.lake/build/ir"
   log "seeded warm build for $TCVER @ ${commit:0:12} into $proj/.lake/build"

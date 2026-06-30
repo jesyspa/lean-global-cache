@@ -192,15 +192,26 @@ main). `publish-build` rotates the repo it just wrote; `lean-cache prune-builds
 
 ### `seed-build`
 
-`lean-cache seed-build [path]` is called automatically at the end of `use` (and
-thus by the post-checkout hook). It seeds a worktree's `.lake/build` from the
-store **only** when the worktree's HEAD exactly matches a stored build's commit
-**and** the toolchain slug matches **and** the worktree has no project build
-yet. On any mismatch — or no stored build — it seeds nothing and lets the normal
-cold/incremental build run. It never approximates, so it can never make Lake
-replay a stale olean as a false green. The exact-(commit, slug) gate is the
-whole safety argument: identical commit ⇒ byte-identical sources ⇒ every module
-legitimately replays.
+`lean-cache seed-build [path]` is called automatically at the end of `use` and
+by `refresh` — so both overlay hooks (post-checkout and reference-transaction)
+reach it, and a checkout that lands on a published commit seeds even when the
+overlay slug is unchanged. It seeds a worktree's `.lake/build` from the store
+**only** when the worktree's HEAD exactly matches a stored build's commit **and**
+the toolchain slug matches. On any mismatch — or no stored build — it seeds
+nothing and lets the normal cold/incremental build run. It never approximates, so
+it can never make Lake replay a stale olean as a false green. The exact-(commit,
+slug) gate is the whole safety argument: identical commit ⇒ byte-identical
+sources ⇒ every module legitimately replays.
+
+When HEAD does match, seeding **replaces** whatever `.lake/build` already holds
+(clearing `lib`/`ir` first, so a stale leftover leaves no orphan oleans). It does
+not preserve an existing build: the worktrees this targets are long-lived and
+reused across tenants, so they typically carry a `.lake/build` from an earlier
+commit, and preserving it is exactly what forces the full rebuild seeding exists
+to avoid. Replacing is safe because the stored tree *is* the true full build of
+this exact commit — and if the worktree's sources have since been edited, Lake's
+own mtime/hash staleness check re-elaborates the changed modules regardless of
+the seeded oleans, so the replacement cannot manufacture a false green.
 
 Two artifact classes are handled differently:
 

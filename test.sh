@@ -219,10 +219,19 @@ qti="$(inode "$Q/.lake/build/lib/lean/Proj/A.trace")"
 check "seeded trace is a writable copy (not the store inode)" "yes" \
   "$([[ -n "$qti" && "$qti" != "$(inode "$store/lib/lean/Proj/A.trace")" ]] && echo yes || echo no)"
 
-# Idempotent: re-seeding a worktree that already has a build changes nothing.
-before="$(inode "$Q/.lake/build/lib/lean/Proj/A.olean")"
+# Replace, not preserve: a stale leftover build (wrong content + an orphan olean
+# absent from the store) is fully overwritten by the stored build at this commit.
+rm -rf "$Q/.lake/build/lib" "$Q/.lake/build/ir"
+mkdir -p "$Q/.lake/build/lib/lean/Proj"
+printf 'STALE-A' > "$Q/.lake/build/lib/lean/Proj/A.olean"
+printf 'ORPHAN'  > "$Q/.lake/build/lib/lean/Proj/Z.olean"
 "$CLI" seed-build "$Q" >/dev/null 2>&1
-check "seed-build no-ops when a build exists"  "$before" "$(inode "$Q/.lake/build/lib/lean/Proj/A.olean")"
+check "re-seed overwrote the stale olean"      "OLEAN-A" \
+  "$(cat "$Q/.lake/build/lib/lean/Proj/A.olean" 2>/dev/null)"
+check "re-seed hardlinked the fresh olean to store" "$(inode "$store/lib/lean/Proj/A.olean")" \
+                                              "$(inode "$Q/.lake/build/lib/lean/Proj/A.olean")"
+check "re-seed dropped the orphan olean"       "no" \
+  "$([[ -e "$Q/.lake/build/lib/lean/Proj/Z.olean" ]] && echo yes || echo no)"
 
 # Safety: on a commit mismatch, seed NOTHING (never approximate a stale build).
 R="$TMP/r"; mkdir -p "$R/Proj"; gitc "$R" init -q
@@ -233,8 +242,19 @@ gitc "$R" add -A; gitc "$R" commit -qm other
 check "seed-build no-ops on commit mismatch"   "0" \
   "$(find "$R/.lake/build" -name '*.olean' 2>/dev/null | wc -l)"
 
+# refresh seeds the new HEAD even when the overlay slug is already current: a
+# checkout can land on a published commit without changing the overlay, yet must
+# still pull in the warm build for that commit.
+"$CLI" use "$P" >/dev/null 2>&1                   # overlay current for v4-30-0
+rm -rf "$P/.lake/build/lib" "$P/.lake/build/ir"
+mkdir -p "$P/.lake/build/lib/lean/Proj"
+printf 'STALE-A' > "$P/.lake/build/lib/lean/Proj/A.olean"
+"$CLI" refresh "$P" >/dev/null 2>&1
+check "refresh seeds when overlay already current" "OLEAN-A" \
+  "$(cat "$P/.lake/build/lib/lean/Proj/A.olean" 2>/dev/null)"
+
 # Push gate: stub lake decides pass/fail; a bare remote receives the push.
-"$CLI" use "$P" >/dev/null 2>&1                   # installs hooks (+ re-seeds, a no-op)
+"$CLI" use "$P" >/dev/null 2>&1                   # installs hooks (+ re-seeds)
 check "pre-push hook installed"               "yes" \
   "$(grep -ql lean-cache-managed-hook "$P/.git/hooks/pre-push" && echo yes || echo no)"
 check "pre-push hook delegates to pre-push-gate" "yes" \

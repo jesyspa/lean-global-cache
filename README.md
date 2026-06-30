@@ -70,7 +70,7 @@ mismatch and is otherwise a cheap no-op. See [DESIGN.md](DESIGN.md) for details.
 Your project's own build artifacts live in `.lake/build`; only mathlib's
 prebuilt oleans are read from the shared cache, so read-only access is enough.
 
-### Seeding a fresh worktree's project build
+### Seeding a worktree's project build
 
 `.lake/build` is per-worktree, so every fresh worktree of a repo cold-builds the
 entire project from scratch — even when a byte-identical warm build already
@@ -86,11 +86,14 @@ lean-cache use                     # overlays packages AND seeds .lake/build
 lake build                         # re-elaborates only the files you edit
 ```
 
-`use` (and the post-checkout hook) call `seed-build` automatically. Seeding
-happens **only** when the worktree's HEAD exactly matches a stored build's
-commit and the toolchain matches; on any mismatch it seeds nothing and the
-normal cold/incremental build runs, so a stale build can never replay as a false
-green. Oleans are hardlinked from the read-only store (so they cost no disk and
+`use` and `refresh` call `seed-build` automatically, so both overlay hooks
+(post-checkout and reference-transaction) reach it. Seeding happens **only** when
+the worktree's HEAD exactly matches a stored build's commit and the toolchain
+matches; on any mismatch it seeds nothing and the normal cold/incremental build
+runs, so a stale build can never replay as a false green. When HEAD does match,
+seeding replaces any `.lake/build` already present (a reused worktree's stale
+leftover is exactly what otherwise forces a needless full rebuild); Lake still
+re-elaborates any module you have since edited. Oleans are hardlinked from the read-only store (so they cost no disk and
 can't be mutated through the worktree — a rebuild replaces the link with a fresh
 file); the small bookkeeping files Lake rewrites in place are copied. The store
 lives under `~/.cache/lean-global-cache/builds` by default (`LEAN_CACHE_BUILDS`

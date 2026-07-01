@@ -119,7 +119,7 @@ slug, or lake sees the deps as missing and tries (and fails) to fetch them.
 normalizes to and re-overlays only on a mismatch. The check reads a single
 symlink — no fetch, no guess — so it is cheap enough to run on every ref update.
 
-Three hooks are installed:
+Four hooks are installed:
 
 - **post-checkout** — `git checkout` / `switch` / `worktree add`.
 - **reference-transaction** — the only stock hook that also fires on
@@ -129,7 +129,12 @@ Three hooks are installed:
   and otherwise exits immediately; `refresh`'s staleness check is the second
   cheap gate. Because it also covers rebase and `commit --amend` (both move a
   local branch), no separate `post-rewrite` hook is installed.
-- **pre-push** — the project build gate (see "Pre-push build gate" below).
+- **pre-push** — the project build gate, plus static-site publishing on a clean
+  push (see "Pre-push build gate" and "Static-site publishing" below).
+- **post-commit** — for a project that opts into publishing, prints a reminder
+  when a commit touches `*.lean` (see "Static-site publishing"). It exits before
+  any work unless the `.lean-publish` marker is present, so a non-publishing
+  project pays only a marker `stat` per commit.
 
 The two overlay hooks no-op outside a Lean project and while the CLI is
 mid-overlay (`LEAN_CACHE_NO_HOOK`), so they can never recurse through their own
@@ -285,6 +290,36 @@ would silently re-clone every dependency otherwise. The gate's own git plumbing
 Each hook carries a sentinel comment line. Re-running `use` regenerates the
 hooks it owns — and upgrades a pre-sentinel legacy `post-checkout` hook in
 place — but never overwrites a hook some other tool installed.
+
+## Static-site publishing
+
+Publishing a project as an HTML site is opt-in per checkout: the project carries
+a `.lean-publish` marker at its root (empty for publisher defaults, or
+`key=value` lines mapping to the publisher's `-o`/`-n`/`-t` flags and an
+`analysis` toggle). Without the marker, none of this runs — the hooks stat for
+it and exit.
+
+Publishing is bound to **push, not commit**, and specifically to the moment the
+pre-push gate's `lake build` succeeds: that is the one point where the tree is
+both what's being shared and known to compile, so a broken site can never go
+live (a failed build aborts the push before publishing). `cmd_pre_push_gate`
+calls `cmd_publish_site` after it prints "build OK"; publishing failures are
+logged but never fail the already-allowed push. The publisher runs in the same
+scrubbed environment as the gate build, for the same linked-worktree reason.
+
+Commit only *reminds*. The `post-commit` hook delegates to `lean-cache
+commit-hint`, which prints a one-line note when the commit touched `*.lean` in an
+opted-in project. Keeping the reminder on commit and the action on push mirrors
+the workflow: you commit repeatedly, but the site should track what you push.
+`lean-cache publish-site` renders on demand for anything in between. As with the
+gate, the hint/publish logic lives in the CLI (the hooks are thin stubs), so a
+fix reaches every worktree the moment the CLI is upgraded.
+
+Why not auto-publish on every commit: commit is not build-gated and fires on
+intermediate/WIP states, so it would routinely push broken or half-finished
+content to a live URL. Why per-checkout opt-in rather than a global default:
+`use` installs these hooks into every cache tenant, but most tenants are not
+published sites — gating on a marker keeps the feature invisible to them.
 
 ## Version normalization
 

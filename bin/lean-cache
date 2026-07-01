@@ -55,6 +55,15 @@ BUILDS="${LEAN_CACHE_BUILDS:-${BUILDS:-${XDG_CACHE_HOME:-$HOME/.cache}/lean-glob
 # this many days ago is pruned. Override with LEAN_CACHE_BUILD_KEEP_DAYS.
 BUILD_KEEP_DAYS="${LEAN_CACHE_BUILD_KEEP_DAYS:-${BUILD_KEEP_DAYS:-7}}"
 
+# Optional static-site publishing. A project opts in by placing a marker file
+# (PUBLISH_MARKER) at its root; when present, a clean push renders the project to
+# a static HTML site via PUBLISHER and a commit touching *.lean prints a hint.
+# The marker may be empty (publisher defaults) or hold `key=value` lines
+# (output/name/ttl/analysis) — see `publish-site`. Override the tool path with
+# LEAN_CACHE_PUBLISHER; projects without the marker are wholly unaffected.
+PUBLISHER="${LEAN_CACHE_PUBLISHER:-${PUBLISHER:-/home/devbot/dev/lean-publisher/publish.sh}}"
+PUBLISH_MARKER=".lean-publish"
+
 # Absolute path the sudoers rule pins; re-exec must use exactly this.
 INSTALLED_SELF="$BIN"
 # Path the installed hooks invoke to refresh the overlay.
@@ -66,6 +75,9 @@ PROG="lean-cache"
 
 die()  { echo "$PROG: $*" >&2; exit 1; }
 log()  { echo "==> $*" >&2; }
+
+# Strip leading and trailing whitespace from $1.
+trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
 
 usage() {
   cat >&2 <<EOF
@@ -102,6 +114,13 @@ Usage: $PROG <command> [args]
   pre-push-gate <remote>
                         Run the push build gate (reads the pushed ref list on
                         stdin). This is what the pre-push git hook calls; not
+                        meant to be run by hand.
+  publish-site [path]   Render the project as a static HTML site via the
+                        configured publisher, but only if it opts in with a
+                        \`$PUBLISH_MARKER\` marker at its root. Runs automatically
+                        after a clean push; safe to run by hand.
+  commit-hint [path]    Print the post-commit publish reminder for an opted-in
+                        project. This is what the post-commit git hook calls; not
                         meant to be run by hand.
   fix-filemode          Set core.fileMode=false on every installed package repo
                         so the read-only cache's normalized exec bits stop
@@ -692,10 +711,14 @@ install_one_hook() {
 #                           `git reset --hard` and `git cherry-pick`; it covers
 #                           rebase/amend too, so no separate post-rewrite hook
 #                           is needed.
-#   pre-push              — gate the push on a clean full `lake build`.
+#   pre-push              — gate the push on a clean full `lake build`, then
+#                           publish the static site if the project opts in.
+#   post-commit           — remind (for an opted-in project) that a *.lean commit
+#                           can be published.
 # post-checkout / reference-transaction defer to `lean-cache refresh`, whose
 # staleness check keeps the high-frequency reference-transaction path a cheap
-# no-op. pre-push only runs when the push changes a *.lean file.
+# no-op. pre-push only runs when the push changes a *.lean file; post-commit is a
+# no-op unless the project carries a PUBLISH_MARKER.
 install_hooks() {
   local proj="$1" gitdir
   gitdir="$(git -C "$proj" rev-parse --git-common-dir 2>/dev/null)" || return 0
@@ -734,6 +757,17 @@ root=\"\$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0
 root=\"\$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0
 [[ -f \"\$root/lakefile.toml\" || -f \"\$root/lakefile.lean\" ]] || exit 0
 exec \"\${LEAN_CACHE_BIN:-$HOOK_BIN}\" pre-push-gate \"\$@\""
+
+  install_one_hook "$gitdir/hooks/post-commit" "#!/usr/bin/env bash
+# $HOOK_SENTINEL: after a commit touching *.lean, remind that the published site
+# can be refreshed. The hint logic lives in \`lean-cache commit-hint\` (as the
+# other hooks delegate to the CLI) so a fix reaches every worktree without
+# regenerating this hook. Opt in per project with a \`$PUBLISH_MARKER\` marker at
+# the repo root; without it this exits before doing any work.
+[[ -n \"\${LEAN_CACHE_NO_HOOK:-}\" ]] && exit 0
+root=\"\$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0
+[[ -f \"\$root/$PUBLISH_MARKER\" ]] || exit 0
+exec \"\${LEAN_CACHE_BIN:-$HOOK_BIN}\" commit-hint \"\$root\""
 }
 
 # The push build gate, invoked by the pre-push hook as `pre-push-gate <remote>`
@@ -780,6 +814,69 @@ cmd_pre_push_gate() {
       -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY -u GIT_QUARANTINE_PATH lake build ) \
     || { echo 'lean push gate: lake build FAILED — push aborted (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; exit 1; }
   echo 'lean push gate: build OK — allowing push' >&2
+  # The build just passed, so this is exactly the state worth publishing. A
+  # no-op unless the project opts in; never blocks the (already-allowed) push.
+  cmd_publish_site "$root" || true
+}
+
+# Render the project as a static HTML site via PUBLISHER, but only if it opts in
+# with a PUBLISH_MARKER file at its root. The marker may be empty (publisher
+# defaults) or hold `key=value` lines:
+#   output=DIR    -o DIR   output directory
+#   name=NAME     -n NAME  site name
+#   ttl=DURATION  -t TTL   static-serving TTL
+#   analysis=1             elaborate goal states (slow); omitted/0 => --no-analysis
+# Blank lines and `#` comments are ignored. Invoked automatically after a clean
+# push (see pre-push-gate); safe to run by hand. Never fails hard: an opt-out or
+# a missing/failing publisher is a logged no-op, so it can't break a push.
+cmd_publish_site() {
+  local root="${1:-}"
+  [[ -n "$root" ]] || root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+  local marker="$root/$PUBLISH_MARKER"
+  [[ -f "$marker" ]] || return 0
+  if [[ ! -x "$PUBLISHER" ]]; then
+    log "publish: publisher not found or not executable: $PUBLISHER"
+    return 0
+  fi
+  local out="" name="" ttl="" analysis="0" key val
+  while IFS='=' read -r key val || [[ -n "$key" ]]; do
+    key="$(trim "$key")"
+    [[ -z "$key" || "$key" == \#* ]] && continue
+    val="$(trim "$val")"
+    case "$key" in
+      output)   out="$val" ;;
+      name)     name="$val" ;;
+      ttl)      ttl="$val" ;;
+      analysis) analysis="$val" ;;
+      *) log "publish: ignoring unknown marker key '$key'" ;;
+    esac
+  done < "$marker"
+  local args=()
+  [[ "$analysis" == 1 || "$analysis" == true ]] || args+=(--no-analysis)
+  [[ -n "$out" ]]  && args+=(-o "$out")
+  [[ -n "$name" ]] && args+=(-n "$name")
+  [[ -n "$ttl" ]]  && args+=(-t "$ttl")
+  log "publish: rendering $root -> static site"
+  # Scrub git's hook-injected environment (as the build gate does) so the
+  # publisher's own git calls resolve against the project, not the superproject.
+  ( cd "$root" && env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX \
+      -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY -u GIT_QUARANTINE_PATH \
+      "$PUBLISHER" "${args[@]}" "$root" ) \
+    || log "publish: publisher failed (site not updated)"
+}
+
+# Print a one-line reminder after a commit that touches *.lean in an opted-in
+# project, noting the site refreshes on push and can be rendered now. Invoked by
+# the post-commit hook; a quiet no-op off an opted-in project or a *.lean commit.
+cmd_commit_hint() {
+  local root="${1:-}"
+  [[ -n "$root" ]] || root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+  [[ -f "$root/$PUBLISH_MARKER" ]] || return 0
+  local changed n
+  changed="$(git -C "$root" diff-tree --no-commit-id --name-only -r --root HEAD -- '*.lean' 2>/dev/null)" || return 0
+  n="$(printf '%s\n' "$changed" | grep -c .)"
+  [[ "$n" -gt 0 ]] || return 0
+  echo "lean-cache: committed changes to $n .lean file(s); the site publishes on push, or run 'lean-cache publish-site' to update it now." >&2
 }
 
 cmd_config() {
@@ -804,6 +901,8 @@ case "$cmd" in
   prune-builds) cmd_prune_builds  "$@" ;;
   fix-filemode) cmd_fix_filemode  "$@" ;;
   pre-push-gate) cmd_pre_push_gate "$@" ;;
+  publish-site) cmd_publish_site  "$@" ;;
+  commit-hint)  cmd_commit_hint   "$@" ;;
   list)      cmd_list      "$@" ;;
   resolve)   cmd_resolve   "$@" ;;
   config)    cmd_config    "$@" ;;

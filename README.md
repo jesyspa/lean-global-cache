@@ -116,35 +116,14 @@ the "pushed non-compiling code that targeted checks falsely reported green" case
 A full `lake build` can take minutes — that latency is the intended cost. Set
 `SKIP_LEAN_PUSH_GATE=1` to bypass it (e.g. right after a known-clean build).
 
-### Publishing a static site
-
-A project can opt into rendering itself as a static HTML site (via
-[lean-publisher]) on push. Drop a `.lean-publish` marker at the repo root:
-
-```bash
-: > .lean-publish                  # empty = publisher defaults
-# …or set options, one `key=value` per line:
-#   output=/srv/www/my-site        -> -o
-#   name=My Project                -> -n
-#   ttl=4h                         -> -t
-#   analysis=1                     elaborate goal states (slow); default off
-```
-
-With the marker present:
-
-- **On push** — after the pre-push gate's `lake build` passes, the site is
-  rendered (a no-op for projects without the marker). A failed build blocks the
-  push, so a broken site is never published.
-- **On commit** — a commit touching any `*.lean` prints a one-line reminder that
-  the site publishes on push (or can be rendered now with `lean-cache
-  publish-site`). `lean-cache publish-site [path]` renders on demand.
-
-The publisher defaults to `--no-analysis` (fast, no goal states) unless the
-marker sets `analysis=1`. Override the publisher path with `LEAN_CACHE_PUBLISHER`.
-Add `.lean-publish` to `.gitignore` to keep the per-checkout marker out of history.
-
-[lean-publisher]: the `publish-lean` tooling that renders a Lean project as a
-static site.
+Because the gate already builds the pushed commit to completion, it then
+**publishes that warm build** (`publish-build`) so future worktrees at the same
+commit seed instead of cold-building — capturing the build for reuse at exactly
+the moment a branch advances, at no extra build cost. Skip this with
+`LEAN_CACHE_NO_PUBLISH_ON_PUSH=1`. A commit touching any `*.lean` also prints a
+one-line reminder that `lean-cache publish-build` is available (silence with
+`LEAN_CACHE_NO_COMMIT_HINT=1`); it's just a nudge, since a clean push publishes
+automatically.
 
 ## Layout it manages
 

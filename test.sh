@@ -264,7 +264,10 @@ check "clean left the package overlay"         "$ovl_before" "$(live_slug "$P")"
 rc=0; "$CLI" clean "$TMP" >/dev/null 2>&1 || rc=$?   # non-Lake dir
 check "clean on non-Lake dir exits 0"          "0" "$rc"
 
-# Push gate: stub lake decides pass/fail; a bare remote receives the push.
+# Push gate: stub lake decides pass/fail; a bare remote receives the push. These
+# cases isolate the gate itself, so suppress the on-push warm-build publish (a
+# second lake invocation) — it is exercised in its own section below.
+export LEAN_CACHE_NO_PUBLISH_ON_PUSH=1
 "$CLI" use "$P" >/dev/null 2>&1                   # installs hooks (+ re-seeds)
 check "pre-push hook installed"               "yes" \
   "$(grep -ql lean-cache-managed-hook "$P/.git/hooks/pre-push" && echo yes || echo no)"
@@ -316,79 +319,49 @@ check "gate (linked worktree): lake ran"          "1" "$(grep -c '^lake' "$TMP/g
 check "gate scrubs GIT_DIR for lake build"        "0" "$(grep -c 'GIT_DIR=[^<]' "$TMP/genv.log" 2>/dev/null)"
 check "gate scrubs GIT_WORK_TREE for lake build"  "0" "$(grep -c 'GIT_WORK_TREE=[^<]' "$TMP/genv.log" 2>/dev/null)"
 
-echo "== static-site publishing (hermetic) =="
-# Stub publisher: record its argv (and git env) instead of rendering anything.
-PUB="$TMP/pubstub"; mkdir -p "$PUB"
-cat > "$PUB/publish.sh" <<'PS'
-#!/usr/bin/env bash
-echo "publish $*" >> "${PUB_LOG:-/dev/null}"
-echo "GIT_DIR=${GIT_DIR-<unset>}" >> "${PUB_ENV_LOG:-/dev/null}"
-exit "${PUB_RC:-0}"
-PS
-chmod +x "$PUB/publish.sh"
-export LEAN_CACHE_PUBLISHER="$PUB/publish.sh"
-M="$P/.lean-publish"
+echo "== publish-on-push & commit reminder (hermetic) =="
+unset LEAN_CACHE_NO_PUBLISH_ON_PUSH   # re-enable the on-push publish under test
+# True if the warm-build store holds a build published for commit $1.
+haspub() { grep -Rls "^commit=$1$" "$LEAN_CACHE_BUILDS" 2>/dev/null | grep -q . && echo yes || echo no; }
 
-# (a) No marker -> publish-site is a quiet no-op (opt-in only).
-: > "$TMP/pub.log2"
-PUB_LOG="$TMP/pub.log2" "$CLI" publish-site "$P" >/dev/null 2>&1
-check "publish-site no-ops without marker"      "0" "$(grep -c '^publish' "$TMP/pub.log2" 2>/dev/null)"
+# commit-hint: reminds on a *.lean commit, silent when no *.lean changed.
+printf 'def a := 4\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm edit2
+check "commit-hint reminds on .lean commit"       "yes" \
+  "$("$CLI" commit-hint "$P" 2>&1 | grep -q 'publish-build' && echo yes || echo no)"
+printf 'y\n' >> "$P/README.md"; gitc "$P" add README.md; gitc "$P" commit -qm doc3
+check "commit-hint silent on non-.lean commit"    "" "$("$CLI" commit-hint "$P" 2>&1)"
 
-# (b) Empty marker -> publisher runs with --no-analysis and the project root.
-: > "$M"; : > "$TMP/pub.log2"
-PUB_LOG="$TMP/pub.log2" "$CLI" publish-site "$P" >/dev/null 2>&1
-check "publish-site runs publisher with marker" "1" "$(grep -c '^publish' "$TMP/pub.log2" 2>/dev/null)"
-check "publish-site defaults to --no-analysis"  "yes" \
-  "$(grep -q -- '--no-analysis' "$TMP/pub.log2" && echo yes || echo no)"
-check "publish-site passes the project root"    "yes" \
-  "$(grep -qF -- "$P" "$TMP/pub.log2" && echo yes || echo no)"
-
-# (c) Marker options map to publisher flags; analysis=1 drops --no-analysis.
-printf 'output=/tmp/site\nname=My Proj\nttl=4h\nanalysis=1\n# a comment\n' > "$M"
-: > "$TMP/pub.log2"
-PUB_LOG="$TMP/pub.log2" "$CLI" publish-site "$P" >/dev/null 2>&1
-pline="$(grep '^publish' "$TMP/pub.log2")"
-check "marker output -> -o"              "yes" "$([[ "$pline" == *"-o /tmp/site"* ]] && echo yes || echo no)"
-check "marker name -> -n"                "yes" "$([[ "$pline" == *"-n My Proj"* ]] && echo yes || echo no)"
-check "marker ttl -> -t"                 "yes" "$([[ "$pline" == *"-t 4h"* ]] && echo yes || echo no)"
-check "analysis=1 omits --no-analysis"   "no"  "$([[ "$pline" == *"--no-analysis"* ]] && echo yes || echo no)"
-rm -f "$M"
-
-# (d) commit-hint reminds only for an opted-in project with a *.lean commit.
-printf 'def a := 4\n' > "$P/Proj/A.lean"; gitc "$P" add -A; gitc "$P" commit -qm edit2
-: > "$M"
-check "commit-hint reminds on .lean commit"     "yes" \
-  "$("$CLI" commit-hint "$P" 2>&1 | grep -q 'publishes on push' && echo yes || echo no)"
-rm -f "$M"
-check "commit-hint silent without marker"       "" "$("$CLI" commit-hint "$P" 2>&1)"
-# Marker stays untracked (a real project would .gitignore it); stage only the
-# doc so the marker is never swept into history.
-: > "$M"; printf 'x\n' >> "$P/README.md"; gitc "$P" add README.md; gitc "$P" commit -qm doc2
-check "commit-hint silent on non-.lean commit"  "" "$("$CLI" commit-hint "$P" 2>&1)"
-rm -f "$M"
-
-# (e) The post-commit hook is installed and delegates to commit-hint.
-check "post-commit hook installed"              "yes" \
+# The post-commit hook is installed and delegates to commit-hint.
+check "post-commit hook installed"                "yes" \
   "$(grep -ql lean-cache-managed-hook "$P/.git/hooks/post-commit" && echo yes || echo no)"
 check "post-commit hook delegates to commit-hint" "yes" \
   "$(grep -ql 'commit-hint' "$P/.git/hooks/post-commit" && echo yes || echo no)"
 
-# (f) A clean *.lean push publishes; a push whose build fails does not. The
-# marker only needs to exist in the worktree at push time (publish reads it from
-# disk, not from history), so it stays untracked here.
-: > "$M"
+# (a) A clean *.lean push captures the warm build for the pushed HEAD. The stub
+# lake does not produce artifacts, so stage a build tree the gate can publish.
 printf 'def a := 5\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm edit3
-: > "$TMP/pub.log2"; : > "$TMP/g.log"
-PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" PUB_LOG="$TMP/pub.log2" \
+c_ok="$(gitc "$P" rev-parse HEAD)"
+rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE5' > "$P/.lake/build/lib/lean/Proj/A.olean"
+: > "$TMP/g.log"
+PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
+check "clean push publishes the warm build"       "yes" "$(haspub "$c_ok")"
+
+# (b) LEAN_CACHE_NO_PUBLISH_ON_PUSH suppresses the capture.
+printf 'def a := 6\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm edit4
+c_skip="$(gitc "$P" rev-parse HEAD)"
+rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE6' > "$P/.lake/build/lib/lean/Proj/A.olean"
+: > "$TMP/g.log"
+PATH="$STUB:$PATH" LEAN_CACHE_NO_PUBLISH_ON_PUSH=1 LAKE_LOG="$TMP/g.log" \
   gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
-check "clean .lean push publishes the site"     "1" "$(grep -c '^publish' "$TMP/pub.log2" 2>/dev/null)"
-printf 'def a := 6\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm bad
-: > "$TMP/pub.log2"
-PATH="$STUB:$PATH" LAKE_RC=1 LAKE_LOG="$TMP/g.log" PUB_LOG="$TMP/pub.log2" \
-  gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
-check "failed build does not publish"           "0" "$(grep -c '^publish' "$TMP/pub.log2" 2>/dev/null)"
-rm -f "$M"
-unset LEAN_CACHE_PUBLISHER
+check "NO_PUBLISH_ON_PUSH skips the capture"      "no" "$(haspub "$c_skip")"
+
+# (c) A failing gate build aborts the push before any publish.
+printf 'def a := 7\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm bad
+c_bad="$(gitc "$P" rev-parse HEAD)"
+rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE7' > "$P/.lake/build/lib/lean/Proj/A.olean"
+: > "$TMP/g.log"
+PATH="$STUB:$PATH" LAKE_RC=1 LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
+check "failed gate build publishes nothing"       "no" "$(haspub "$c_bad")"
 
 echo "== build-store rotation (hermetic) =="
 # Fabricate builds with controlled publish times and check the keep/drop policy.

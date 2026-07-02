@@ -95,6 +95,8 @@ Usage: $PROG <command> [args]
                         build slot: at most LEAN_CACHE_BUILD_SLOTS (default 2)
                         heavy builds run concurrently host-wide, so each gets
                         real parallelism. Use for worker verification builds.
+                        A bare-word first arg is a lake target; a path must be
+                        \`.\` or contain a slash (use ./name for a relative dir).
   clean [path]          Remove the worktree's project build (.lake/build) to
                         reset it to a cold state, e.g. before a reused worktree
                         is handed to a new tenant. Leaves the package overlay
@@ -966,8 +968,12 @@ cmd_pre_push_gate() {
 # and each other, so a few builds run at full parallelism instead of many
 # crawling. Extra args go to lake build verbatim.
 cmd_build() {
+  # First arg is the project path only when it looks like one (".", or contains
+  # a slash) AND exists — a bare word is always a lake target, so a target that
+  # happens to share its name with a directory (e.g. `build Aliasing`) is never
+  # misparsed. Use ./name for a relative project dir.
   local proj="."
-  if [[ $# -ge 1 && -d "$1" ]]; then proj="$1"; shift; fi
+  if [[ $# -ge 1 && ( "$1" == "." || "$1" == */* ) && -d "$1" ]]; then proj="$1"; shift; fi
   proj="$(cd "$proj" && pwd)" || die "no such directory"
   [[ -f "$proj/lakefile.toml" || -f "$proj/lakefile.lean" ]] \
     || die "$proj is not a Lake project (no lakefile)"

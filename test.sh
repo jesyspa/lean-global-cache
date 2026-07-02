@@ -489,6 +489,13 @@ PATH="$STUB:$PATH" LAKE_LOG="$TMP/b.log" "$CLI" build "$P" Proj.A >/dev/null 2>&
 check "build wrapper passes extra args to lake" "lake build Proj.A" "$(cat "$TMP/b.log" 2>/dev/null)"
 rc=0; PATH="$STUB:$PATH" LAKE_RC=1 "$CLI" build "$P" >/dev/null 2>&1 || rc=$?
 check "build wrapper propagates build failure"  "1" "$rc"
+# A bare-word target that shares its name with a directory is a lake target,
+# never a project path (paths must be "." or contain a slash).
+mkdir -p "$P/Aliasing"
+: > "$TMP/b.log"
+( cd "$P" && PATH="$STUB:$PATH" LAKE_LOG="$TMP/b.log" "$CLI" build Aliasing >/dev/null 2>&1 )
+check "build wrapper: bare word is a target, not a path" "lake build Aliasing" "$(cat "$TMP/b.log" 2>/dev/null)"
+rm -rf "$P/Aliasing"
 
 # All slots busy + zero wait: degrade to an unserialized build with a note.
 flock "$TMP/lean-cache-build-slot.0.lock" sleep 20 &

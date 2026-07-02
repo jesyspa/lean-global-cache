@@ -287,6 +287,42 @@ prints a warning and lets the ref pass rather than green-lighting it on the
 strength of the wrong tree. To gate such a ref, check it out and push from that
 worktree.
 
+### Skipping the gate for a stored green build
+
+The gate skips its rebuild when the warm-build store already holds this exact
+(commit, toolchain) **published from a clean tree** (`tree_clean=1` in the
+manifest — no tracked changes, no untracked `.lean`/lakefile/toolchain files):
+such a build attests that the commit itself compiles, so rebuilding it only
+repeats minutes of work. This kills the observed triple-build pattern (a worker
+builds green and publishes, a coordinator re-verifies, and the gate built a
+third time) and the re-push of an already-green branch. A store entry published
+from a dirty tree records `tree_clean=0` and never skips — the artifacts may
+not correspond to the commit (they are still fine to *seed* from: Lake
+re-elaborates anything whose sources differ). `LEAN_CACHE_NO_GATE_SKIP=1`
+forces the rebuild.
+
+## Host-wide build serialization
+
+Concurrent full `lake build`s from several sessions oversubscribe the host
+(observed: four cold builds stacked on six cores, load ~20, a 10-line check
+taking 24 minutes), and every build crawls instead of a few finishing fast.
+The build-running commands — the pre-push gate, `publish-build`, and the
+`lean-cache build` wrapper — therefore take a **host build slot** first: one of
+`LEAN_CACHE_BUILD_SLOTS` (default 2) world-openable lock files under `/tmp`
+(`flock` on `lean-cache-build-slot.N.lock`), so at most that many heavy builds
+run at once, each with real parallelism.
+
+Serialization degrades, it never blocks work: a process that cannot get a slot
+within `LEAN_CACHE_BUILD_WAIT` seconds (default 3600) — or cannot use the lock
+files at all — proceeds unserialized with a note. Waiting and building both
+emit periodic progress lines, so a session watching a silent pipe can tell a
+minutes-long gate from a hang. The slot is held (fd 8) until the process exits;
+the gate's publish re-exec inherits `LEAN_CACHE_BUILD_SLOT_HELD` and rides the
+parent's slot rather than deadlocking on it. `LEAN_CACHE_BUILD_SLOTS=0`
+disables serialization. Plain `lake build` run by hand bypasses all of this —
+routing heavy verification builds through `lean-cache build` is what opts a
+workflow in.
+
 Like the two overlay hooks (which delegate to `refresh`), the installed
 `pre-push` hook is a thin stub: it does the cheap guards (`SKIP_LEAN_PUSH_GATE`,
 lakefile present) and then `exec`s `lean-cache pre-push-gate`, where the actual

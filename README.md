@@ -26,6 +26,7 @@ lean-cache use [version] [path]  # set up .lake/packages in a project
 lean-cache refresh [path]        # re-overlay only if the toolchain changed
 lean-cache seed-build [path]     # seed .lake/build from a stored warm build
 lean-cache publish-build [path]  # store this project's warm build for reuse
+lean-cache build [path] [args]   # lake build under a host build slot (serialized)
 lean-cache clean [path]          # wipe .lake/build (cold-reset a reused worktree)
 lean-cache prune-builds [--keep-days N]  # rotate the warm-build store
 lean-cache list                  # installed versions + sizes
@@ -115,6 +116,22 @@ and runs a bare `lake build`, aborting the push if the build fails. This catches
 the "pushed non-compiling code that targeted checks falsely reported green" case.
 A full `lake build` can take minutes — that latency is the intended cost. Set
 `SKIP_LEAN_PUSH_GATE=1` to bypass it (e.g. right after a known-clean build).
+
+The gate skips the rebuild when the warm-build store already holds this exact
+commit+toolchain published from a clean tree — that build already attests the
+commit compiles, so re-pushing an already-green branch (or pushing right after
+a `publish-build`) is near-instant. `LEAN_CACHE_NO_GATE_SKIP=1` forces the
+rebuild. The gate only vouches for the checked-out HEAD: pushing a ref whose
+tip is some other commit passes with a warning instead of being validated
+against the wrong tree.
+
+Heavy builds are serialized host-wide: the gate, `publish-build`, and
+`lean-cache build` take one of `LEAN_CACHE_BUILD_SLOTS` (default 2) lock slots
+first, so concurrent sessions don't stack five thrashing cold builds onto six
+cores. Waiting is capped (`LEAN_CACHE_BUILD_WAIT`, default 3600s) and degrades
+to an unserialized build rather than blocking; progress lines print while
+waiting and every 30s during the build. Route worker verification builds
+through `lean-cache build [path] [lake-build args]` to opt them in.
 
 Because the gate already builds the pushed commit to completion, it then
 **publishes that warm build** (`publish-build`) so future worktrees at the same

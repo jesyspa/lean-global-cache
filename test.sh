@@ -175,6 +175,7 @@ echo "== build seeding & push gate (hermetic) =="
 # the push gate can be exercised without the toolchain or the network. The store
 # is redirected to a throwaway dir via LEAN_CACHE_BUILDS.
 export LEAN_CACHE_BUILDS="$TMP/builds"
+export LEAN_CACHE_BUILD_LOCK_DIR="$TMP"   # never contend with real host builds
 STUB="$TMP/stub"; mkdir -p "$STUB"
 cat > "$STUB/lake" <<'LK'
 #!/usr/bin/env bash
@@ -190,6 +191,7 @@ mode()  { stat -c '%a' "$1" 2>/dev/null; }
 # A fake project with a pre-staged "warm build" tree.
 P="$TMP/proj"; mkdir -p "$P/Proj"; gitc "$P" init -q
 pin v4.30.0 "$P"; printf 'name="p"\n' > "$P/lakefile.toml"
+printf '.lake/\n' > "$P/.gitignore"          # as any real Lake project has
 printf 'def a := 1\n' > "$P/Proj/A.lean"
 gitc "$P" add -A; gitc "$P" commit -qm init
 pcommit="$(gitc "$P" rev-parse HEAD)"
@@ -277,9 +279,11 @@ git init -q --bare "$TMP/remote.git"
 gitc "$P" remote add origin "$TMP/remote.git"
 
 # Establish the baseline on the remote (the first push carries A.lean, so the
-# gate runs the build once here).
+# gate runs the build once here). NO_GATE_SKIP: the publish-build test above
+# stored a green build for this very commit, which would legitimately skip the
+# gate — the skip has its own section below; here we exercise the build path.
 : > "$TMP/g.log"
-PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
+PATH="$STUB:$PATH" LEAN_CACHE_NO_GATE_SKIP=1 LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
 check "gate: initial push (new .lean) runs lake" "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
 
 # (a) An incremental push whose diff has no *.lean must not invoke lake.
@@ -431,6 +435,93 @@ rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE7' 
 : > "$TMP/g.log"
 PATH="$STUB:$PATH" LAKE_RC=1 LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
 check "failed gate build publishes nothing"       "no" "$(haspub "$c_bad")"
+
+echo "== gate skip on stored green build (hermetic) =="
+# A clean-tree publish attests the commit: the gate must skip its rebuild when
+# the store already holds that (commit, toolchain) with tree_clean=1.
+printf 'def a := 8\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm edit5
+c5="$(gitc "$P" rev-parse HEAD)"
+rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE8' > "$P/.lake/build/lib/lean/Proj/A.olean"
+PATH="$STUB:$PATH" "$CLI" publish-build "$P" >/dev/null 2>&1
+m5="$(grep -Rl "^commit=$c5$" "$LEAN_CACHE_BUILDS" 2>/dev/null | head -1)"
+check "clean-tree publish stamps tree_clean=1"  "tree_clean=1" "$(grep '^tree_clean=' "$m5" 2>/dev/null)"
+: > "$TMP/g.log"
+out="$(PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$P" push origin HEAD:main 2>&1)"; rc=$?
+check "gate skips build for stored green HEAD"  "0" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
+check "gate announces the skip"                 "yes" \
+  "$(printf '%s' "$out" | grep -q 'skipping the gate build' && echo yes || echo no)"
+check "skipped-gate push goes through"          "$c5" \
+  "$(gitc "$P" ls-remote origin refs/heads/main | cut -f1)"
+
+# LEAN_CACHE_NO_GATE_SKIP forces the rebuild even with a stored green build.
+printf 'def a := 9\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm edit6
+rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE9' > "$P/.lake/build/lib/lean/Proj/A.olean"
+PATH="$STUB:$PATH" "$CLI" publish-build "$P" >/dev/null 2>&1
+: > "$TMP/g.log"
+PATH="$STUB:$PATH" LEAN_CACHE_NO_GATE_SKIP=1 LEAN_CACHE_NO_PUBLISH_ON_PUSH=1 \
+  LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
+check "NO_GATE_SKIP forces the gate build"      "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
+
+# A dirty-tree publish (untracked .lean present) attests nothing: tree_clean=0
+# and the gate must NOT skip.
+printf 'def stray := 0\n' > "$P/Stray.lean"                 # untracked source
+printf 'def a := 10\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm edit7
+c7="$(gitc "$P" rev-parse HEAD)"
+rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE10' > "$P/.lake/build/lib/lean/Proj/A.olean"
+PATH="$STUB:$PATH" "$CLI" publish-build "$P" >/dev/null 2>&1
+m7="$(grep -Rl "^commit=$c7$" "$LEAN_CACHE_BUILDS" 2>/dev/null | head -1)"
+check "dirty-tree publish stamps tree_clean=0"  "tree_clean=0" "$(grep '^tree_clean=' "$m7" 2>/dev/null)"
+rm -f "$P/Stray.lean"
+: > "$TMP/g.log"
+out="$(PATH="$STUB:$PATH" LEAN_CACHE_NO_PUBLISH_ON_PUSH=1 LAKE_LOG="$TMP/g.log" \
+       gitc "$P" push origin HEAD:main 2>&1)"; rc=$?
+check "gate does not skip on a dirty-tree store" "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
+check "no skip message on a dirty-tree store"    "no" \
+  "$(printf '%s' "$out" | grep -q 'skipping the gate build' && echo yes || echo no)"
+
+echo "== host build slots & lean-cache build (hermetic) =="
+# The wrapper runs lake build (with passthrough args) in the project.
+: > "$TMP/b.log"
+PATH="$STUB:$PATH" LAKE_LOG="$TMP/b.log" "$CLI" build "$P" >/dev/null 2>&1
+check "build wrapper runs lake build"           "lake build" "$(cat "$TMP/b.log" 2>/dev/null)"
+: > "$TMP/b.log"
+PATH="$STUB:$PATH" LAKE_LOG="$TMP/b.log" "$CLI" build "$P" Proj.A >/dev/null 2>&1
+check "build wrapper passes extra args to lake" "lake build Proj.A" "$(cat "$TMP/b.log" 2>/dev/null)"
+rc=0; PATH="$STUB:$PATH" LAKE_RC=1 "$CLI" build "$P" >/dev/null 2>&1 || rc=$?
+check "build wrapper propagates build failure"  "1" "$rc"
+
+# All slots busy + zero wait: degrade to an unserialized build with a note.
+flock "$TMP/lean-cache-build-slot.0.lock" sleep 20 &
+locker=$!
+until ! flock -n "$TMP/lean-cache-build-slot.0.lock" true 2>/dev/null; do sleep 0.1; done
+out="$(PATH="$STUB:$PATH" LEAN_CACHE_BUILD_SLOTS=1 LEAN_CACHE_BUILD_WAIT=0 "$CLI" build "$P" 2>&1)"; rc=$?
+check "contended slot degrades, build still runs" "0" "$rc"
+check "contended slot says so"                  "yes" \
+  "$(printf '%s' "$out" | grep -q 'proceeding unserialized' && echo yes || echo no)"
+# flock(1) forks: kill the child actually holding the lock (killing only the
+# wrapper leaves an orphaned sleep pinning the slot), then the wrapper itself.
+# Plain kill by pid — pkill is unreliable here (shimmed on some hosts).
+kill $(ps -o pid= --ppid "$locker" 2>/dev/null) 2>/dev/null || true
+kill "$locker" 2>/dev/null || true; wait "$locker" 2>/dev/null || true
+
+# LEAN_CACHE_BUILD_SLOTS=0 disables serialization entirely (no slot chatter).
+out="$(PATH="$STUB:$PATH" LEAN_CACHE_BUILD_SLOTS=0 "$CLI" build "$P" 2>&1)"; rc=$?
+check "SLOTS=0 disables serialization"          "0" "$rc"
+check "SLOTS=0 emits no slot messages"          "no" \
+  "$(printf '%s' "$out" | grep -q 'build slot' && echo yes || echo no)"
+
+# The gate's publish re-exec rides the gate's own slot (no self-deadlock, no
+# waiting): with a single slot and publish-on-push enabled, the push completes
+# with two lake runs (gate + publish's no-op) and never waits for a slot.
+printf 'def a := 11\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm edit8
+rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE11' > "$P/.lake/build/lib/lean/Proj/A.olean"
+: > "$TMP/g.log"
+out="$(PATH="$STUB:$PATH" LEAN_CACHE_BUILD_SLOTS=1 LEAN_CACHE_BUILD_WAIT=45 \
+       LAKE_LOG="$TMP/g.log" gitc "$P" push origin HEAD:main 2>&1)"; rc=$?
+check "gate+publish share one slot: push succeeds" "0" "$rc"
+check "gate+publish share one slot: both builds ran" "2" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
+check "gate+publish share one slot: no slot wait"  "no" \
+  "$(printf '%s' "$out" | grep -q 'waiting for a host build slot' && echo yes || echo no)"
 
 echo "== build-store rotation (hermetic) =="
 # Fabricate builds with controlled publish times and check the keep/drop policy.

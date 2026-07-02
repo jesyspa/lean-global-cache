@@ -275,7 +275,7 @@ check "pre-push hook installed"               "yes" \
   "$(grep -ql lean-cache-managed-hook "$P/.git/hooks/pre-push" && echo yes || echo no)"
 check "pre-push hook delegates to pre-push-gate" "yes" \
   "$(grep -ql 'pre-push-gate' "$P/.git/hooks/pre-push" && echo yes || echo no)"
-git init -q --bare "$TMP/remote.git"
+git init -q --bare -b main "$TMP/remote.git"
 gitc "$P" remote add origin "$TMP/remote.git"
 
 # Establish the baseline on the remote (the first push carries A.lean, so the
@@ -331,7 +331,7 @@ pin v4.30.0 "$E"; printf 'name="p"\n' > "$E/lakefile.toml"
 printf 'def e := 1\n' > "$E/E.lean"
 gitc "$E" add -A; gitc "$E" commit -qm lean-change
 printf 'doc\n' > "$E/README.md"; gitc "$E" add -A; gitc "$E" commit -qm doc-tip
-git init -q --bare "$TMP/eremote.git"; gitc "$E" remote add origin "$TMP/eremote.git"
+git init -q --bare -b main "$TMP/eremote.git"; gitc "$E" remote add origin "$TMP/eremote.git"
 "$CLI" use "$E" >/dev/null 2>&1
 : > "$TMP/g.log"
 PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$E" push -q origin HEAD:main >/dev/null 2>&1 || true
@@ -340,7 +340,7 @@ check "gate: new-branch push gates non-tip .lean commits" "1" "$(grep -c '^lake'
 # (f) Force-push when the remote moved and was never fetched: the remote tip's
 # object is absent locally, so the roid..loid diff cannot run. The gate must
 # fall back to the remote-tracking range (not die silently) and still build.
-git init -q --bare "$TMP/fremote.git"
+git init -q --bare -b main "$TMP/fremote.git"
 F="$TMP/fpush"; mkdir -p "$F"; gitc "$F" init -q
 pin v4.30.0 "$F"; printf 'name="p"\n' > "$F/lakefile.toml"
 printf 'def f := 1\n' > "$F/F.lean"; gitc "$F" add -A; gitc "$F" commit -qm init
@@ -377,7 +377,7 @@ check "gate: undecidable rollback push goes through" "0" "$rc"
 G="$TMP/gpush"; mkdir -p "$G"; gitc "$G" init -q
 pin v4.30.0 "$G"; printf 'name="p"\n' > "$G/lakefile.toml"
 printf 'def h := 1\n' > "$G/H.lean"; gitc "$G" add -A; gitc "$G" commit -qm init
-git init -q --bare "$TMP/gremote.git"; gitc "$G" remote add origin "$TMP/gremote.git"
+git init -q --bare -b main "$TMP/gremote.git"; gitc "$G" remote add origin "$TMP/gremote.git"
 "$CLI" use "$G" >/dev/null 2>&1
 PATH="$STUB:$PATH" gitc "$G" push -q origin HEAD:main >/dev/null 2>&1
 gitc "$G" switch -qc feature 2>/dev/null || gitc "$G" checkout -qb feature

@@ -162,6 +162,14 @@ build`) to block to completion regardless of mode; the pre-push gate and
 build riding a parent's slot (`LEAN_CACHE_BUILD_SLOT_HELD`) completes in place —
 no second slot, no bail. `LEAN_CACHE_BUILD_SLOTS=0` disables serialization.
 
+Before either path runs, the build policy also checks the project's package
+overlay: if a shared-cache symlink under `.lake/packages` has gone dangling
+(e.g. its version was `uninstall`ed out from under a worktree that still
+points at it), it re-overlays once to repair it, then proceeds. A healthy
+overlay costs one stat and changes nothing, so this never touches an
+already-fine `.lake/build`; you no longer need to run `lean-cache use` by hand
+to recover from a broken overlay.
+
 Because the gate already builds the pushed commit to completion, it then
 **publishes that warm build** (`publish-build`) so future worktrees at the same
 commit seed instead of cold-building — capturing the build for reuse at exactly

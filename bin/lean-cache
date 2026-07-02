@@ -707,6 +707,26 @@ live_overlay_slug() {
   printf '%s' "${link%%/*}"
 }
 
+# True when the project's overlay carries a shared-cache symlink that no longer
+# resolves — e.g. its target version was `uninstall`ed out from under a
+# worktree that still points at it. Only fires when .lake/packages already
+# holds an overlay (so a project that has never been `use`d, or one with no
+# shared-cache dependency at all, is left alone rather than forced into one).
+# This is the cheap presence check `build` runs before every build; it must
+# never be fooled by live_overlay_slug's read-the-symlink-text check, which
+# can't see a dangling target.
+overlay_broken() { # arg: proj
+  local pkgdir="$1/.lake/packages" ent
+  [[ -d "$pkgdir" ]] || return 1
+  for ent in "$pkgdir"/* "$pkgdir"/.[!.]*; do
+    [[ -L "$ent" ]] || continue
+    case "$(readlink "$ent" 2>/dev/null)" in
+      "$LAKES"/*) [[ -e "$ent" ]] || return 0 ;;
+    esac
+  done
+  return 1
+}
+
 # Re-overlay the project only when its live overlay is stale — i.e. points at a
 # different toolchain than the one its lean-toolchain now pins (or has no overlay
 # yet). On a match this is a one-symlink-read no-op, which is what makes it safe
@@ -1137,6 +1157,17 @@ cmd_build() {
   else
     RERUN_HINT="$PROG build${orig[*]:+ ${orig[*]}}"
   fi
+
+  # Self-heal a broken overlay before building, so a build never has to be
+  # preceded by a manual `lean-cache use`. Only fires on an actually-dangling
+  # overlay (see overlay_broken) — never unconditionally, since cmd_use's own
+  # seed-build can replace an incremental .lake/build the instance is mid-edit
+  # on, which would be actively harmful on the common warm/incremental path.
+  if overlay_broken "$proj"; then
+    log "package overlay in $proj is stale (a shared-cache symlink no longer resolves); repairing"
+    cmd_use "$proj"
+  fi
+
   run_build_policied "$proj" "$PROG build" "$@"
 }
 

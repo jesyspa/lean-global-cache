@@ -158,6 +158,31 @@ The two overlay hooks no-op outside a Lean project and while the CLI is
 mid-overlay (`LEAN_CACHE_NO_HOOK`), so they can never recurse through their own
 ref updates.
 
+### Self-healing a dangling overlay on build
+
+`refresh`'s staleness check only reads the slug encoded in the live overlay's
+`readlink` text — it never checks whether that target still resolves. That's
+fine for the toolchain-bump case it exists for, but it means a version
+`uninstall`ed out from under a worktree that still points at it (or an overlay
+otherwise mangled by hand) would look "current" to `refresh` forever, so the
+hooks alone would never repair it. `lean-cache build` (and, via the shim, bare
+`lake build`) covers that gap: before it calls the shared build policy, it
+checks whether `.lake/packages` already holds an overlay and, if so, whether
+any of its shared-cache symlinks has gone dangling (`overlay_broken`). Only
+then does it re-run `use` to repair it; a healthy overlay costs one directory
+scan and changes nothing. This makes a manual `lean-cache use` unnecessary to
+recover from a broken overlay.
+
+The check deliberately does **not** fire on a project with no overlay yet
+(`.lake/packages` absent) — that's not "broken", it's "never provisioned",
+and forcing one into existence on every cold build would both mis-provision a
+project with no shared-cache dependency and, worse, risk masking the fact that
+the hooks never ran. It also must never be unconditional: `use`'s own
+`seed-build` replaces `.lake/build/{lib,ir}` when the worktree's HEAD matches
+a stored build, which is exactly the incremental build state a plain `lake
+build` must never disturb — so the repair is gated strictly on an actual
+dangling symlink, never run on the common warm/incremental path.
+
 ## Project build seeding
 
 `.lake/packages` (mathlib) is shared, but `.lake/build` — the project's own

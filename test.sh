@@ -711,6 +711,61 @@ check "shim cold bail ran no real build"          "0" "$(grep -c '^lake build' "
 check "shim cold bail names 'lake build' to re-run" "yes" \
   "$(printf '%s' "$out" | grep -q 'lake build' && echo yes || echo no)"
 
+echo "== overlay self-heal on build (hermetic) =="
+# A project whose shared-cache overlay has gone dangling (e.g. its version was
+# uninstalled from underneath it) must be silently repaired by `build` before
+# it runs lake — no manual `lean-cache use` required.
+mkdir -p "$TMP/cache/lakes/v9-2-0/packages/mathlib" "$TMP/cache/lakes/v9-2-0/packages/batteries"
+OV="$TMP/selfheal"; mkdir -p "$OV/Proj"; gitc "$OV" init -q
+pin v9.2.0 "$OV"; printf 'name="p"\n' > "$OV/lakefile.toml"
+printf '.lake/\n' > "$OV/.gitignore"; printf 'def o := 1\n' > "$OV/Proj/O.lean"
+gitc "$OV" add -A; gitc "$OV" commit -qm init
+"$CLI" use "$OV" >/dev/null 2>&1
+mkdir -p "$OV/.lake/build/lib/lean/Proj" "$OV/.lake/build/ir/Proj"
+printf 'OLEAN-O' > "$OV/.lake/build/lib/lean/Proj/O.olean"
+printf 'IR-O'    > "$OV/.lake/build/ir/Proj/O.c"
+mathlib_target="$(readlink "$OV/.lake/packages/mathlib")"
+
+# (a) overlay present: build runs directly, no repair, and the existing
+# incremental .lake/build is left untouched (not wiped by a needless reseed).
+: > "$TMP/b.log"
+out="$(PATH="$STUB:$PATH" LAKE_LOG="$TMP/b.log" "$CLI" build "$OV" 2>&1)"; rc=$?
+check "healthy overlay: build ran lake"           "1" "$(grep -c '^lake build' "$TMP/b.log" 2>/dev/null)"
+check "healthy overlay: build exits 0"            "0" "$rc"
+check "healthy overlay: no repair message"        "no" \
+  "$(printf '%s' "$out" | grep -qi 'repairing' && echo yes || echo no)"
+check "healthy overlay: mathlib link unchanged"   "$mathlib_target" "$(readlink "$OV/.lake/packages/mathlib")"
+check "healthy overlay: build/lib olean intact"   "OLEAN-O" "$(cat "$OV/.lake/build/lib/lean/Proj/O.olean" 2>/dev/null)"
+check "healthy overlay: build/ir intact"          "IR-O" "$(cat "$OV/.lake/build/ir/Proj/O.c" 2>/dev/null)"
+
+# (b) overlay dangling: repair runs (re-links to the real shared package), then
+# the build proceeds. No stored warm build matches this commit, so the repair's
+# own seed-build stays a no-op and .lake/build is left alone too.
+ln -sfn "$TMP/cache/lakes/v9-2-0/packages/nonexistent" "$OV/.lake/packages/mathlib"
+: > "$TMP/b.log"
+out="$(PATH="$STUB:$PATH" LAKE_LOG="$TMP/b.log" "$CLI" build "$OV" 2>&1)"; rc=$?
+check "dangling overlay: repair message shown"    "yes" \
+  "$(printf '%s' "$out" | grep -qi 'repairing' && echo yes || echo no)"
+check "dangling overlay: mathlib re-linked"        "$mathlib_target" "$(readlink "$OV/.lake/packages/mathlib")"
+check "dangling overlay: mathlib resolves"         "yes" "$([[ -e "$OV/.lake/packages/mathlib" ]] && echo yes || echo no)"
+check "dangling overlay: build still ran lake"     "1" "$(grep -c '^lake build' "$TMP/b.log" 2>/dev/null)"
+check "dangling overlay: build exits 0"            "0" "$rc"
+check "dangling overlay: build/lib olean intact"   "OLEAN-O" "$(cat "$OV/.lake/build/lib/lean/Proj/O.olean" 2>/dev/null)"
+
+# (c) A project with no shared-cache overlay at all (never `use`d) is left
+# alone: build must not force one into existence off a bare mathlib-missing
+# check — the hooks are what provision a fresh checkout.
+NV="$TMP/nooverlay"; mkdir -p "$NV/Proj"; gitc "$NV" init -q
+pin v9.2.0 "$NV"; printf 'name="p"\n' > "$NV/lakefile.toml"
+printf '.lake/\n' > "$NV/.gitignore"; printf 'def n := 1\n' > "$NV/Proj/N.lean"
+gitc "$NV" add -A; gitc "$NV" commit -qm init
+: > "$TMP/b.log"
+out="$(PATH="$STUB:$PATH" CLAUDE_BASH_MODE=background LAKE_LOG="$TMP/b.log" "$CLI" build "$NV" 2>&1)"; rc=$?
+check "no overlay yet: build does not force one"  "no" \
+  "$([[ -e "$NV/.lake/packages" ]] && echo yes || echo no)"
+check "no overlay yet: build still ran lake"      "1" "$(grep -c '^lake build' "$TMP/b.log" 2>/dev/null)"
+check "no overlay yet: build exits 0"             "0" "$rc"
+
 echo "== build-store rotation (hermetic) =="
 # Fabricate builds with controlled publish times and check the keep/drop policy.
 mkbuild() { # mkbuild <repodir> <commit> <slug> <age_days>

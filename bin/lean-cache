@@ -307,8 +307,10 @@ cmd_install() {
 
   # `elan toolchain install` errors (nonzero) if the toolchain already exists,
   # which would abort under `set -e`; only install when it's actually missing.
+  # elan suffixes the default toolchain with " (default)", so strip that before
+  # the exact match or an installed default would be "missing" and re-installed.
   log "ensuring toolchain $TOOLCHAIN"
-  if elan toolchain list 2>/dev/null | grep -qxF "$TOOLCHAIN"; then
+  if elan toolchain list 2>/dev/null | sed 's/ (default)$//' | grep -qxF "$TOOLCHAIN"; then
     log "toolchain $TOOLCHAIN already present"
   else
     elan toolchain install "$TOOLCHAIN"

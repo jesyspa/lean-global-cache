@@ -123,7 +123,7 @@ trap 'rm -f "$SUDO_TMP"' EXIT
 cat > "$SUDO_TMP" <<EOF
 # Managed by lean-global-cache (admin/setup-standalone.sh).
 # Any local user may manage the shared Lean cache as its owner, $OWNER.
-ALL ALL=($OWNER) NOPASSWD: $BIN install *, $BIN uninstall *
+ALL ALL=($OWNER) NOPASSWD: $BIN install *, $BIN uninstall *, $BIN fix-filemode
 EOF
 visudo -cf "$SUDO_TMP" >/dev/null || { echo "sudoers syntax check failed" >&2; exit 1; }
 install -m 0440 -o root -g root "$SUDO_TMP" /etc/sudoers.d/lean-cache

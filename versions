@@ -6,5 +6,4 @@
 # installed ad-hoc via `lean-cache install` are left alone, never auto-removed.
 # Pruning is manual via `lean-cache uninstall`.
 
-4.28.0
 4.30.0

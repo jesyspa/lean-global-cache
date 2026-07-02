@@ -319,6 +319,73 @@ check "gate (linked worktree): lake ran"          "1" "$(grep -c '^lake' "$TMP/g
 check "gate scrubs GIT_DIR for lake build"        "0" "$(grep -c 'GIT_DIR=[^<]' "$TMP/genv.log" 2>/dev/null)"
 check "gate scrubs GIT_WORK_TREE for lake build"  "0" "$(grep -c 'GIT_WORK_TREE=[^<]' "$TMP/genv.log" 2>/dev/null)"
 
+# (e) First push of a multi-commit new branch gates on the WHOLE new history,
+# not just the tip commit: commit 1 adds a .lean, the tip is doc-only, and the
+# gate must still build (the .lean is new to the remote).
+E="$TMP/newrepo"; mkdir -p "$E"; gitc "$E" init -q
+pin v4.30.0 "$E"; printf 'name="p"\n' > "$E/lakefile.toml"
+printf 'def e := 1\n' > "$E/E.lean"
+gitc "$E" add -A; gitc "$E" commit -qm lean-change
+printf 'doc\n' > "$E/README.md"; gitc "$E" add -A; gitc "$E" commit -qm doc-tip
+git init -q --bare "$TMP/eremote.git"; gitc "$E" remote add origin "$TMP/eremote.git"
+"$CLI" use "$E" >/dev/null 2>&1
+: > "$TMP/g.log"
+PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$E" push -q origin HEAD:main >/dev/null 2>&1 || true
+check "gate: new-branch push gates non-tip .lean commits" "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
+
+# (f) Force-push when the remote moved and was never fetched: the remote tip's
+# object is absent locally, so the roid..loid diff cannot run. The gate must
+# fall back to the remote-tracking range (not die silently) and still build.
+git init -q --bare "$TMP/fremote.git"
+F="$TMP/fpush"; mkdir -p "$F"; gitc "$F" init -q
+pin v4.30.0 "$F"; printf 'name="p"\n' > "$F/lakefile.toml"
+printf 'def f := 1\n' > "$F/F.lean"; gitc "$F" add -A; gitc "$F" commit -qm init
+gitc "$F" remote add origin "$TMP/fremote.git"
+"$CLI" use "$F" >/dev/null 2>&1
+PATH="$STUB:$PATH" gitc "$F" push -q origin HEAD:main >/dev/null 2>&1
+F2="$TMP/fpush2"; git clone -q "$TMP/fremote.git" "$F2"
+printf 'def g := 2\n' > "$F2/G.lean"; gitc "$F2" add -A; gitc "$F2" commit -qm other
+gitc "$F2" push -q origin HEAD:main >/dev/null 2>&1     # remote advances
+printf 'def f := 3\n' > "$F/F.lean"; gitc "$F" add -A; gitc "$F" commit -qm mine
+: > "$TMP/g.log"
+out="$(PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$F" push --force origin HEAD:main 2>&1)"; rc=$?
+check "gate: unfetched force-push still builds"   "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
+check "gate: unfetched force-push goes through"   "0" "$rc"
+check "gate: unfetched force-push announces the gate" "yes" \
+  "$(printf '%s' "$out" | grep -q 'lean push gate' && echo yes || echo no)"
+
+# (f2) Force-push rollback to a commit the remote-tracking refs already have:
+# the changed set is undecidable locally, so the gate builds conservatively.
+gitc "$F" fetch -q origin
+gitc "$F" reset --hard -q "HEAD~1" >/dev/null 2>&1
+# advance the remote once more so its tip is again unknown to F (F's own
+# force-push moved the remote, so this one must force too)
+printf 'def g := 3\n' > "$F2/G.lean"; gitc "$F2" add -A; gitc "$F2" commit -qm more
+gitc "$F2" push -q --force origin HEAD:main >/dev/null 2>&1
+: > "$TMP/g.log"
+out="$(PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$F" push --force origin HEAD:main 2>&1)"; rc=$?
+check "gate: undecidable rollback push builds conservatively" "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
+check "gate: undecidable rollback push goes through" "0" "$rc"
+
+# (g) Pushing a ref whose tip is NOT the checked-out HEAD: the gate can only
+# build the current worktree, so it must warn and pass the ref ungated instead
+# of green-lighting it on the strength of the wrong tree.
+G="$TMP/gpush"; mkdir -p "$G"; gitc "$G" init -q
+pin v4.30.0 "$G"; printf 'name="p"\n' > "$G/lakefile.toml"
+printf 'def h := 1\n' > "$G/H.lean"; gitc "$G" add -A; gitc "$G" commit -qm init
+git init -q --bare "$TMP/gremote.git"; gitc "$G" remote add origin "$TMP/gremote.git"
+"$CLI" use "$G" >/dev/null 2>&1
+PATH="$STUB:$PATH" gitc "$G" push -q origin HEAD:main >/dev/null 2>&1
+gitc "$G" switch -qc feature 2>/dev/null || gitc "$G" checkout -qb feature
+printf 'def broken :=\n' > "$G/H.lean"; gitc "$G" add -A; gitc "$G" commit -qm feat
+gitc "$G" switch -q - 2>/dev/null || gitc "$G" checkout -q "@{-1}"
+: > "$TMP/g.log"
+out="$(PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$G" push origin feature:feature 2>&1)"; rc=$?
+check "gate: non-HEAD ref push does not run lake"  "0" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
+check "gate: non-HEAD ref push warns it is ungated" "yes" \
+  "$(printf '%s' "$out" | grep -q 'NOT gated' && echo yes || echo no)"
+check "gate: non-HEAD ref push goes through"        "0" "$rc"
+
 echo "== publish-on-push & commit reminder (hermetic) =="
 unset LEAN_CACHE_NO_PUBLISH_ON_PUSH   # re-enable the on-push publish under test
 # True if the warm-build store holds a build published for commit $1.
@@ -330,6 +397,8 @@ check "commit-hint reminds on .lean commit"       "yes" \
   "$("$CLI" commit-hint "$P" 2>&1 | grep -q 'publish-build' && echo yes || echo no)"
 printf 'y\n' >> "$P/README.md"; gitc "$P" add README.md; gitc "$P" commit -qm doc3
 check "commit-hint silent on non-.lean commit"    "" "$("$CLI" commit-hint "$P" 2>&1)"
+rc=0; "$CLI" commit-hint "$P" >/dev/null 2>&1 || rc=$?
+check "commit-hint exits 0 on non-.lean commit"   "0" "$rc"
 
 # The post-commit hook is installed and delegates to commit-hint.
 check "post-commit hook installed"                "yes" \

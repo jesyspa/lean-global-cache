@@ -267,6 +267,26 @@ gate. It is generic (no project-specific paths), no-ops when the push changes no
 `*.lean`, and is bypassable with `SKIP_LEAN_PUSH_GATE=1` for when the user has
 just run a clean build themselves.
 
+The changed set for a pushed ref is computed against the best base available,
+degrading conservatively:
+
+- remote ref exists and its tip is in the local odb — plain `roid..loid` diff;
+- ref is new on the remote, or the remote tip is absent locally (a force-push
+  after the remote moved, without fetching) — diff from just below the oldest
+  pushed commit no remote-tracking ref already has, or from the **empty tree**
+  when the entire history is new to the remote (a first push gates every commit,
+  not just the tip);
+- remote tip absent *and* every pushed commit is already on a remote-tracking
+  ref (a force-pushed rollback) — the changed set is undecidable locally, so the
+  gate builds anyway rather than waving the push through.
+
+The gate can only build the tree it has: the checked-out worktree. A pushed ref
+whose tip is not the worktree's HEAD (`git push origin other` while on `main`)
+is **not gated** — a build of `main` says nothing about `other`, so the gate
+prints a warning and lets the ref pass rather than green-lighting it on the
+strength of the wrong tree. To gate such a ref, check it out and push from that
+worktree.
+
 Like the two overlay hooks (which delegate to `refresh`), the installed
 `pre-push` hook is a thin stub: it does the cheap guards (`SKIP_LEAN_PUSH_GATE`,
 lakefile present) and then `exec`s `lean-cache pre-push-gate`, where the actual

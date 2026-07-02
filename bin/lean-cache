@@ -760,33 +760,64 @@ exec \"\${LEAN_CACHE_BIN:-$HOOK_BIN}\" commit-hint \"\$root\""
 # olean and report a false green) and run the bare default `lake build`; abort
 # the push (nonzero exit) if it fails. A full build can take minutes — that
 # latency is the intended cost of the gate.
+#
+# The gate can only build the tree it has: the checked-out worktree. A pushed
+# ref whose tip is not the worktree's HEAD (e.g. `git push origin other` while
+# on main) is therefore NOT gated — the gate warns and lets it pass rather than
+# green-lighting `other` on the strength of a build of `main`.
 cmd_pre_push_gate() {
-  local remote="${1:-}" root changed new base parent f
+  local remote="${1:-}" root head changed new base parent f tip know
+  local gate=0 undecided=0 ungated=""
   root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
   [[ -f "$root/lakefile.toml" || -f "$root/lakefile.lean" ]] || exit 0
+  head="$(git rev-parse -q --verify HEAD 2>/dev/null || true)"
   changed=""
-  while read -r _lref loid _rref roid; do
-    [[ "$loid" =~ ^0+$ ]] && continue
-    if [[ "$roid" =~ ^0+$ ]]; then
-      base="$(git rev-list "$loid" --not --remotes="$remote" 2>/dev/null | tail -1)"
-      [[ -n "$base" ]] || continue
-      parent="$(git rev-parse -q --verify "$base^" 2>/dev/null || true)"
-      if [[ -n "$parent" ]]; then
-        new="$(git diff --name-only "$parent" "$loid" -- '*.lean' 2>/dev/null)"
-      else
-        new="$(git diff-tree --no-commit-id --name-only -r --root "$loid" -- '*.lean' 2>/dev/null)"
+  while read -r lref loid _rref roid; do
+    [[ "$loid" =~ ^0+$ ]] && continue          # ref deletion: nothing to build
+    new=""; know=1
+    if [[ "$roid" =~ ^0+$ ]] || ! new="$(git diff --name-only "$roid" "$loid" -- '*.lean' 2>/dev/null)"; then
+      # No remote tip to diff against: the ref is new on the remote, or the
+      # remote tip's object is absent locally (a force-push after the remote
+      # moved, without fetching). Diff from just below the oldest pushed commit
+      # that no remote-tracking ref already has — or from the empty tree when
+      # the entire history is new to the remote.
+      new=""
+      base="$(git rev-list "$loid" --not --remotes="$remote" 2>/dev/null | tail -1)" || base=""
+      if [[ -n "$base" ]]; then
+        parent="$(git rev-parse -q --verify "$base^" 2>/dev/null || true)"
+        [[ -n "$parent" ]] || parent="$(git hash-object -t tree /dev/null)"
+        new="$(git diff --name-only "$parent" "$loid" -- '*.lean' 2>/dev/null)" || new=""
+      elif [[ ! "$roid" =~ ^0+$ ]]; then
+        # Unknown remote tip and every pushed commit is already on some
+        # remote-tracking ref (e.g. force-pushing a rollback): what the push
+        # changes is undecidable here, so gate it rather than wave it through.
+        know=0
       fi
-    else
-      new="$(git diff --name-only "$roid" "$loid" -- '*.lean' 2>/dev/null)"
     fi
-    changed="$changed$new
+    [[ -n "$new" || "$know" -eq 0 ]] || continue
+    tip="$(git rev-parse -q --verify "$loid^{commit}" 2>/dev/null || true)"
+    if [[ -n "$head" && "$tip" == "$head" ]]; then
+      gate=1
+      [[ "$know" -eq 1 ]] || undecided=1
+      changed="$changed$new
 "
+    else
+      ungated="$ungated $lref"
+    fi
   done
+  [[ -z "$ungated" ]] || echo "lean push gate: WARNING: pushed ref(s)$ungated change .lean but their tip is not the checked-out HEAD; the gate can only build the current worktree, so they are NOT gated. Check the ref out and push from that worktree to gate it." >&2
+  [[ "$gate" -eq 1 ]] || exit 0
   changed="$(printf '%s\n' "$changed" | sort -u | sed '/^$/d')"
-  [[ -n "$changed" ]] || exit 0
-  while IFS= read -r f; do [[ -n "$f" && -f "$root/$f" ]] && touch "$root/$f"; done <<< "$changed"
+  while IFS= read -r f; do
+    if [[ -n "$f" && -f "$root/$f" ]]; then touch "$root/$f"; fi
+  done <<< "$changed"
   command -v lake >/dev/null 2>&1 || { echo 'lean push gate: lake not found in PATH (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; exit 1; }
-  echo "lean push gate: $(printf '%s\n' "$changed" | grep -c .) changed .lean file(s); running full 'lake build' (may take minutes)..." >&2
+  local n; n="$(printf '%s\n' "$changed" | grep -c . || true)"
+  if [[ "$undecided" -eq 1 && "$n" -eq 0 ]]; then
+    echo "lean push gate: cannot compute the changed .lean set (remote tip not fetched); running full 'lake build' (may take minutes)..." >&2
+  else
+    echo "lean push gate: $n changed .lean file(s); running full 'lake build' (may take minutes)..." >&2
+  fi
   # Build in a clean git environment. git push from a linked worktree exports
   # GIT_DIR/GIT_WORK_TREE into the hook (and so into here); if Lake inherits
   # them, each 'git remote get-url' it runs to validate a dependency resolves
@@ -817,7 +848,7 @@ cmd_commit_hint() {
   [[ -n "$root" ]] || root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
   local changed n
   changed="$(git -C "$root" diff-tree --no-commit-id --name-only -r --root HEAD -- '*.lean' 2>/dev/null)" || return 0
-  n="$(printf '%s\n' "$changed" | grep -c .)"
+  n="$(printf '%s\n' "$changed" | grep -c . || true)"
   [[ "$n" -gt 0 ]] || return 0
   echo "lean-cache: committed changes to $n .lean file(s); run 'lean-cache publish-build' to store the warm build for reuse (a clean push publishes it automatically)." >&2
 }

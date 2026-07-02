@@ -571,14 +571,41 @@ cmd_uninstall() {
   normalize_version "$1"
   require_owner uninstall "$1"
 
+  local removed=0
+
   local dest; dest="$(dest_for "$SLUG")"
-  [[ -d "$dest" ]] || { log "$TCVER not installed (nothing to do)"; return 0; }
-  local dest_owner; dest_owner="$(stat -c '%U' "$dest")"
-  [[ "$dest_owner" == "$OWNER" ]] \
-    || die "$dest is owned by $dest_owner, not $OWNER — refusing to remove"
-  log "removing $dest"
-  rm -rf "$dest"
-  log "uninstalled $TCVER"
+  if [[ -d "$dest" ]]; then
+    local dest_owner; dest_owner="$(stat -c '%U' "$dest")"
+    [[ "$dest_owner" == "$OWNER" ]] \
+      || die "$dest is owned by $dest_owner, not $OWNER — refusing to remove"
+    log "removing $dest"
+    rm -rf "$dest"
+    removed=1
+  else
+    log "$TCVER lake cache not installed (nothing to do)"
+  fi
+
+  # elan suffixes the default toolchain with " (default)" in `toolchain list`,
+  # so check that exact line before the bare one — matching cmd_install's
+  # stripped-suffix lookup would hide which case we're in, and uninstalling the
+  # default toolchain breaks elan for every other toolchain too.
+  local tc_list; tc_list="$(elan toolchain list 2>/dev/null || true)"
+  if printf '%s\n' "$tc_list" | grep -qxF "$TOOLCHAIN (default)"; then
+    log "toolchain $TOOLCHAIN is elan's default — skipping removal (uninstalling it would break elan); switch the default toolchain first if you really want it gone"
+  elif printf '%s\n' "$tc_list" | grep -qxF "$TOOLCHAIN"; then
+    log "removing toolchain $TOOLCHAIN"
+    elan toolchain uninstall "$TOOLCHAIN"
+    removed=1
+    log "WARNING: any project pinning $TOOLCHAIN via its lean-toolchain file will no longer build until it is reinstalled"
+  else
+    log "toolchain $TOOLCHAIN not installed (nothing to do)"
+  fi
+
+  if [[ "$removed" -eq 1 ]]; then
+    log "uninstalled $TCVER"
+  else
+    log "$TCVER: nothing to do"
+  fi
 }
 
 # Build an overlay: .lake/packages is a real directory holding one symlink per

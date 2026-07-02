@@ -20,7 +20,7 @@ deterministic umask and permission pass every time.
 
 ```
 lean-cache install <version>     # build & install a mathlib version
-lean-cache uninstall <version>   # remove a version
+lean-cache uninstall <version>   # remove a version's lake cache and elan toolchain
 lean-cache link <version>        # print the packages path to symlink against
 lean-cache use [version] [path]  # set up .lake/packages in a project
 lean-cache refresh [path]        # re-overlay only if the toolchain changed

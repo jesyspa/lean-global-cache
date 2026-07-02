@@ -170,6 +170,67 @@ check "fix-filemode silences mathlib mode diff"   "" "$(gitc "$FM/mathlib" statu
 check "fix-filemode silences batteries mode diff" "" "$(gitc "$FM/batteries" status --short)"
 check "core.fileMode set to false" "false" "$(gitc "$FM/mathlib" config --get core.fileMode)"
 
+echo "== uninstall (hermetic) =="
+# No real elan here: a stub `elan` backed by a flat "installed toolchains" file
+# stands in for `elan toolchain list`/`uninstall`, mirroring how the `lake`
+# stub below stands in for builds. ELAN_STATE_FILE points the stub at that file.
+ELANSTUB="$TMP/elanstub"; mkdir -p "$ELANSTUB"
+cat > "$ELANSTUB/elan" <<'EL'
+#!/usr/bin/env bash
+state="${ELAN_STATE_FILE:?ELAN_STATE_FILE not set}"
+case "$1 $2" in
+  "toolchain list")
+    [[ -f "$state" ]] && cat "$state"
+    exit 0 ;;
+  "toolchain uninstall")
+    tc="$3"
+    grep -qxF "$tc" "$state" 2>/dev/null || { echo "elan-stub: no such toolchain: $tc" >&2; exit 1; }
+    grep -vxF "$tc" "$state" > "$state.new"    # grep exits 1 when this empties the file; that's fine
+    mv "$state.new" "$state"
+    exit 0 ;;
+  *) echo "elan-stub: unsupported: $*" >&2; exit 1 ;;
+esac
+EL
+chmod +x "$ELANSTUB/elan"
+ELAN_STATE="$TMP/elan-toolchains.txt"
+has_dir() { [[ -d "$1" ]] && echo yes || echo no; }
+export LEAN_CACHE_OWNER="$(id -un)"   # so require_owner passes without sudo
+
+# (a) A full-state uninstall removes both the lake cache and the toolchain, and
+# warns that project pins will stop building.
+UTC="leanprover/lean4:v4.77.0"; USLUG="v4-77-0"
+mkdir -p "$TMP/cache/lakes/$USLUG/packages/mathlib"
+printf '%s\n' "$UTC" > "$ELAN_STATE"
+out="$(PATH="$ELANSTUB:$PATH" ELAN_STATE_FILE="$ELAN_STATE" "$CLI" uninstall 4.77.0 2>&1)"
+check "uninstall removes the lake cache"      "no"  "$(has_dir "$TMP/cache/lakes/$USLUG")"
+check "uninstall removes the toolchain"       "no"  "$(grep -qxF "$UTC" "$ELAN_STATE" && echo yes || echo no)"
+check "uninstall warns pinning projects break" "yes" \
+  "$(printf '%s' "$out" | grep -qi 'no longer build' && echo yes || echo no)"
+
+# (b) Idempotent re-run on a half-removed version (lake cache already gone,
+# toolchain still lingering — the current real state of 4.28.0) finishes the job.
+printf '%s\n' "$UTC" > "$ELAN_STATE"     # lake cache stays absent from (a)
+PATH="$ELANSTUB:$PATH" ELAN_STATE_FILE="$ELAN_STATE" "$CLI" uninstall 4.77.0 >/dev/null 2>&1
+check "half-state re-run removes the lingering toolchain" "no" \
+  "$(grep -qxF "$UTC" "$ELAN_STATE" && echo yes || echo no)"
+
+# (c) A further re-run, with nothing left to remove, is a clean no-op.
+out="$(PATH="$ELANSTUB:$PATH" ELAN_STATE_FILE="$ELAN_STATE" "$CLI" uninstall 4.77.0 2>&1)"
+check "no-op re-run reports nothing to do" "yes" \
+  "$(printf '%s' "$out" | grep -qi 'nothing to do' && echo yes || echo no)"
+
+# (d) uninstall skips elan's default toolchain (removing it would break elan),
+# with a clear note, but still removes the lake cache.
+DTC="leanprover/lean4:v4.78.0"; DSLUG="v4-78-0"
+mkdir -p "$TMP/cache/lakes/$DSLUG/packages/mathlib"
+printf '%s (default)\n' "$DTC" > "$ELAN_STATE"
+out="$(PATH="$ELANSTUB:$PATH" ELAN_STATE_FILE="$ELAN_STATE" "$CLI" uninstall 4.78.0 2>&1)"
+check "uninstall skips the elan default toolchain" "yes" \
+  "$(grep -qxF "$DTC (default)" "$ELAN_STATE" && echo yes || echo no)"
+check "uninstall still removes the lake cache for the default" "no" "$(has_dir "$TMP/cache/lakes/$DSLUG")"
+check "uninstall notes the default-toolchain skip" "yes" \
+  "$(printf '%s' "$out" | grep -qi 'default' && echo yes || echo no)"
+
 echo "== build seeding & push gate (hermetic) =="
 # No real Lean here: a stub `lake` stands in for the build so publish/seed and
 # the push gate can be exercised without the toolchain or the network. The store

@@ -86,6 +86,24 @@ best-effort — which is the intended outcome.
 
 Idempotent: a version that already exists is a no-op.
 
+## `uninstall` internals
+
+`lean-cache uninstall <version>`:
+
+1. Re-exec as `hostbot` if needed.
+2. Remove `lakes/<slug>/packages` if present (refusing if it's not
+   owner-owned, same as `install`).
+3. Remove the elan toolchain if present — unless it's elan's *default*
+   toolchain, in which case it's left alone (with a note): removing the
+   default breaks `elan` for every other toolchain too. A project pinning the
+   removed toolchain via `lean-toolchain` prints a warning, since `lean-cache`
+   has no way to enumerate which projects pin it.
+
+Each artifact (lake cache, toolchain) is removed independently and reported
+separately, so a re-run on a half-removed version (e.g. lake cache already
+gone, toolchain still lingering) finishes the job rather than early-returning.
+It's a no-op only when neither artifact exists.
+
 ## Consumer overlay
 
 `lean-cache use` does **not** make `.lake/packages` a single symlink to the
@@ -482,6 +500,10 @@ step.
   (default 7), rotated after each `publish-build` and on demand via
   `prune-builds`. There is no scheduled sweep — a store that stops being
   published to keeps its last build; a cron `prune-builds` covers that if wanted.
-- **Toolchain reuse.** `uninstall` removes a version's packages but leaves its
-  elan toolchain (cheap, possibly shared). A `--purge-toolchain` flag could be
-  added if needed.
+- **Toolchain removal.** `uninstall` removes both a version's lake cache and its
+  elan toolchain, independently and idempotently — a re-run on a half-removed
+  version finishes whichever side is left. It skips the toolchain (with a note)
+  when it is elan's default, since removing that breaks elan, and warns that any
+  project pinning the removed toolchain via `lean-toolchain` will no longer
+  build; `lean-cache` cannot enumerate project pins, so that warning is a
+  caution, not a check.

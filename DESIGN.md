@@ -301,27 +301,81 @@ not correspond to the commit (they are still fine to *seed* from: Lake
 re-elaborates anything whose sources differ). `LEAN_CACHE_NO_GATE_SKIP=1`
 forces the rebuild.
 
+## Transparent `lake` shim
+
+Instances should run bare `lake build` and the LSP as on stock Lean and never
+touch `lean-cache` commands or manage build timeouts. A transparent shim makes
+that so. `deploy.sh` installs `bin/lake-shim` as `$(dirname BIN)/lake` — on the
+fleet `/opt/bots/bin/lake`, which sits at PATH position 2, ahead of the real
+`lake` (an ELF at `~/bin/lake`), so it wins.
+
+The shim carries a `LEAN_CACHE_LAKE_SHIM` marker and resolves the real `lake` as
+the first `lake` on PATH without that marker (falling back to the active elan
+toolchain's `lake`), so it never execs itself. Any subcommand other than `build`
+— and the LSP's `lake setup-file`/`serve`/… — `exec`s the real lake untouched,
+so only full builds are ever policied. `lake build` delegates to `lean-cache
+build`, handing down the resolved real-lake path (`LEAN_CACHE_REAL_LAKE`) so the
+build underneath never re-enters the shim and recurses. Keeping the policy in the
+CLI — the shim is a thin stub, like the git hooks — means one home for it and one
+place a fix lands. `lean-cache`'s own `run_lake_build` resolves the real lake the
+same way, so a `lake build` it spawns (the gate, `publish-build`) also skips the
+shim.
+
 ## Host-wide build serialization
 
 Concurrent full `lake build`s from several sessions oversubscribe the host
 (observed: four cold builds stacked on six cores, load ~20, a 10-line check
-taking 24 minutes), and every build crawls instead of a few finishing fast.
-The build-running commands — the pre-push gate, `publish-build`, and the
-`lean-cache build` wrapper — therefore take a **host build slot** first: one of
+taking 24 minutes), and every build crawls instead of a few finishing fast. But
+most builds are *warm* — a fresh worktree seeded from the store, or an
+incremental rebuild after an edit — and serializing those would add pointless
+queueing to the common, cheap case. So the policy serializes **only cold/full
+builds** (the ones that actually thrash), classified cheaply (milliseconds): a
+build is cold when no stored warm build matches HEAD **and** `.lake/build` holds
+no oleans; anything else is warm. Warm builds run immediately, foreground, with
+no slot — indistinguishable from a plain `lake build`. The classification reuses
+the exact-(commit, slug) match `seed-build` already computes.
+
+A cold/full build takes a **host build slot** first: one of
 `LEAN_CACHE_BUILD_SLOTS` (default 2) world-openable lock files under `/tmp`
 (`flock` on `lean-cache-build-slot.N.lock`), so at most that many heavy builds
-run at once, each with real parallelism.
+run at once, each with real parallelism. Serialization degrades, it never blocks
+work: a process that cannot get a slot within `LEAN_CACHE_BUILD_WAIT` seconds
+(default 3600) — or cannot use the lock files at all — proceeds unserialized with
+a note. Waiting and building both emit periodic progress lines, so a session
+watching a silent pipe can tell a minutes-long build from a hang. The slot is
+held (fd 8) until the process exits; a child build inherits
+`LEAN_CACHE_BUILD_SLOT_HELD` and rides the parent's slot rather than deadlocking
+on it. `LEAN_CACHE_BUILD_SLOTS=0` disables serialization.
 
-Serialization degrades, it never blocks work: a process that cannot get a slot
-within `LEAN_CACHE_BUILD_WAIT` seconds (default 3600) — or cannot use the lock
-files at all — proceeds unserialized with a note. Waiting and building both
-emit periodic progress lines, so a session watching a silent pipe can tell a
-minutes-long gate from a hang. The slot is held (fd 8) until the process exits;
-the gate's publish re-exec inherits `LEAN_CACHE_BUILD_SLOT_HELD` and rides the
-parent's slot rather than deadlocking on it. `LEAN_CACHE_BUILD_SLOTS=0`
-disables serialization. Plain `lake build` run by hand bypasses all of this —
-routing heavy verification builds through `lean-cache build` is what opts a
-workflow in.
+### Foreground bail on a cold build
+
+A cold/full build takes minutes and cannot finish inside a bounded foreground
+tool call — the harness terminates a foreground Bash call that exceeds its
+timeout (default ~2 min, max 10) rather than letting it run on or flipping it to
+the background. The harness signals which regime a call is in by exporting
+`CLAUDE_BASH_MODE=foreground|background` per Bash call; **absent means
+background** (a human terminal, cron, or nested script has no 2-minute guillotine
+and should just wait).
+
+The policy reads that signal for a cold build:
+
+- **force-wait** (`LEAN_CACHE_FORCE_WAIT=1`, or `--wait` on `lean-cache build`) —
+  acquire a slot and build to completion regardless of mode. This is what the
+  pre-push gate and `publish-build` set internally, since they must complete
+  synchronously (the gate blocks the push).
+- **`CLAUDE_BASH_MODE=foreground`** — do **not** build: print the exact command
+  to re-run (backgrounded, so the model is woken on completion, or with a
+  10-minute timeout) and exit a distinct code (75, so a caller can tell
+  "re-run me backgrounded" from a build failure). Bailing fast beats being killed
+  mid-build with a half-written `.lake/build`.
+- **`background` or absent** — acquire a slot and build to completion (the
+  wake-on-completion path).
+
+A build already riding a parent's slot (`LEAN_CACHE_BUILD_SLOT_HELD`) short-
+circuits all of this and completes in place — the parent already committed to
+building, so a nested build must finish, never bail. `lean-cache build` is an
+explicit alias for the same policy; instances no longer need it, but it stays
+useful (and `--wait` maps to force-wait).
 
 Like the two overlay hooks (which delegate to `refresh`), the installed
 `pre-push` hook is a thin stub: it does the cheap guards (`SKIP_LEAN_PUSH_GATE`,
@@ -395,15 +449,19 @@ rejected — this is also what keeps the sudoers wildcard safe.
 Standard hostbot deploy-handler repo. `deploy.sh` (as `OWNER`):
 
 1. installs `bin/lean-cache` to `BIN`,
-2. ensures `ROOT/{lakes,elan}` exist `2755`,
-3. reconciles the `versions` manifest — each listed version is `install`ed
+2. installs the transparent `lake` shim (`bin/lake-shim`) as `$(dirname BIN)/lake`,
+3. ensures `ROOT/{lakes,elan}` exist `2755`,
+4. reconciles the `versions` manifest — each listed version is `install`ed
    (idempotent). The manifest is a **floor**: ad-hoc installs are never
    auto-removed, and pruning is manual via `uninstall`.
 
 `test.sh` runs first in an isolated worktree: bash syntax + shellcheck, version
 resolution unit tests, validation-rejects-junk tests, the overlay/hooks
-scenarios, and the build-seeding + push-gate scenarios (with a stub `lake`). It
-does not touch the real cache or the network.
+scenarios, the build-seeding + push-gate scenarios, the warm/cold build-policy
+scenarios (warm runs unslotted, cold serializes, foreground bails, background /
+force-wait / slot-held build to completion), and the `lake` shim scenarios
+(non-build passthrough, build delegation, no self-recursion) — all with a stub
+`lake`. It does not touch the real cache or the network.
 
 `publish-build` / `seed-build` are not part of `deploy.sh`: they are per-user,
 per-project operations a bot runs in its own worktrees, not a host-level deploy

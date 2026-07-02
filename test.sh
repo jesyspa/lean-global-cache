@@ -13,7 +13,7 @@ check() { # check <description> <expected> <actual>
 }
 
 echo "== bash syntax =="
-for f in "$CLI" "$REPO_DIR/deploy.sh" "$REPO_DIR/test.sh" \
+for f in "$CLI" "$REPO_DIR/bin/lake-shim" "$REPO_DIR/deploy.sh" "$REPO_DIR/test.sh" \
          "$REPO_DIR/lib/config.sh" "$REPO_DIR"/admin/*.sh \
          "$REPO_DIR/lean-cache.conf.example"; do
   [[ -e "$f" ]] || continue
@@ -22,7 +22,7 @@ done
 
 if command -v shellcheck >/dev/null 2>&1; then
   echo "== shellcheck =="
-  shellcheck -S warning "$CLI" "$REPO_DIR/deploy.sh" "$REPO_DIR/test.sh" \
+  shellcheck -S warning "$CLI" "$REPO_DIR/bin/lake-shim" "$REPO_DIR/deploy.sh" "$REPO_DIR/test.sh" \
     "$REPO_DIR/lib/config.sh" "$REPO_DIR"/admin/*.sh && note "ok: shellcheck clean"
 else
   echo "== shellcheck (skipped, not installed) =="
@@ -497,11 +497,19 @@ mkdir -p "$P/Aliasing"
 check "build wrapper: bare word is a target, not a path" "lake build Aliasing" "$(cat "$TMP/b.log" 2>/dev/null)"
 rm -rf "$P/Aliasing"
 
+# Only cold/full builds take a slot, so the slot machinery is exercised with a
+# cold project (no .lake/build, no stored warm build) forced to build to
+# completion (force-wait) instead of bailing.
+CB="$TMP/coldslot"; mkdir -p "$CB/Proj"; gitc "$CB" init -q
+pin v4.30.0 "$CB"; printf 'name="p"\n' > "$CB/lakefile.toml"
+printf '.lake/\n' > "$CB/.gitignore"; printf 'def cb := 1\n' > "$CB/Proj/CB.lean"
+gitc "$CB" add -A; gitc "$CB" commit -qm init
+
 # All slots busy + zero wait: degrade to an unserialized build with a note.
 flock "$TMP/lean-cache-build-slot.0.lock" sleep 20 &
 locker=$!
 until ! flock -n "$TMP/lean-cache-build-slot.0.lock" true 2>/dev/null; do sleep 0.1; done
-out="$(PATH="$STUB:$PATH" LEAN_CACHE_BUILD_SLOTS=1 LEAN_CACHE_BUILD_WAIT=0 "$CLI" build "$P" 2>&1)"; rc=$?
+out="$(PATH="$STUB:$PATH" LEAN_CACHE_FORCE_WAIT=1 LEAN_CACHE_BUILD_SLOTS=1 LEAN_CACHE_BUILD_WAIT=0 "$CLI" build "$CB" 2>&1)"; rc=$?
 check "contended slot degrades, build still runs" "0" "$rc"
 check "contended slot says so"                  "yes" \
   "$(printf '%s' "$out" | grep -q 'proceeding unserialized' && echo yes || echo no)"
@@ -512,7 +520,7 @@ kill $(ps -o pid= --ppid "$locker" 2>/dev/null) 2>/dev/null || true
 kill "$locker" 2>/dev/null || true; wait "$locker" 2>/dev/null || true
 
 # LEAN_CACHE_BUILD_SLOTS=0 disables serialization entirely (no slot chatter).
-out="$(PATH="$STUB:$PATH" LEAN_CACHE_BUILD_SLOTS=0 "$CLI" build "$P" 2>&1)"; rc=$?
+out="$(PATH="$STUB:$PATH" LEAN_CACHE_FORCE_WAIT=1 LEAN_CACHE_BUILD_SLOTS=0 "$CLI" build "$CB" 2>&1)"; rc=$?
 check "SLOTS=0 disables serialization"          "0" "$rc"
 check "SLOTS=0 emits no slot messages"          "no" \
   "$(printf '%s' "$out" | grep -q 'build slot' && echo yes || echo no)"
@@ -529,6 +537,118 @@ check "gate+publish share one slot: push succeeds" "0" "$rc"
 check "gate+publish share one slot: both builds ran" "2" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
 check "gate+publish share one slot: no slot wait"  "no" \
   "$(printf '%s' "$out" | grep -q 'waiting for a host build slot' && echo yes || echo no)"
+
+echo "== transparent build policy (hermetic) =="
+# The shared warm/cold policy behind both `lake build` (via the shim) and
+# `lean-cache build`. A warm/incremental build runs immediately; a cold/full one
+# serializes and, in a bounded foreground call, bails instead of being killed.
+
+# Cold project: committed, no .lake/build, no stored warm build.
+CP="$TMP/cold"; mkdir -p "$CP/Proj"; gitc "$CP" init -q
+pin v4.30.0 "$CP"; printf 'name="p"\n' > "$CP/lakefile.toml"
+printf '.lake/\n' > "$CP/.gitignore"; printf 'def c := 1\n' > "$CP/Proj/C.lean"
+gitc "$CP" add -A; gitc "$CP" commit -qm init
+
+# Warm project: same, but carrying a prior build (an olean under .lake/build).
+WP="$TMP/warm"; mkdir -p "$WP/Proj"; gitc "$WP" init -q
+pin v4.30.0 "$WP"; printf 'name="p"\n' > "$WP/lakefile.toml"
+printf '.lake/\n' > "$WP/.gitignore"; printf 'def w := 1\n' > "$WP/Proj/W.lean"
+gitc "$WP" add -A; gitc "$WP" commit -qm init
+mkdir -p "$WP/.lake/build/lib/lean/Proj"; printf 'OLE' > "$WP/.lake/build/lib/lean/Proj/W.olean"
+
+# (a) Warm build runs immediately with no slot, even in a foreground call.
+: > "$TMP/pol.log"
+out="$(PATH="$STUB:$PATH" CLAUDE_BASH_MODE=foreground LAKE_LOG="$TMP/pol.log" "$CLI" build "$WP" 2>&1)"; rc=$?
+check "warm build runs (foreground)"            "1" "$(grep -c '^lake build' "$TMP/pol.log" 2>/dev/null)"
+check "warm build exits 0"                      "0" "$rc"
+check "warm build takes no slot"                "no" \
+  "$(printf '%s' "$out" | grep -q 'build slot' && echo yes || echo no)"
+
+# (b) Cold build in a bounded foreground call bails: it does NOT build, exits the
+# distinct bail code, and prints actionable re-run instructions.
+: > "$TMP/pol.log"
+out="$(PATH="$STUB:$PATH" CLAUDE_BASH_MODE=foreground LAKE_LOG="$TMP/pol.log" "$CLI" build "$CP" 2>&1)" && rc=0 || rc=$?
+check "cold foreground build runs no lake"       "0" "$(grep -c '^lake build' "$TMP/pol.log" 2>/dev/null)"
+check "cold foreground build bails, code 75"     "75" "$rc"
+check "cold foreground bail explains re-run"     "yes" \
+  "$(printf '%s' "$out" | grep -q 'backgrounded' && echo yes || echo no)"
+
+# (c) Cold build with an explicit background mode queues and builds to completion.
+: > "$TMP/pol.log"; rc=0
+PATH="$STUB:$PATH" CLAUDE_BASH_MODE=background LAKE_LOG="$TMP/pol.log" "$CLI" build "$CP" >/dev/null 2>&1 || rc=$?
+check "cold background build runs lake"          "1" "$(grep -c '^lake build' "$TMP/pol.log" 2>/dev/null)"
+check "cold background build exits 0"            "0" "$rc"
+
+# (d) Absent CLAUDE_BASH_MODE defaults to background (queue-and-build, not bail).
+: > "$TMP/pol.log"; rc=0
+env -u CLAUDE_BASH_MODE PATH="$STUB:$PATH" LAKE_LOG="$TMP/pol.log" "$CLI" build "$CP" >/dev/null 2>&1 || rc=$?
+check "absent mode builds (not bail)"            "1" "$(grep -c '^lake build' "$TMP/pol.log" 2>/dev/null)"
+check "absent mode exits 0"                      "0" "$rc"
+
+# (e) Force-wait (--wait or LEAN_CACHE_FORCE_WAIT=1) builds a cold project to
+# completion even in a foreground call — no bail.
+: > "$TMP/pol.log"; rc=0
+PATH="$STUB:$PATH" CLAUDE_BASH_MODE=foreground LAKE_LOG="$TMP/pol.log" "$CLI" build --wait "$CP" >/dev/null 2>&1 || rc=$?
+check "--wait forces cold build (foreground)"    "1" "$(grep -c '^lake build' "$TMP/pol.log" 2>/dev/null)"
+check "--wait cold build exits 0"                "0" "$rc"
+: > "$TMP/pol.log"; rc=0
+PATH="$STUB:$PATH" CLAUDE_BASH_MODE=foreground LEAN_CACHE_FORCE_WAIT=1 LAKE_LOG="$TMP/pol.log" \
+  "$CLI" build "$CP" >/dev/null 2>&1 || rc=$?
+check "FORCE_WAIT forces cold build (foreground)" "1" "$(grep -c '^lake build' "$TMP/pol.log" 2>/dev/null)"
+
+# (f) A build riding a parent's slot (LEAN_CACHE_BUILD_SLOT_HELD) completes now:
+# no re-acquire, and no foreground bail even when cold.
+: > "$TMP/pol.log"
+out="$(PATH="$STUB:$PATH" CLAUDE_BASH_MODE=foreground LEAN_CACHE_BUILD_SLOT_HELD=1 \
+       LAKE_LOG="$TMP/pol.log" "$CLI" build "$CP" 2>&1)"; rc=$?
+check "slot-held cold build runs (no bail)"      "1" "$(grep -c '^lake build' "$TMP/pol.log" 2>/dev/null)"
+check "slot-held cold build exits 0"             "0" "$rc"
+check "slot-held build acquires no new slot"     "no" \
+  "$(printf '%s' "$out" | grep -q 'build slot' && echo yes || echo no)"
+
+# (g) A stored warm build matching HEAD classifies as warm even with an empty
+# .lake/build on disk (a freshly seedable worktree), so it does not bail.
+SP="$TMP/stored"; mkdir -p "$SP/Proj"; gitc "$SP" init -q
+pin v4.30.0 "$SP"; printf 'name="p"\n' > "$SP/lakefile.toml"
+printf '.lake/\n' > "$SP/.gitignore"; printf 'def s := 1\n' > "$SP/Proj/S.lean"
+gitc "$SP" add -A; gitc "$SP" commit -qm init
+mkdir -p "$SP/.lake/build/lib/lean/Proj"; printf 'OLE' > "$SP/.lake/build/lib/lean/Proj/S.olean"
+PATH="$STUB:$PATH" "$CLI" publish-build "$SP" >/dev/null 2>&1
+rm -rf "$SP/.lake/build"                 # cold on disk, but a stored build matches HEAD
+: > "$TMP/pol.log"; rc=0
+PATH="$STUB:$PATH" CLAUDE_BASH_MODE=foreground LAKE_LOG="$TMP/pol.log" "$CLI" build "$SP" >/dev/null 2>&1 || rc=$?
+check "stored-warm build classifies as warm (fg)" "1" "$(grep -c '^lake build' "$TMP/pol.log" 2>/dev/null)"
+check "stored-warm build does not bail"          "0" "$rc"
+
+echo "== lake shim (hermetic) =="
+# The shim, installed alongside lean-cache, must pass non-build subcommands
+# straight through to the real lake and route `lake build` through the policy —
+# without recursing into itself.
+SHIMDIR="$TMP/shimbin"; mkdir -p "$SHIMDIR"
+install -m 0755 "$REPO_DIR/bin/lake-shim" "$SHIMDIR/lake"
+install -m 0755 "$CLI" "$SHIMDIR/lean-cache"
+
+# (a) A non-build subcommand execs the real lake untouched.
+: > "$TMP/shim.log"
+( cd "$WP" && PATH="$SHIMDIR:$STUB:$PATH" LAKE_LOG="$TMP/shim.log" lake env >/dev/null 2>&1 ) || true
+check "shim passes non-build to the real lake"   "yes" \
+  "$(grep -q '^lake env' "$TMP/shim.log" && echo yes || echo no)"
+
+# (b) `lake build` routes through the policy — a warm project builds now.
+: > "$TMP/shim.log"
+( cd "$WP" && PATH="$SHIMDIR:$STUB:$PATH" LAKE_LOG="$TMP/shim.log" lake build >/dev/null 2>&1 ) || true
+check "shim routes build through the policy (warm runs)" "1" \
+  "$(grep -c '^lake build' "$TMP/shim.log" 2>/dev/null)"
+
+# (c) The shim resolves the real lake (not itself), so a cold foreground `lake
+# build` reaches the policy's bail rather than looping through the shim.
+: > "$TMP/shim.log"
+out="$( cd "$CP" && PATH="$SHIMDIR:$STUB:$PATH" CLAUDE_BASH_MODE=foreground \
+        LAKE_LOG="$TMP/shim.log" lake build 2>&1 )" && rc=0 || rc=$?
+check "shim cold foreground build bails, code 75" "75" "$rc"
+check "shim cold bail ran no real build"          "0" "$(grep -c '^lake build' "$TMP/shim.log" 2>/dev/null)"
+check "shim cold bail names 'lake build' to re-run" "yes" \
+  "$(printf '%s' "$out" | grep -q 'lake build' && echo yes || echo no)"
 
 echo "== build-store rotation (hermetic) =="
 # Fabricate builds with controlled publish times and check the keep/drop policy.

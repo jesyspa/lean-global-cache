@@ -30,6 +30,13 @@ log "installing $BIN_DST"
 mkdir -p "$(dirname "$BIN_DST")"
 install -m 0755 "$REPO_DIR/bin/lean-cache" "$BIN_DST"
 
+# Install the transparent `lake` shim next to lean-cache. Placed ahead of the
+# real lake on PATH, it makes bare `lake build` route through the shared build
+# policy while every other subcommand (and the LSP) passes straight through.
+LAKE_SHIM_DST="$(dirname "$BIN_DST")/lake"
+log "installing $LAKE_SHIM_DST"
+install -m 0755 "$REPO_DIR/bin/lake-shim" "$LAKE_SHIM_DST"
+
 # --- 2. Ensure the cache root exists, OWNER-owned, not group-writable --------
 # (Ownership of any pre-existing tree is fixed once by admin/migrate-ownership.sh;
 #  here we only create-if-missing and set modes on what we own.)

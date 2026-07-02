@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# lake-shim — a transparent `lake` wrapper, installed ahead of the real `lake`
+# on PATH (as $(dirname "$BIN")/lake) so instances run bare `lake build` and the
+# LSP exactly as on stock Lean while the cache overlay, warm-seeding, and cold-
+# build serialization happen underneath.
+#
+# The LEAN_CACHE_LAKE_SHIM marker below is how the real lake is told apart from
+# this shim when resolving PATH (here and in `lean-cache`), so a build can never
+# recurse back into the shim.
+#
+#   any subcommand other than `build`  -> exec the real lake, untouched
+#   `lake build …`                     -> delegate to `lean-cache build`, which
+#                                         applies the shared warm/cold policy
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The first `lake` on PATH that is not one of our shims (they carry the marker
+# above), else the active elan toolchain's lake. Never returns this shim, so an
+# exec of it cannot recurse.
+resolve_real_lake() {
+  local cand
+  while IFS= read -r cand; do
+    [[ -x "$cand" ]] || continue
+    grep -q 'LEAN_CACHE_LAKE_SHIM' "$cand" 2>/dev/null && continue
+    printf '%s\n' "$cand"; return 0
+  done < <(type -aP lake 2>/dev/null)
+  if command -v elan >/dev/null 2>&1; then
+    local c; c="$(elan which lake 2>/dev/null)" || c=""
+    [[ -n "$c" && -x "$c" ]] && { printf '%s\n' "$c"; return 0; }
+  fi
+  return 1
+}
+
+real_lake="$(resolve_real_lake)" \
+  || { echo "lake: cannot find the real lake on PATH" >&2; exit 127; }
+
+# Only `lake build` is policied; everything else (and a bare `lake`) passes
+# straight through so the LSP and every other subcommand behave as on stock Lean.
+if [[ "${1:-}" != build ]]; then
+  exec "$real_lake" "$@"
+fi
+shift   # drop 'build'
+
+# Delegate the build to `lean-cache` (installed next to us) so the warm/cold
+# policy lives in exactly one place. Hand it the resolved real lake so its own
+# build never re-enters this shim. If no lean-cache sits beside us, degrade to a
+# plain build rather than break `lake`.
+lean_cache="$SELF_DIR/lean-cache"
+if [[ -x "$lean_cache" ]]; then
+  exec env LEAN_CACHE_FROM_SHIM=1 LEAN_CACHE_REAL_LAKE="$real_lake" \
+       "$lean_cache" build "$@"
+fi
+exec "$real_lake" build "$@"

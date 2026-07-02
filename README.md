@@ -26,7 +26,7 @@ lean-cache use [version] [path]  # set up .lake/packages in a project
 lean-cache refresh [path]        # re-overlay only if the toolchain changed
 lean-cache seed-build [path]     # seed .lake/build from a stored warm build
 lean-cache publish-build [path]  # store this project's warm build for reuse
-lean-cache build [path] [args]   # lake build under a host build slot (serialized)
+lean-cache build [--wait] [path] [args]  # lake build under the shared build policy
 lean-cache clean [path]          # wipe .lake/build (cold-reset a reused worktree)
 lean-cache prune-builds [--keep-days N]  # rotate the warm-build store
 lean-cache list                  # installed versions + sizes
@@ -53,6 +53,13 @@ lean-cache use                    # overlays .lake/packages onto the shared cach
 lake exe cache get                # near-instant; oleans already present
 lake build                        # builds your code into project-local .lake/build
 ```
+
+Use bare `lake` (and the LSP) exactly as on stock Lean. On the fleet a
+transparent `lake` shim sits ahead of the real `lake` on PATH: every subcommand
+except `build` passes straight through, and `lake build` routes through the
+[shared build policy](#transparent-builds-cold-only-serialization) so cold/full
+builds serialize host-wide — you never invoke `lean-cache build` or manage a
+build timeout yourself.
 
 `use` makes `.lake/packages` a real directory containing one symlink per shared
 package (mathlib + its closure). Because the directory itself is writable, a
@@ -125,13 +132,35 @@ rebuild. The gate only vouches for the checked-out HEAD: pushing a ref whose
 tip is some other commit passes with a warning instead of being validated
 against the wrong tree.
 
-Heavy builds are serialized host-wide: the gate, `publish-build`, and
-`lean-cache build` take one of `LEAN_CACHE_BUILD_SLOTS` (default 2) lock slots
-first, so concurrent sessions don't stack five thrashing cold builds onto six
-cores. Waiting is capped (`LEAN_CACHE_BUILD_WAIT`, default 3600s) and degrades
-to an unserialized build rather than blocking; progress lines print while
-waiting and every 30s during the build. Route worker verification builds
-through `lean-cache build [path] [lake-build args]` to opt them in.
+### Transparent builds & cold-only serialization
+
+Instances run bare `lake build`; the serialization is transparent and engages
+only for builds that actually thrash the host. The installed `lake` shim routes
+`lake build` through a shared policy (also reachable explicitly as `lean-cache
+build`):
+
+- **warm/incremental** (a stored warm build matches HEAD, or `.lake/build`
+  already holds oleans) → runs immediately, foreground, with no slot. This is
+  the common case and feels exactly like a plain `lake build`.
+- **cold/full** (no stored build matches HEAD *and* `.lake/build` has no oleans)
+  → takes one of `LEAN_CACHE_BUILD_SLOTS` (default 2) host-wide lock slots first,
+  so concurrent sessions don't stack five thrashing cold builds onto six cores.
+  Waiting is capped (`LEAN_CACHE_BUILD_WAIT`, default 3600s) and degrades to an
+  unserialized build rather than blocking; progress lines print while waiting and
+  every 30s during the build.
+
+A cold/full build cannot finish inside a bounded foreground tool call. The
+harness exports `CLAUDE_BASH_MODE=foreground|background` per Bash call
+(absent → treat as `background`). When a cold build is requested with
+`CLAUDE_BASH_MODE=foreground`, the policy does **not** build: it prints the exact
+command to re-run and exits code 75, so you re-run it backgrounded (woken on
+completion) or with a 10-minute timeout instead of having it killed mid-build.
+In `background` mode (or absent) a cold build queues on a slot and runs to
+completion. Set `LEAN_CACHE_FORCE_WAIT=1` (or pass `--wait` to `lean-cache
+build`) to block to completion regardless of mode; the pre-push gate and
+`publish-build` force-wait internally, since they must complete synchronously. A
+build riding a parent's slot (`LEAN_CACHE_BUILD_SLOT_HELD`) completes in place —
+no second slot, no bail. `LEAN_CACHE_BUILD_SLOTS=0` disables serialization.
 
 Because the gate already builds the pushed commit to completion, it then
 **publishes that warm build** (`publish-build`) so future worktrees at the same
@@ -191,7 +220,8 @@ then follow [admin/README.md](admin/README.md) for the one-time root setup.
 
 **Multi-user:** one-time root setup (ownership migration + sudoers) — see
 [admin/README.md](admin/README.md). After that, deploy through the hostbot
-deploy-handler: `deploy.sh` installs the CLI to `BIN` and reconciles the
+deploy-handler: `deploy.sh` installs the CLI to `BIN`, installs the transparent
+`lake` shim next to it (`$(dirname BIN)/lake`), and reconciles the
 [`versions`](versions) manifest (a floor of versions to keep present — it never
 auto-removes).
 

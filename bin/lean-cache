@@ -62,6 +62,12 @@ HOOK_BIN="$BIN"
 
 PROG="lean-cache"
 
+# Exit code the cold-build policy uses to bail out of a bounded foreground call
+# (CLAUDE_BASH_MODE=foreground) rather than run a multi-minute build that the
+# harness would kill mid-flight. Distinct from a build failure (1) so a caller
+# can tell "re-run me backgrounded" from "the build broke".
+BUILD_BAIL_CODE=75
+
 # --- Helpers -----------------------------------------------------------------
 
 die()  { echo "$PROG: $*" >&2; exit 1; }
@@ -91,12 +97,17 @@ Usage: $PROG <command> [args]
   publish-build [path]  Build the project to completion and store its warm
                         .lake/build for the current (commit, toolchain), so
                         future fresh worktrees can be seeded from it.
-  build [path] [args]   Run \`lake build [args]\` in the project under a host
-                        build slot: at most LEAN_CACHE_BUILD_SLOTS (default 2)
-                        heavy builds run concurrently host-wide, so each gets
-                        real parallelism. Use for worker verification builds.
-                        A bare-word first arg is a lake target; a path must be
-                        \`.\` or contain a slash (use ./name for a relative dir).
+  build [--wait] [path] [args]
+                        Run \`lake build [args]\` under the shared build policy —
+                        the same path bare \`lake build\` takes via the installed
+                        \`lake\` shim. Warm/incremental builds run immediately;
+                        cold/full builds serialize on a host slot (at most
+                        LEAN_CACHE_BUILD_SLOTS, default 2) and run to completion,
+                        except in a bounded foreground call (CLAUDE_BASH_MODE=
+                        foreground) where they bail with re-run instructions.
+                        --wait (or LEAN_CACHE_FORCE_WAIT=1) blocks to completion
+                        regardless of mode. A bare-word first arg is a lake
+                        target; a path must be \`.\` or contain a slash.
   clean [path]          Remove the worktree's project build (.lake/build) to
                         reset it to a cold state, e.g. before a reused worktree
                         is handed to a new tenant. Leaves the package overlay
@@ -271,13 +282,37 @@ acquire_build_slot() { # arg: message prefix
   done
 }
 
+# Resolve the real `lake` binary, skipping our own `lake` shim wherever it sits
+# on PATH (the shim carries the LEAN_CACHE_LAKE_SHIM marker; the shim passes its
+# already-resolved path down via LEAN_CACHE_REAL_LAKE so we don't re-search).
+# Memoized in REAL_LAKE. Without this, `lake build` here would re-enter the shim
+# (which sits ahead of the real lake on PATH) and recurse.
+REAL_LAKE=""
+real_lake() {
+  if [[ -z "$REAL_LAKE" ]]; then
+    if [[ -n "${LEAN_CACHE_REAL_LAKE:-}" && -x "${LEAN_CACHE_REAL_LAKE:-}" ]]; then
+      REAL_LAKE="$LEAN_CACHE_REAL_LAKE"
+    else
+      local cand
+      while IFS= read -r cand; do
+        [[ -x "$cand" ]] || continue
+        grep -q 'LEAN_CACHE_LAKE_SHIM' "$cand" 2>/dev/null && continue
+        REAL_LAKE="$cand"; break
+      done < <(type -aP lake 2>/dev/null)
+      [[ -n "$REAL_LAKE" ]] || REAL_LAKE="lake"
+    fi
+  fi
+  printf '%s' "$REAL_LAKE"
+}
+
 # Run `lake build` in $1 with git's hook-injected environment scrubbed (see
 # cmd_pre_push_gate for why) and a heartbeat line every 30s, so a session
 # watching a silent non-TTY pipe can tell a minutes-long build is alive.
 run_lake_build() { # args: root message-prefix [lake build args...]
-  local root="$1" who="$2" pid hb rc=0; shift 2
+  local root="$1" who="$2" pid hb rc=0 lake; shift 2
+  lake="$(real_lake)"
   ( cd "$root" && env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX \
-      -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY -u GIT_QUARANTINE_PATH lake build "$@" ) &
+      -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY -u GIT_QUARANTINE_PATH "$lake" build "$@" ) &
   pid=$!
   # The heartbeat (and the sleep it is in the middle of when killed) must not
   # inherit our fds: fd 8/9 are the build-slot and publish locks — an orphaned
@@ -290,6 +325,77 @@ run_lake_build() { # args: root message-prefix [lake build args...]
   kill "$hb" 2>/dev/null || true
   wait "$hb" 2>/dev/null || true
   return "$rc"
+}
+
+# True when the project already carries a real prior build: at least one olean
+# under .lake/build. A seeded worktree (warm build hardlinked in) counts, so it
+# builds incrementally without a slot.
+has_local_oleans() { # arg: proj
+  local f
+  f="$(find "$1/.lake/build" -name '*.olean' -print -quit 2>/dev/null)"
+  [[ -n "$f" ]]
+}
+
+# True when a stored warm build matches the worktree's exact (HEAD commit,
+# toolchain slug) — the same match `seed-build` uses. Runs in a subshell so
+# normalize_version's global writes don't leak.
+stored_warm_build_matches() { # arg: proj
+  local proj="$1" commit slug store
+  [[ -f "$proj/lean-toolchain" ]] || return 1
+  commit="$(git -C "$proj" rev-parse HEAD 2>/dev/null)" || return 1
+  [[ -n "$commit" ]] || return 1
+  slug="$( { normalize_version "$(cat "$proj/lean-toolchain")" && printf '%s' "$SLUG"; } 2>/dev/null )" || slug=""
+  [[ -n "$slug" ]] || return 1
+  store="$(build_store_for "$proj" "$commit" "$slug")" || return 1
+  [[ -d "$store/lib" ]]
+}
+
+# Classify a build as warm/incremental vs cold/full. "Cold/full" means no stored
+# warm build matches HEAD AND .lake/build has no oleans — a from-scratch build
+# that thrashes the host. Anything else is warm/incremental (fast, common case).
+is_cold_build() { # arg: proj
+  has_local_oleans "$1" && return 1
+  stored_warm_build_matches "$1" && return 1
+  return 0
+}
+
+# The shared build policy, used by `lake build` (via the shim, which delegates to
+# `lean-cache build`) and by `lean-cache build` directly:
+#   - a build riding a parent's slot (LEAN_CACHE_BUILD_SLOT_HELD) completes now,
+#     no re-acquire, no bail — the parent already committed to building;
+#   - warm/incremental builds run immediately, foreground, NO slot (feel exactly
+#     like a plain `lake build`);
+#   - cold/full builds serialize on a host slot and run to completion when we can
+#     block (force-wait, or a background/absent CLAUDE_BASH_MODE — the wake-on-
+#     completion path), but in a bounded foreground call they bail with
+#     instructions rather than be killed mid-build.
+# RERUN_HINT (set by the caller) is the exact command to re-run on a bail.
+run_build_policied() { # args: proj who [lake build args...]
+  local proj="$1" who="$2"; shift 2
+
+  if [[ -n "${LEAN_CACHE_BUILD_SLOT_HELD:-}" ]]; then
+    run_lake_build "$proj" "$who" "$@"; return
+  fi
+  if ! is_cold_build "$proj"; then
+    run_lake_build "$proj" "$who" "$@"; return
+  fi
+
+  # Cold/full from here.
+  if [[ -n "${LEAN_CACHE_FORCE_WAIT:-}" ]]; then
+    acquire_build_slot "$who"
+    run_lake_build "$proj" "$who" "$@"; return
+  fi
+  if [[ "${CLAUDE_BASH_MODE:-background}" == foreground ]]; then
+    {
+      echo "$who: cold full build of $proj will exceed this call's ~2-minute foreground limit; not building."
+      echo "  Re-run it backgrounded (you'll be woken on completion) or with a 10-minute timeout:"
+      echo "    ${RERUN_HINT:-lake build}"
+      echo "  Or set LEAN_CACHE_FORCE_WAIT=1 to block to completion regardless of mode."
+    } >&2
+    exit "$BUILD_BAIL_CODE"
+  fi
+  acquire_build_slot "$who"
+  run_lake_build "$proj" "$who" "$@"
 }
 
 # Re-exec the current invocation as the cache owner. Used by mutating commands.
@@ -664,6 +770,8 @@ cmd_clean() {
 # (which would later replay as a false green).
 cmd_publish_build() {
   [[ $# -le 1 ]] || usage
+  # Publishing must build synchronously; never take the cold-build bail path.
+  export LEAN_CACHE_FORCE_WAIT=1
   local proj="${1:-.}"
   proj="$(cd "$proj" 2>/dev/null && pwd)" || die "no such directory: ${1:-.}"
   [[ -f "$proj/lean-toolchain" ]] || die "no $proj/lean-toolchain"
@@ -869,6 +977,9 @@ exec \"\${LEAN_CACHE_BIN:-$HOOK_BIN}\" commit-hint \"\$root\""
 # on main) is therefore NOT gated — the gate warns and lets it pass rather than
 # green-lighting `other` on the strength of a build of `main`.
 cmd_pre_push_gate() {
+  # The gate blocks the push; it must build synchronously to completion and
+  # never take the cold-build bail path.
+  export LEAN_CACHE_FORCE_WAIT=1
   local remote="${1:-}" root head changed new base parent f tip know
   local gate=0 undecided=0 ungated=""
   root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
@@ -963,22 +1074,43 @@ cmd_pre_push_gate() {
         "$BIN" publish-build "$root" ) || log "push gate: warm-build publish failed (push still allowed)"
 }
 
-# `lake build` under a host build slot: workers that route their heavy builds
-# through this (instead of bare `lake build`) get serialized against the gate
-# and each other, so a few builds run at full parallelism instead of many
-# crawling. Extra args go to lake build verbatim.
+# `lake build` under the shared build policy: an explicit alias for the same path
+# the transparent `lake` shim takes. Warm/incremental builds run immediately with
+# no slot; cold/full builds serialize on a host slot and either run to completion
+# (force-wait, or a background/absent CLAUDE_BASH_MODE) or bail in a bounded
+# foreground call. `--wait` forces block-to-completion regardless of mode. Extra
+# args go to `lake build` verbatim.
 cmd_build() {
+  local wait=0 rest=()
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --wait) wait=1 ;;
+      *) rest+=("$a") ;;
+    esac
+  done
+  set -- ${rest[@]+"${rest[@]}"}
+
   # First arg is the project path only when it looks like one (".", or contains
   # a slash) AND exists — a bare word is always a lake target, so a target that
   # happens to share its name with a directory (e.g. `build Aliasing`) is never
   # misparsed. Use ./name for a relative project dir.
-  local proj="."
+  local orig=("$@") proj="."
   if [[ $# -ge 1 && ( "$1" == "." || "$1" == */* ) && -d "$1" ]]; then proj="$1"; shift; fi
   proj="$(cd "$proj" && pwd)" || die "no such directory"
   [[ -f "$proj/lakefile.toml" || -f "$proj/lakefile.lean" ]] \
     || die "$proj is not a Lake project (no lakefile)"
-  acquire_build_slot "$PROG build"
-  run_lake_build "$proj" "$PROG build" "$@"
+
+  [[ "$wait" -eq 1 ]] && export LEAN_CACHE_FORCE_WAIT=1
+  # The command to re-run on a foreground bail: `lake build …` when we were
+  # reached through the shim (what the instance actually typed), else the
+  # explicit `lean-cache build …`.
+  if [[ -n "${LEAN_CACHE_FROM_SHIM:-}" ]]; then
+    RERUN_HINT="lake build${orig[*]:+ ${orig[*]}}"
+  else
+    RERUN_HINT="$PROG build${orig[*]:+ ${orig[*]}}"
+  fi
+  run_build_policied "$proj" "$PROG build" "$@"
 }
 
 # Print a one-line reminder after a commit that touches *.lean, noting the warm

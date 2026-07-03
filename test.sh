@@ -498,14 +498,14 @@ PATH="$STUB:$PATH" LAKE_RC=1 LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD
 check "failed gate build publishes nothing"       "no" "$(haspub "$c_bad")"
 
 echo "== gate skip on stored green build (hermetic) =="
-# A clean-tree publish attests the commit: the gate must skip its rebuild when
-# the store already holds that (commit, toolchain) with tree_clean=1.
+# A green publish attests the commit: the gate must skip its rebuild when the
+# store already holds that (commit, toolchain) with tree_clean=1.
 printf 'def a := 8\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm edit5
 c5="$(gitc "$P" rev-parse HEAD)"
 rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE8' > "$P/.lake/build/lib/lean/Proj/A.olean"
 PATH="$STUB:$PATH" "$CLI" publish-build "$P" >/dev/null 2>&1
 m5="$(grep -Rl "^commit=$c5$" "$LEAN_CACHE_BUILDS" 2>/dev/null | head -1)"
-check "clean-tree publish stamps tree_clean=1"  "tree_clean=1" "$(grep '^tree_clean=' "$m5" 2>/dev/null)"
+check "green publish stamps tree_clean=1"       "tree_clean=1" "$(grep '^tree_clean=' "$m5" 2>/dev/null)"
 : > "$TMP/g.log"
 out="$(PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$P" push origin HEAD:main 2>&1)"; rc=$?
 check "gate skips build for stored green HEAD"  "0" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
@@ -523,22 +523,73 @@ PATH="$STUB:$PATH" LEAN_CACHE_NO_GATE_SKIP=1 LEAN_CACHE_NO_PUBLISH_ON_PUSH=1 \
   LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
 check "NO_GATE_SKIP forces the gate build"      "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
 
-# A dirty-tree publish (untracked .lean present) attests nothing: tree_clean=0
-# and the gate must NOT skip.
-printf 'def stray := 0\n' > "$P/Stray.lean"                 # untracked source
+# A dirty-tree publish is refused outright: every stored build must be an honest
+# snapshot of committed sources.
 printf 'def a := 10\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm edit7
 c7="$(gitc "$P" rev-parse HEAD)"
+printf 'def stray := 0\n' > "$P/Stray.lean"                 # untracked source -> dirty tree
 rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE10' > "$P/.lake/build/lib/lean/Proj/A.olean"
-PATH="$STUB:$PATH" "$CLI" publish-build "$P" >/dev/null 2>&1
-m7="$(grep -Rl "^commit=$c7$" "$LEAN_CACHE_BUILDS" 2>/dev/null | head -1)"
-check "dirty-tree publish stamps tree_clean=0"  "tree_clean=0" "$(grep '^tree_clean=' "$m7" 2>/dev/null)"
+rc=0; out="$(PATH="$STUB:$PATH" "$CLI" publish-build "$P" 2>&1)" || rc=$?
+check "dirty-tree publish is refused"           "yes" "$([[ "$rc" -ne 0 ]] && echo yes || echo no)"
+check "dirty-tree publish says why"             "yes" \
+  "$(printf '%s' "$out" | grep -q 'dirty tree' && echo yes || echo no)"
+check "dirty-tree publish stores nothing"       "no" "$(haspub "$c7")"
 rm -f "$P/Stray.lean"
+
+# A failed build on a clean tree still publishes, stamped tree_clean=0 (non-green):
+# it seeds future incremental builds but attests nothing.
+PATH="$STUB:$PATH" LAKE_RC=1 "$CLI" publish-build "$P" >/dev/null 2>&1
+m7="$(grep -Rl "^commit=$c7$" "$LEAN_CACHE_BUILDS" 2>/dev/null | head -1)"
+check "failed build publishes a store entry"    "yes" "$(haspub "$c7")"
+check "failed build stamps tree_clean=0"        "tree_clean=0" "$(grep '^tree_clean=' "$m7" 2>/dev/null)"
+
+# seed-build seeds a non-green entry like any other (honest olean/trace pairs).
+NG="$TMP/ng"; gitc "$P" worktree add -q "$NG" "$c7" 2>/dev/null
+"$CLI" seed-build "$NG" >/dev/null 2>&1
+check "seed-build seeds a non-green entry"      "OLE10" \
+  "$(cat "$NG/.lake/build/lib/lean/Proj/A.olean" 2>/dev/null)"
+
+# The gate must NOT skip on a non-green (tree_clean=0) store entry.
 : > "$TMP/g.log"
 out="$(PATH="$STUB:$PATH" LEAN_CACHE_NO_PUBLISH_ON_PUSH=1 LAKE_LOG="$TMP/g.log" \
        gitc "$P" push origin HEAD:main 2>&1)"; rc=$?
-check "gate does not skip on a dirty-tree store" "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
-check "no skip message on a dirty-tree store"    "no" \
+check "gate does not skip on a non-green store" "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
+check "no skip message on a non-green store"    "no" \
   "$(printf '%s' "$out" | grep -q 'skipping the gate build' && echo yes || echo no)"
+
+# A stored green build is never overwritten by a later non-green publish at the
+# same commit: an interrupted/OOM'd rebuild must not stale the entry or switch
+# off the gate skip.
+printf 'def a := 20\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm green-guard
+c8="$(gitc "$P" rev-parse HEAD)"
+rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'GREEN8' > "$P/.lake/build/lib/lean/Proj/A.olean"
+PATH="$STUB:$PATH" "$CLI" publish-build "$P" >/dev/null 2>&1          # green publish
+m8="$(grep -Rl "^commit=$c8$" "$LEAN_CACHE_BUILDS" 2>/dev/null | head -1)"
+check "green build stamps tree_clean=1"         "tree_clean=1" "$(grep '^tree_clean=' "$m8" 2>/dev/null)"
+printf 'NONGREEN8' > "$P/.lake/build/lib/lean/Proj/A.olean"          # different olean content
+rc=0; PATH="$STUB:$PATH" LAKE_RC=1 "$CLI" publish-build "$P" >/dev/null 2>&1 || rc=$?
+check "failed publish over green entry succeeds" "0" "$rc"
+check "green entry survives a failed re-publish" "tree_clean=1" "$(grep '^tree_clean=' "$m8" 2>/dev/null)"
+check "green entry keeps its green olean"       "GREEN8" \
+  "$(cat "$(dirname "$m8")/lib/lean/Proj/A.olean" 2>/dev/null)"
+
+echo "== store retention protects green attestations (hermetic) =="
+# Retention keeps the newest build per slug (warmth) AND the newest green build
+# per slug (attestation), so a stream of non-green WIP publishes cannot evict a
+# green entry the gate skips on. Craft entries with explicit published_at so the
+# ordering is deterministic.
+RB="$LEAN_CACHE_BUILDS/retain-repo"
+mkentry() { # dir published_at tree_clean
+  mkdir -p "$1/lib"; printf 'OLE' > "$1/lib/x.olean"
+  printf 'slug=s\npublished_at=%s\ntree_clean=%s\n' "$2" "$3" > "$1/.seed-manifest"
+}
+mkentry "$RB/cX/s" 1000 1     # green, oldest
+mkentry "$RB/cY/s" 2000 0     # non-green WIP
+mkentry "$RB/cZ/s" 3000 0     # non-green WIP, newest
+"$CLI" prune-builds --keep-days 0 >/dev/null 2>&1
+check "retention keeps the newest green entry"   "yes" "$([[ -d "$RB/cX/s" ]] && echo yes || echo no)"
+check "retention keeps the newest entry"         "yes" "$([[ -d "$RB/cZ/s" ]] && echo yes || echo no)"
+check "retention drops middle non-green WIP"     "no"  "$([[ -d "$RB/cY/s" ]] && echo yes || echo no)"
 
 echo "== host build slots & lean-cache build (hermetic) =="
 # The wrapper runs lake build (with passthrough args) in the project.

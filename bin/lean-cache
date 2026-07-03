@@ -752,18 +752,20 @@ cmd_refresh() {
   cmd_use "$proj"   # re-overlays and then seeds
 }
 
-# Seed the worktree's .lake/build from a stored warm build, but ONLY when the
+# Seed the worktree's .lake/build from a stored build, but ONLY when the
 # worktree's HEAD exactly matches a stored (commit, slug) build. On any mismatch
 # (or no stored build) this is a silent no-op and the normal cold/incremental
-# build runs — we never approximate, so we can never replay a stale olean as a
-# false green.
+# build runs.
 #
-# When HEAD does match, the stored tree IS the true full build of this exact
-# commit, so we replace whatever .lake/build holds (typically a stale leftover
-# from a reused worktree) rather than preserving it: the replacement can't be a
-# false green (lake re-elaborates any module whose source differs from committed
-# HEAD), and preserving a stale build is exactly what forces a needless full
-# rebuild. Safe to call from a hook.
+# The stored tree is an honest snapshot of this exact commit: every olean is
+# paired with its own true trace, so a green publish carries a full build and a
+# non-green publish carries a consistent partial one (built pairs up to the
+# failure, still-honest older pairs beyond it). Either way lake re-elaborates
+# any module whose source or dependencies differ after seeding, so we replace
+# whatever .lake/build holds (typically a stale leftover from a reused worktree)
+# rather than preserving it: the replacement can't be a false green, and
+# preserving a stale build is what forces a needless full rebuild. Safe to call
+# from a hook.
 cmd_seed_build() {
   [[ $# -le 1 ]] || usage
   local proj="${1:-.}"
@@ -811,10 +813,12 @@ cmd_clean() {
   log "removed $proj/.lake/build"
 }
 
-# Build the project to completion and publish its warm .lake/build for the
-# current (commit, slug), so future fresh worktrees can be seeded from it.
-# Running the build first guarantees we never store a partial or stale tree
-# (which would later replay as a false green).
+# Build the project and publish its .lake/build for the current (commit, slug),
+# so future fresh worktrees can be seeded from it. Requires a clean tree, so the
+# stored build is an honest snapshot of committed sources; tree_clean=1 in the
+# manifest records that lake exited 0 (a green build the gate may skip on). A
+# non-green build is still published (tree_clean=0) to seed future incremental
+# builds, but never overwrites a stored green build of the same commit.
 cmd_publish_build() {
   [[ $# -le 1 ]] || usage
   # Publishing must build synchronously; never take the cold-build bail path.
@@ -827,14 +831,19 @@ cmd_publish_build() {
   [[ -n "$commit" ]] || die "no HEAD commit in $proj"
   normalize_version "$(cat "$proj/lean-toolchain")"
 
-  # Record cleanliness BEFORE the build: it is what makes the stored build
-  # attest the commit (the gate's skip-on-stored-green trusts tree_clean=1).
-  local clean=0; tree_clean_for_build "$proj" && clean=1
+  # Publish only at a commit boundary: the working tree must match committed
+  # HEAD, so every stored build is an honest snapshot keyed to real committed
+  # sources. Publish WIP by committing it first, then publishing.
+  tree_clean_for_build "$proj" \
+    || die "refusing to publish a dirty tree; commit your changes first"
 
-  log "building $proj to completion before publishing (this can take minutes)"
+  log "building $proj before publishing (this can take minutes)"
   acquire_build_slot "$PROG publish-build"
-  run_lake_build "$proj" "$PROG publish-build" \
-    || die "lake build failed; refusing to publish a broken build"
+  # A failed build is still publishable: its .lake/build holds honest olean/trace
+  # pairs for the modules that did compile, which seed a faster incremental build.
+  # green (lake exited 0) is what the manifest records as tree_clean.
+  local green=0
+  if run_lake_build "$proj" "$PROG publish-build"; then green=1; fi
   [[ -d "$proj/.lake/build/lib" ]] || die "$proj has no .lake/build/lib to publish"
 
   local store; store="$(build_store_for "$proj" "$commit" "$SLUG")"
@@ -846,6 +855,15 @@ cmd_publish_build() {
     || exec 9>"$BUILDS/.publish.lock"
   flock -n 9 || die "another publish for this build is in progress"
 
+  # Never turn a stored green attestation into a non-green one: an interrupted or
+  # failed rebuild at a commit already known green must not stale the entry or
+  # switch off the gate's skip. Leave the stored green build in place, and never
+  # fail the caller (a push must not be affected).
+  if [[ "$green" -eq 0 ]] && grep -qx 'tree_clean=1' "$store/.seed-manifest" 2>/dev/null; then
+    log "keeping stored green build for $TCVER @ ${commit:0:12}; not overwriting with a non-green build"
+    return 0
+  fi
+
   mkdir -p "$(dirname "$store")"
   local incoming="${store}.incoming.$$"
   rm -rf "$incoming"; mkdir -p "$incoming"
@@ -853,13 +871,13 @@ cmd_publish_build() {
   [[ -d "$proj/.lake/build/ir" ]] && cp -a "$proj/.lake/build/ir" "$incoming/ir"
   printf 'repo=%s\ncommit=%s\ntoolchain=%s\nslug=%s\noleans=%s\npublished_by=%s\npublished_at=%s\ntree_clean=%s\n' \
     "$(repo_identity "$proj")" "$commit" "$TOOLCHAIN" "$SLUG" \
-    "$(find "$incoming/lib" -name '*.olean' 2>/dev/null | wc -l)" "$(id -un)" "$(date +%s)" "$clean" \
+    "$(find "$incoming/lib" -name '*.olean' 2>/dev/null | wc -l)" "$(id -un)" "$(date +%s)" "$green" \
     > "$incoming/.seed-manifest"
   normalize_build_store "$incoming"
 
   rm -rf "$store"
   mv "$incoming" "$store"
-  log "published warm build for $TCVER @ ${commit:0:12} -> $store"
+  log "published $([[ "$green" -eq 1 ]] && echo green || echo non-green) build for $TCVER @ ${commit:0:12} -> $store"
 
   # Rotate this repo's store: the build just published is now "latest" and is
   # kept; older non-latest builds past the window are dropped.
@@ -875,28 +893,38 @@ build_published_at() {
   printf '%s' "$t"
 }
 
+# True if a stored build dir holds a green (lake-exited-0) build.
+build_is_green() { grep -qx 'tree_clean=1' "$1/.seed-manifest" 2>/dev/null; }
+
 # Rotate one repo's store dir ($BUILDS/<repo>): keep the newest build per slug
-# (toolchain) indefinitely; remove any other build published more than
-# keep_days ago. A build dir is <repo>/<commit>/<slug>.
+# (toolchain) AND the newest green build per slug indefinitely; remove any other
+# build published more than keep_days ago. Protecting the newest green build
+# keeps a stream of non-green WIP publishes from washing out the attestation the
+# gate skips on. A build dir is <repo>/<commit>/<slug>.
 prune_builds_under() {
   local repo="$1" keep_days="$2"
   [[ -d "$repo" ]] || return 0
   local now cutoff; now="$(date +%s)"; cutoff=$(( now - keep_days * 86400 ))
-  local -A latest=()
+  local -A latest=() latest_green=()
   local d slug ts
-  # Pass 1: newest publish time per slug.
+  # Pass 1: newest publish time per slug, and newest green publish time per slug.
   while IFS= read -r -d '' d; do
     case "$d" in *.incoming.*) continue ;; esac
     [[ -e "$d/.seed-manifest" || -d "$d/lib" ]] || continue
     slug="$(basename "$d")"; ts="$(build_published_at "$d")"
     [[ -z "${latest[$slug]:-}" || "$ts" -gt "${latest[$slug]}" ]] && latest[$slug]="$ts"
+    if build_is_green "$d"; then
+      [[ -z "${latest_green[$slug]:-}" || "$ts" -gt "${latest_green[$slug]}" ]] && latest_green[$slug]="$ts"
+    fi
   done < <(find "$repo" -mindepth 2 -maxdepth 2 -type d -print0 2>/dev/null)
-  # Pass 2: drop non-latest builds older than the window.
+  # Pass 2: drop builds that are neither newest-per-slug nor newest-green-per-slug
+  # and are older than the window.
   while IFS= read -r -d '' d; do
     case "$d" in *.incoming.*) continue ;; esac
     [[ -e "$d/.seed-manifest" || -d "$d/lib" ]] || continue
     slug="$(basename "$d")"; ts="$(build_published_at "$d")"
     [[ "$ts" -eq "${latest[$slug]:-0}" ]] && continue   # newest per slug: keep
+    [[ "$ts" -eq "${latest_green[$slug]:-0}" ]] && build_is_green "$d" && continue  # newest green per slug: keep
     [[ "$ts" -lt "$cutoff" ]] || continue               # within window: keep
     log "pruning stale build $(basename "$(dirname "$d")")/$slug (~$(( (now - ts) / 86400 ))d old)"
     rm -rf "$d"
@@ -1070,11 +1098,10 @@ cmd_pre_push_gate() {
   [[ "$gate" -eq 1 ]] || exit 0
 
   # Skip the rebuild when the store already holds a green build of this exact
-  # (commit, toolchain), published from a clean tree: that build attests the
-  # commit compiles, so gating it again only repeats minutes of work (the
-  # worker-builds / coordinator-verifies / gate-builds-again triple build).
-  # A store entry published from a dirty tree (tree_clean=0, or a manifest
-  # predating the field) attests nothing and never skips.
+  # (commit, toolchain): that build attests the commit compiles, so gating it
+  # again only repeats minutes of work (the worker-builds / coordinator-verifies
+  # / gate-builds-again triple build). A non-green stored build (tree_clean=0, or
+  # a manifest predating the field) attests nothing and never skips.
   # Set LEAN_CACHE_NO_GATE_SKIP=1 to force the rebuild.
   if [[ -z "${LEAN_CACHE_NO_GATE_SKIP:-}" && -f "$root/lean-toolchain" ]]; then
     local slug store

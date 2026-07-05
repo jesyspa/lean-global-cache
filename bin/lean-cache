@@ -79,9 +79,7 @@ Usage: $PROG <command> [args]
 
   install [--force] <version>
                         Build & install a mathlib version into the shared cache.
-                        Runs a full `lake build` (incl. ProofWidgets' npm widget
-                        JS) so consumers only ever read the cache. --force
-                        rebuilds a version already present.
+                        --force rebuilds a version already present.
   uninstall <version>   Remove a version from the shared cache.
   link <version>        Print the packages path to symlink a project's
                         .lake/packages at.
@@ -606,9 +604,8 @@ EOF
   # Integrity check: mathlib oleans must be present, else the cache is useless.
   # `-print -quit` stops at the first match, so there's no pipe (a `… | head`
   # would SIGPIPE find and, under pipefail+set -e, abort the whole install).
-  # The `|| true` is load-bearing: without it a missing build dir makes the
-  # command substitution exit non-zero and `set -e` kills the install *before*
-  # the `|| die` below can report — a silent abort with no diagnostic.
+  # `|| true`: a missing dir makes the substitution exit non-zero, which under
+  # `set -e` would abort before the `|| die` below can report.
   local mlbuild="$build/.lake/packages/mathlib/.lake/build" first_olean
   first_olean="$(find "$mlbuild" -name '*.olean' -print -quit 2>/dev/null || true)"
   if [[ -z "$first_olean" ]]; then
@@ -620,25 +617,17 @@ EOF
   [[ -d "$build/.lake/packages" ]] \
     || die "lake produced no .lake/packages directory — aborting"
 
-  # Run the full `lake build` now, as OWNER, so every output a consumer would
-  # otherwise have to regenerate itself is materialized in the read-only cache:
-  #   * per-module hash markers — `lake exe cache get` writes some *.hash files
-  #     with a leading zero dropped (e.g. *.ilean.hash: `566…` vs the canonical
-  #     `0566…`), which Lake treats as stale. On the first downstream build Lake
-  #     "replays" that module and rewrites the hash — hitting "permission denied"
-  #     on the read-only tree. A real `lake build` writes them canonically, once,
-  #     here; consumers then read them and never replay.
-  #   * ProofWidgets' npm-built widget JS (widgetJsAll), else consumers `npm
-  #     install` into the cache and hit the same permission error.
-  # Building from the fetched oleans is a replay (no recompilation), but it still
-  # rewrites thousands of small files, so it is not instant. Fatal on failure — a
-  # cache that breaks every consumer build is worse than no cache.
+  # Build fully, as OWNER, rather than trusting `cache get` alone: `cache get`
+  # leaves outputs Lake regenerates on a consumer's first build — some hash
+  # markers, and ProofWidgets' widget JS — which then fail to write into the
+  # read-only cache. This replays the fetched oleans (no recompilation) but
+  # rewrites many small files, so it is not instant. Fatal on failure: a cache
+  # that breaks consumer builds is worse than none.
   local -a targets=(Mathlib)
   [[ -d "$build/.lake/packages/proofwidgets" ]] && targets+=(widgetJsAll)
-  log "materializing the full build into the cache: lake build ${targets[*]} (replays cached oleans; may take minutes)"
+  log "building the cache: lake build ${targets[*]} (may take minutes)"
   ( cd "$build" && lake build "${targets[@]}" ) \
-    || die "full lake build failed — aborting so the cache is not published half-built"
-  log "full build materialized"
+    || die "lake build failed — aborting so the cache is not published half-built"
 
   log "publishing to $pkgs"
   mkdir -p "$dest"

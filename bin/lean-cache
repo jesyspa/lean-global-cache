@@ -78,8 +78,9 @@ usage() {
 Usage: $PROG <command> [args]
 
   install [--force] <version>
-                        Build & install a mathlib version into the shared cache
-                        (incl. ProofWidgets' npm-built widget JS). --force
+                        Build & install a mathlib version into the shared cache.
+                        Runs a full `lake build` (incl. ProofWidgets' npm widget
+                        JS) so consumers only ever read the cache. --force
                         rebuilds a version already present.
   uninstall <version>   Remove a version from the shared cache.
   link <version>        Print the packages path to symlink a project's
@@ -619,23 +620,25 @@ EOF
   [[ -d "$build/.lake/packages" ]] \
     || die "lake produced no .lake/packages directory — aborting"
 
-  # Materialize ProofWidgets' TypeScript widgets now, as OWNER, so their build
-  # outputs (dist JS, package-lock.json, and the input-hash markers) live in the
-  # shared cache. ProofWidgets ships prebuilt JS, but Lake still runs `npm
-  # install` for the lockfile the first time a project builds it; without this,
-  # every consumer's first full `lake build` tries to write that under the
-  # read-only cache and dies with "permission denied". A no-op when the closure
-  # has no proofwidgets. Requires npm + network (present on the build host); a
-  # widget-build failure is fatal — a cache that would break every consumer
-  # build is worse than no cache.
-  if [[ -d "$build/.lake/packages/proofwidgets" ]]; then
-    log "building ProofWidgets widget JS (npm) into the cache (target: widgetJsAll)"
-    ( cd "$build" && lake build widgetJsAll ) \
-      || die "widgetJsAll build failed (npm/network?) — aborting so the cache is not published half-built"
-    log "ProofWidgets widget JS built"
-  else
-    log "no proofwidgets in the closure — skipping widget build"
-  fi
+  # Run the full `lake build` now, as OWNER, so every output a consumer would
+  # otherwise have to regenerate itself is materialized in the read-only cache:
+  #   * per-module hash markers — `lake exe cache get` writes some *.hash files
+  #     with a leading zero dropped (e.g. *.ilean.hash: `566…` vs the canonical
+  #     `0566…`), which Lake treats as stale. On the first downstream build Lake
+  #     "replays" that module and rewrites the hash — hitting "permission denied"
+  #     on the read-only tree. A real `lake build` writes them canonically, once,
+  #     here; consumers then read them and never replay.
+  #   * ProofWidgets' npm-built widget JS (widgetJsAll), else consumers `npm
+  #     install` into the cache and hit the same permission error.
+  # Building from the fetched oleans is a replay (no recompilation), but it still
+  # rewrites thousands of small files, so it is not instant. Fatal on failure — a
+  # cache that breaks every consumer build is worse than no cache.
+  local -a targets=(Mathlib)
+  [[ -d "$build/.lake/packages/proofwidgets" ]] && targets+=(widgetJsAll)
+  log "materializing the full build into the cache: lake build ${targets[*]} (replays cached oleans; may take minutes)"
+  ( cd "$build" && lake build "${targets[@]}" ) \
+    || die "full lake build failed — aborting so the cache is not published half-built"
+  log "full build materialized"
 
   log "publishing to $pkgs"
   mkdir -p "$dest"

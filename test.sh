@@ -160,6 +160,33 @@ rc=0; "$CLI" refresh "$U" >/dev/null 2>&1 || rc=$?
 check "refresh of uninstalled ver exits 0"    "0" "$rc"
 check "refresh of uninstalled ver no overlay" "" "$(live_slug "$U")"
 
+echo "== elan wiring (hermetic) =="
+# `use` points ~/.elan at the shared ELAN_HOME ($LEAN_CACHE_ROOT/elan) so bare
+# lean/lake and the editor resolve the shared toolchain, unless a real personal
+# elan is present (then it warns and leaves it). HOME is redirected per case, so
+# this never touches the developer's real ~/.elan.
+mkdir -p "$TMP/cache/elan/bin"; : > "$TMP/cache/elan/bin/lean"
+EP="$TMP/elanwire"; mkdir -p "$EP"; gitc "$EP" init -q
+pin v4.30.0 "$EP"; gitc "$EP" add -A; gitc "$EP" commit -qm e
+elink()    { readlink "$1/.elan" 2>/dev/null || true; }
+realdir()  { [[ -d "$1" && ! -L "$1" ]] && echo yes || echo no; }
+
+# (a) absent ~/.elan -> symlinked to the shared elan.
+EA="$TMP/eh-fresh"; mkdir -p "$EA"
+HOME="$EA" "$CLI" use "$EP" >/dev/null 2>&1
+check "use wires an absent ~/.elan"           "$TMP/cache/elan" "$(elink "$EA")"
+# (b) a correct link is idempotent.
+HOME="$EA" "$CLI" use "$EP" >/dev/null 2>&1
+check "use leaves a correct ~/.elan link"     "$TMP/cache/elan" "$(elink "$EA")"
+# (c) a wrong/broken link is repointed.
+EW="$TMP/eh-wrong"; mkdir -p "$EW"; ln -sfn /nonexistent "$EW/.elan"
+HOME="$EW" "$CLI" use "$EP" >/dev/null 2>&1
+check "use repoints a wrong ~/.elan link"     "$TMP/cache/elan" "$(elink "$EW")"
+# (d) a real personal elan is preserved, never clobbered.
+ER="$TMP/eh-real"; mkdir -p "$ER/.elan/bin"; : > "$ER/.elan/bin/lean"
+HOME="$ER" "$CLI" use "$EP" >/dev/null 2>&1
+check "use preserves a real ~/.elan"          "yes" "$(realdir "$ER/.elan")"
+
 echo "== fix-filemode (hermetic) =="
 # The cache normalizes permissions, which flips the exec bit on tracked files;
 # fix-filemode must set core.fileMode=false on each package repo so `git status`

@@ -484,19 +484,42 @@ register_safe_dirs() { # arg: shared packages dir being overlaid
 
 # When the cache uses a shared ELAN_HOME (a fleet/standalone host) rather than
 # the caller's own ~/.elan, bare `lean`/`lake` and an editor's Lean server
-# resolve via the caller's PATH, NOT through `lean-cache`, so they miss the
-# shared toolchain — and a stale personal elan on PATH can shadow it entirely.
-# Print the one-time shell wiring. Skipped when the cache IS the caller's own
-# elan (nothing to wire).
-print_elan_hint() {
-  [[ "$ELAN_HOME" == "$HOME/.elan" ]] && return 0
-  cat >&2 <<EOF
-==> To run lean/lake or your editor's Lean server (outside \`lean-cache\`) against
-    the shared toolchain, add to your shell rc (e.g. ~/.zshrc or ~/.profile):
-        export ELAN_HOME="$ELAN_HOME"
-        export PATH="\$ELAN_HOME/bin:\$PATH"
-    Place it after any line that adds \$HOME/.elan/bin so the shared elan wins.
+# resolve elan the usual way — via $HOME/.elan/bin on PATH, or by looking
+# straight at ~/.elan — and so miss the shared toolchain. Wire the usual
+# location to the shared one by making ~/.elan a symlink to $ELAN_HOME: no rc
+# edits, and it also catches tools that hardcode ~/.elan and ignore PATH. The
+# shared tree stays owner-only (2755), so this user runs its toolchains
+# read-only and cannot pollute it. A real (non-symlink) ~/.elan is never
+# clobbered — we warn and leave it, since replacing it needs the user's consent.
+# Skipped when the cache IS the caller's own elan (nothing to wire).
+wire_elan() {
+  local home_elan="$HOME/.elan"
+  [[ "$ELAN_HOME" == "$home_elan" ]] && return 0
+  # Don't create a dangling link to an elan the owner has not bootstrapped yet.
+  [[ -d "$ELAN_HOME" ]] || return 0
+
+  local want; want="$(realpath "$ELAN_HOME" 2>/dev/null || echo "$ELAN_HOME")"
+
+  if [[ -L "$home_elan" ]]; then
+    local cur; cur="$(realpath "$home_elan" 2>/dev/null || true)"
+    [[ "$cur" == "$want" ]] && return 0          # already wired — stay quiet
+    ln -sfn "$ELAN_HOME" "$home_elan"
+    log "repointed $home_elan -> $ELAN_HOME (was ${cur:-broken link})"
+  elif [[ -e "$home_elan" ]]; then
+    # A real personal elan: its bin is on PATH the usual way, so it shadows the
+    # shared toolchain. Replacing it would discard the user's own install, so
+    # leave it and show how to hand elan over to the cache.
+    cat >&2 <<EOF
+==> A personal elan at $home_elan is shadowing the shared toolchain.
+    To let lean-cache own elan, move it aside and re-run:
+        mv $home_elan $home_elan.bak && $PROG use
+    That replaces $home_elan with a symlink to the shared $ELAN_HOME; your
+    toolchains live in the shared cache, so nothing is lost.
 EOF
+  else
+    ln -sfn "$ELAN_HOME" "$home_elan"
+    log "wired $home_elan -> $ELAN_HOME (shared toolchain now on the usual PATH)"
+  fi
 }
 
 # --- Commands ----------------------------------------------------------------
@@ -535,13 +558,19 @@ cmd_check_env() {
   else fail "no elan at $ELAN_HOME — the cache owner must bootstrap it"; fi
 
   # We prepend the shared elan for our own commands, but bare lean/lake and the
-  # editor's Lean server inherit the caller's PATH, so check that.
+  # editor's Lean server inherit the caller's PATH, so check that. Compare by
+  # realpath, not string: `use` wires ~/.elan as a symlink to the shared elan,
+  # so the first lean on PATH is $HOME/.elan/bin/lean but resolves to the shared
+  # one — that is correctly wired, not a shadow.
   local first_lean; first_lean="$(PATH="$CALLER_PATH" command -v lean 2>/dev/null || true)"
-  if [[ "$first_lean" == "$ELAN_HOME/bin/lean" ]]; then pass "bare lean/lake resolve to the shared elan"
+  local want_lean; want_lean="$(realpath "$ELAN_HOME/bin/lean" 2>/dev/null || echo "$ELAN_HOME/bin/lean")"
+  local got_lean=""
+  [[ -n "$first_lean" ]] && got_lean="$(realpath "$first_lean" 2>/dev/null || echo "$first_lean")"
+  if [[ -n "$got_lean" && "$got_lean" == "$want_lean" ]]; then pass "bare lean/lake resolve to the shared elan"
   elif [[ -z "$first_lean" ]]; then
-    warn "shared elan not on your PATH; add to your shell rc: export PATH=\"$ELAN_HOME/bin:\$PATH\""
+    warn "shared elan not on your PATH; run '$PROG use' to link ~/.elan to it, or add: export PATH=\"$ELAN_HOME/bin:\$PATH\""
   else
-    warn "bare lean resolves to $first_lean, not the shared elan; put $ELAN_HOME/bin first on PATH"
+    warn "bare lean resolves to $first_lean, not the shared elan; run '$PROG use' to link ~/.elan to the shared elan"
   fi
 
   # Consumer git-trust: without it Lake mistakes the OWNER-owned dep repos for a
@@ -1390,7 +1419,7 @@ case "$cmd" in
   install)   cmd_install   "$@" ;;
   uninstall) cmd_uninstall "$@" ;;
   link)      cmd_link      "$@" ;;
-  use)          cmd_use           "$@" && print_elan_hint ;;
+  use)          cmd_use           "$@" && wire_elan ;;
   refresh)      cmd_refresh       "$@" ;;
   seed-build)   cmd_seed_build    "$@" ;;
   clean)        cmd_clean         "$@" ;;

@@ -128,6 +128,26 @@ shared cache precisely to avoid cross-project conflicts.
 - A package name the project provides as its own *real* directory is treated as
   an intentional override/extra and left untouched.
 
+### Wiring elan to the shared toolchain
+
+`lean-cache` runs its own `lean`/`lake` against the shared `ELAN_HOME`
+(`ROOT/elan`), but bare `lean`/`lake` and the editor's Lean server resolve elan
+the usual way — via `$HOME/.elan/bin` on `PATH`, or by looking straight at
+`~/.elan` — and would otherwise miss the shared toolchain (or be shadowed by a
+stale personal elan). So `use` makes `~/.elan` a **symlink to `ROOT/elan`**: no
+shell-rc edits, and it also catches tools that hardcode `~/.elan` and ignore
+`PATH`. The shared tree stays owner-only (`2755`), so a consumer runs its
+toolchains read-only and cannot pollute it — the same read-only-is-enough
+argument as the package overlay. In steady state (toolchain already cached and
+pinned via `lean-toolchain`) elan never needs to write, so the read-only home is
+transparent; an uncached toolchain or `self update` fails loudly, which is the
+owner's job to resolve. Linking is idempotent and repoints a wrong/broken link,
+but a **real** (non-symlink) `~/.elan` is never clobbered — `use` warns and
+leaves it, since replacing a user's own install needs their consent. `check-env`
+compares by `realpath`, so a symlinked `~/.elan` reads as correctly wired and a
+genuine shadow is flagged. A single-user cache the caller owns (`ELAN_HOME ==
+~/.elan`) needs no wiring and is skipped.
+
 ### Keeping the overlay fresh across git operations
 
 The overlay is toolchain-specific: it points at `lakes/<slug>/packages`, and a

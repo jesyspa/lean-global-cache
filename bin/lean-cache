@@ -597,9 +597,16 @@ EOF
   # Integrity check: mathlib oleans must be present, else the cache is useless.
   # `-print -quit` stops at the first match, so there's no pipe (a `… | head`
   # would SIGPIPE find and, under pipefail+set -e, abort the whole install).
-  local first_olean
-  first_olean="$(find "$build/.lake/packages/mathlib/.lake/build" -name '*.olean' -print -quit 2>/dev/null)"
-  [[ -n "$first_olean" ]] || die "no mathlib oleans after cache get — aborting"
+  # The `|| true` is load-bearing: without it a missing build dir makes the
+  # command substitution exit non-zero and `set -e` kills the install *before*
+  # the `|| die` below can report — a silent abort with no diagnostic.
+  local mlbuild="$build/.lake/packages/mathlib/.lake/build" first_olean
+  first_olean="$(find "$mlbuild" -name '*.olean' -print -quit 2>/dev/null || true)"
+  if [[ -z "$first_olean" ]]; then
+    log "diagnostic: $mlbuild -> $(ls -d "$mlbuild" 2>&1)"
+    log "diagnostic: .lake/packages -> $(ls "$build/.lake/packages" 2>&1 | tr '\n' ' ')"
+    die "no mathlib oleans after cache get (looked under $mlbuild) — aborting"
+  fi
 
   [[ -d "$build/.lake/packages" ]] \
     || die "lake produced no .lake/packages directory — aborting"
@@ -615,7 +622,11 @@ EOF
   # build is worse than no cache.
   if [[ -d "$build/.lake/packages/proofwidgets" ]]; then
     log "building ProofWidgets widget JS (npm) into the cache (target: widgetJsAll)"
-    ( cd "$build" && lake build widgetJsAll )
+    ( cd "$build" && lake build widgetJsAll ) \
+      || die "widgetJsAll build failed (npm/network?) — aborting so the cache is not published half-built"
+    log "ProofWidgets widget JS built"
+  else
+    log "no proofwidgets in the closure — skipping widget build"
   fi
 
   log "publishing to $pkgs"

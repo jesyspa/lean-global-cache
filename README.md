@@ -193,34 +193,39 @@ On the fleet these paths are under `/opt/bots/lean` (see [Configuration](#config
 
 ## Configuration
 
-Four settings control the host layout:
+These settings control the host layout:
 
-| Setting | Env var             | Default (single-user)                              |
-|---------|---------------------|----------------------------------------------------|
-| OWNER   | LEAN_CACHE_OWNER    | current user (`id -un`)                            |
-| GROUP   | LEAN_CACHE_GROUP    | current group (`id -gn`)                           |
-| ROOT    | LEAN_CACHE_ROOT     | `$HOME/.local/share/lean-global-cache`             |
-| BIN     | LEAN_CACHE_BIN      | realpath of the running `lean-cache` script itself |
+| Setting           | Env var                       | Default (single-user)                              |
+|-------------------|-------------------------------|----------------------------------------------------|
+| OWNER             | LEAN_CACHE_OWNER              | current user (`id -un`)                            |
+| GROUP             | LEAN_CACHE_GROUP              | current group (`id -gn`)                           |
+| ROOT              | LEAN_CACHE_ROOT              | `$HOME/.local/share/lean-global-cache`             |
+| BIN               | LEAN_CACHE_BIN               | realpath of the running `lean-cache` script itself |
+| INSTALL_LAKE_SHIM | LEAN_CACHE_INSTALL_LAKE_SHIM | `0` (no `lake` shim)                               |
 
 **Precedence:** env var > config file > built-in default.
 
-**Config file:** sourced if readable at `${LEAN_CACHE_CONF:-/etc/lean-cache.conf}`.
-It may set any subset of `OWNER`, `GROUP`, `ROOT`, `BIN` as plain shell
-assignments. See [`lean-cache.conf.example`](lean-cache.conf.example) for the
-fleet's values.
+**Config file:** `LEAN_CACHE_CONF`, if set, is used exclusively; otherwise the
+first that exists is read — `~/.config/lean-cache/lean-cache.conf` (per-user)
+then `/etc/lean-cache/lean-cache.conf` (multi-user), plus the legacy
+`/etc/lean-cache.conf`. It may set any subset of the settings as plain shell
+assignments. See [`lean-cache.conf.example`](lean-cache.conf.example).
 
-**Single-user host:** no setup needed. Just put `bin/lean-cache` on your PATH
-(or install it anywhere). The cache lands in `~/.local/share/lean-global-cache`,
-you already own it, and no sudo or admin scripts are required.
+**Single-user host:** no config file needed. Just put `bin/lean-cache` on your
+PATH (or install it anywhere). The cache lands in
+`~/.local/share/lean-global-cache`, you already own it, and no sudo or admin
+scripts are required.
 
 ```bash
-lean-cache config    # show the four resolved values
+lean-cache config      # show the resolved OWNER/GROUP/ROOT/BIN
+lean-cache check-env   # verify this user's wiring to the cache
 ```
 
-**Multi-user (fleet) host:** copy `lean-cache.conf.example` to
-`/etc/lean-cache.conf` and edit to taste (the fleet values are
-`OWNER=hostbot GROUP=bots ROOT=/opt/bots/lean BIN=/opt/bots/bin/lean-cache`),
-then follow [admin/README.md](admin/README.md) for the one-time root setup.
+**Multi-user host:** copy `lean-cache.conf.example` to
+`/etc/lean-cache/lean-cache.conf` and edit to taste (the fleet values are
+`OWNER=hostbot GROUP=bots ROOT=/opt/bots/lean BIN=/opt/bots/bin/lean-cache`,
+`INSTALL_LAKE_SHIM=1`), then follow [admin/README.md](admin/README.md) for the
+one-time root setup.
 
 ## Setup & deployment
 

@@ -7,7 +7,7 @@
 #   1. Creates a dedicated owner system user (the single writer).
 #   2. Creates the prefix skeleton, owner-owned.
 #   3. Clones the repo (or fast-forwards an existing clone) to $SRC.
-#   4. Writes /etc/lean-cache.conf so the CLI/admin scripts share OWNER/GROUP/ROOT/BIN.
+#   4. Writes /etc/lean-cache/lean-cache.conf so the CLI/admin scripts share config.
 #   5. Bootstraps elan (the Lean toolchain manager) into the shared ELAN_HOME —
 #      the CLI uses elan but does not install it.
 #   6. Installs the lean-cache CLI and creates the cache tree (versions are
@@ -42,7 +42,8 @@ PATH_LINK=/usr/local/bin/lean-cache          # on-PATH symlink -> $BIN
 REPO_URL="https://github.com/jesyspa/lean-global-cache.git"
 BRANCH=main
 UPDATE_ON_CALENDAR="hourly"                  # systemd OnCalendar= for autoupdate
-CONF=/etc/lean-cache.conf
+INSTALL_LAKE_SHIM=0                           # 1: route bare `lake build` through the slot policy
+CONF=/etc/lean-cache/lean-cache.conf         # multi-user config the CLI + admin scripts read
 # ---------------------------------------------------------------------------
 
 [[ "$(id -u)" -eq 0 ]] || { echo "must run as root (use sudo)" >&2; exit 1; }
@@ -70,15 +71,17 @@ else
   run_owner git -C "$SRC" merge --ff-only "origin/$BRANCH"
 fi
 
-# --- 4. /etc/lean-cache.conf (deterministic, root-owned) --------------------
+# --- 4. system config (deterministic, root-owned) ---------------------------
 log "writing $CONF"
+install -d -m 0755 "$(dirname "$CONF")"
 cat > "$CONF" <<EOF
-# lean-cache.conf — standalone shared host. Managed by admin/setup-standalone.sh.
-# The CLI, deploy.sh, and the admin scripts all resolve these four settings.
+# lean-cache config — standalone shared host. Managed by admin/setup-standalone.sh.
+# The CLI, deploy.sh, and the admin scripts all read these settings.
 OWNER=$OWNER
 GROUP=$GROUP
 ROOT=$ROOT
 BIN=$BIN
+INSTALL_LAKE_SHIM=$INSTALL_LAKE_SHIM
 EOF
 chown root:root "$CONF"
 chmod 0644 "$CONF"
@@ -102,7 +105,7 @@ fi
 # --- 6. install the CLI + cache tree (no version provisioning) ---------------
 # Versions are installed on demand by users (`lean-cache install <ver>`), so we
 # deliberately skip deploy.sh's `versions` reconcile and just lay down the CLI
-# and the cache dirs. The CLI reads /etc/lean-cache.conf at runtime.
+# and the cache dirs. The CLI reads $CONF at runtime.
 log "installing the lean-cache CLI to $BIN"
 run_owner install -m 0755 "$SRC/bin/lean-cache" "$BIN"
 run_owner install -d -m 2755 "$ROOT/lakes" "$ROOT/elan"
@@ -205,6 +208,9 @@ Notes:
     toolchain to their shell rc:
         export ELAN_HOME=$ROOT/elan
         export PATH="\$ELAN_HOME/bin:\$PATH"
+    then check their wiring with:   lean-cache check-env
+  * The transparent 'lake' shim is off; set INSTALL_LAKE_SHIM=1 in $CONF to route
+    bare 'lake build' through the build-slot policy.
   * Run an update now:   sudo systemctl start lean-cache-update.service
   * Inspect the timer:   systemctl list-timers lean-cache-update.timer
 EOF

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # deploy.sh — install the lean-cache CLI and reconcile the versions manifest.
 #
-# Installs the CLI to BIN (default: $HOME/.local/bin/lean-cache on a
-# single-user host; /opt/bots/bin/lean-cache on the fleet via
-# /etc/lean-cache.conf) and reconciles ./versions against the shared cache
-# (idempotent). All cache files end up OWNER-owned and not group-writable.
+# Installs the CLI to BIN (default: $HOME/.local/bin/lean-cache on a single-user
+# host; a shared path on a multi-user host via the config file) and reconciles
+# ./versions against the shared cache (idempotent). All cache files end up
+# OWNER-owned and not group-writable.
 #
 # One-time root setup (ownership migration + sudoers) lives in admin/ and is
 # NOT run here — see admin/README.md. deploy.sh never needs root.

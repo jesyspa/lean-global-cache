@@ -18,18 +18,20 @@ it directly. Two failure modes followed:
 
 ## Portability / configuration
 
-The single-writer model is opt-in via configuration. Four settings — `OWNER`,
-`GROUP`, `ROOT`, `BIN` — are resolved at runtime with the precedence env var >
-`/etc/lean-cache.conf` > built-in default.
+The single-writer model is opt-in via configuration. `OWNER`, `GROUP`, `ROOT`,
+`BIN`, and `INSTALL_LAKE_SHIM` are resolved at runtime with the precedence env
+var > config file > built-in default. The config file is `LEAN_CACHE_CONF` if
+set (used exclusively), else the first of `~/.config/lean-cache/lean-cache.conf`,
+`/etc/lean-cache/lean-cache.conf`, or the legacy `/etc/lean-cache.conf`.
 
 The built-in defaults target a **single-user host**: `OWNER` is the current
-user, `ROOT` is `~/.local/share/lean-global-cache`. Because `require_owner`
-no-ops when the caller already IS `OWNER`, a single-user host never invokes
-sudo and needs no sudoers rule or admin scripts.
+user, `ROOT` is `~/.local/share/lean-global-cache`, no config file is needed.
+Because `require_owner` no-ops when the caller already IS `OWNER`, a single-user
+host never invokes sudo and needs no sudoers rule or admin scripts.
 
-The fleet sets `OWNER=hostbot GROUP=bots ROOT=/opt/bots/lean
-BIN=/opt/bots/bin/lean-cache` via `/etc/lean-cache.conf`. The admin scripts
-read the same config file so the sudoers rule always matches the CLI.
+A shared host sets e.g. `OWNER=hostbot GROUP=bots ROOT=/opt/bots/lean
+BIN=/opt/bots/bin/lean-cache` in the config file. The admin scripts read the
+same file so the sudoers rule always matches the CLI.
 
 ## Model: single writer
 

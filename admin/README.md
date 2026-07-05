@@ -5,16 +5,16 @@ single-user host skips them entirely — the built-in defaults make the current
 user the owner, so no sudo rule is needed.
 
 The scripts read `OWNER`, `GROUP`, `ROOT`, and `BIN` from the config
-(`/etc/lean-cache.conf` or `LEAN_CACHE_*` env vars), so they automatically
-use the same values as the CLI. See
-[`lean-cache.conf.example`](../lean-cache.conf.example) for the fleet's settings.
+(`/etc/lean-cache/lean-cache.conf` or `LEAN_CACHE_*` env vars), so they
+automatically use the same values as the CLI. See
+[`lean-cache.conf.example`](../lean-cache.conf.example) for the settings.
 
 For a shared host, run these scripts once, by hand, when adopting this repo.
 Order:
 
-1. `sudo ./admin/install-config.sh` — install `/etc/lean-cache.conf` from
-   [`lean-cache.conf.example`](../lean-cache.conf.example), then edit it to this
-   host's values. Do this **first**: until the config exists the CLI and the
+1. `sudo ./admin/install-config.sh` — install `/etc/lean-cache/lean-cache.conf`
+   from [`lean-cache.conf.example`](../lean-cache.conf.example), then edit it to
+   this host's values. Do this **first**: until the config exists the CLI and the
    other admin scripts fall back to single-user defaults (the calling user and
    `$HOME/.local/share`), which is wrong for a shared cache.
 

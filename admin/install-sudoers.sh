@@ -3,9 +3,9 @@
 # run the mutating lean-cache subcommands as OWNER, so installs/uninstalls
 # always produce OWNER-owned files. Read-only subcommands need no privilege.
 #
-# OWNER, GROUP, and BIN are read from the config (env vars or
-# /etc/lean-cache.conf); they must match the values used by the CLI.
-# See lean-cache.conf.example for the fleet's settings.
+# OWNER, GROUP, and BIN are read from the config (env vars or the config file);
+# they must match the values used by the CLI.
+# See lean-cache.conf.example for the settings.
 #
 #   sudo ./admin/install-sudoers.sh
 set -euo pipefail

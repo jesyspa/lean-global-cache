@@ -3,8 +3,8 @@
 # Lean cache to the single-writer model. Run by a human with sudo, once, at
 # adoption time. NOT run by deploy.sh (deploy never needs root).
 #
-# ROOT, OWNER, and GROUP are read from the config (env vars or
-# /etc/lean-cache.conf). See lean-cache.conf.example for the fleet's settings.
+# ROOT, OWNER, and GROUP are read from the config (env vars or the config file).
+# See lean-cache.conf.example for the settings.
 #
 #   sudo ./admin/migrate-ownership.sh
 #

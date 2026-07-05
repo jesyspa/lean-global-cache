@@ -407,6 +407,12 @@ require_owner() {
     [[ -x "$INSTALLED_SELF" ]] \
       || die "must run as $OWNER and $INSTALLED_SELF is not installed"
     log "re-executing as $OWNER via sudo"
+    # sudo keeps the caller's CWD, but the caller often runs from their own
+    # home/project tree (mode 700) which $OWNER cannot enter — every CWD-relative
+    # `find`/`git` then fails ("Failed to change directory ... Permission
+    # denied"). Re-exec from a neutral, world-traversable directory; all work
+    # uses absolute paths under the cache root regardless.
+    cd / || true
     exec sudo -n -u "$OWNER" "$INSTALLED_SELF" "$@"
   fi
 }
@@ -551,9 +557,11 @@ cmd_install() {
   exec 9>"$LAKES/.$SLUG.lock"
   flock -n 9 || die "another install of $SLUG is in progress"
 
-  # Clear stale build dirs from a previously-interrupted install of this version
-  # (safe under the lock — only this slug's build dirs are touched).
+  # Clear stale build dirs and half-published trees from a previously-interrupted
+  # install of this version (safe under the lock — only this slug's scratch dirs
+  # are touched; the live $pkgs is never matched by these globs).
   rm -rf "$LAKES"/.build."$SLUG".* 2>/dev/null || true
+  rm -rf "$dest"/.packages.incoming.* "$dest"/.packages.old.* 2>/dev/null || true
 
   # `elan toolchain install` errors (nonzero) if the toolchain already exists,
   # which would abort under `set -e`; only install when it's actually missing.

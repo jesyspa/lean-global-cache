@@ -222,6 +222,12 @@ case "$1 $2" in
     grep -vxF "$tc" "$state" > "$state.new"    # grep exits 1 when this empties the file; that's fine
     mv "$state.new" "$state"
     exit 0 ;;
+  "default "*)                                 # elan default <toolchain>
+    tc="$2"
+    # Real elan would DOWNLOAD an uninstalled toolchain here; the stub refuses,
+    # matching the cache invariant cmd_set_default guards before ever calling us.
+    grep -qxF "$tc" "$state" 2>/dev/null || { echo "elan-stub: toolchain not installed: $tc" >&2; exit 1; }
+    exit 0 ;;
   *) echo "elan-stub: unsupported: $*" >&2; exit 1 ;;
 esac
 EL
@@ -264,6 +270,24 @@ check "uninstall skips the elan default toolchain" "yes" \
 check "uninstall still removes the lake cache for the default" "no" "$(has_dir "$TMP/cache/lakes/$DSLUG")"
 check "uninstall notes the default-toolchain skip" "yes" \
   "$(printf '%s' "$out" | grep -qi 'default' && echo yes || echo no)"
+
+echo "== set-default-toolchain (hermetic) =="
+# Sets the shared elan default, but only for an already-installed toolchain —
+# defaulting to an uncached one would download it into the shared tree behind
+# `install`'s back. Reuses the elan stub (its `default` arm refuses uninstalled).
+STC="leanprover/lean4:v4.79.0"
+# (a) installed -> succeeds and confirms the new default.
+printf '%s\n' "$STC" > "$ELAN_STATE"
+rc=0; out="$(PATH="$ELANSTUB:$PATH" ELAN_STATE_FILE="$ELAN_STATE" "$CLI" set-default-toolchain 4.79.0 2>&1)" || rc=$?
+check "set-default of installed ver exits 0"   "0" "$rc"
+check "set-default confirms the new default"   "yes" \
+  "$(printf '%s' "$out" | grep -qi 'default toolchain set to' && echo yes || echo no)"
+# (b) not installed -> hard-fails, tells the user to install first, calls no elan.
+printf '%s\n' "$STC" > "$ELAN_STATE"    # 4.80.0 absent from state
+rc=0; out="$(PATH="$ELANSTUB:$PATH" ELAN_STATE_FILE="$ELAN_STATE" "$CLI" set-default-toolchain 4.80.0 2>&1)" || rc=$?
+check "set-default of uninstalled ver fails"   "1" "$rc"
+check "set-default names the install remedy"   "yes" \
+  "$(printf '%s' "$out" | grep -qi 'not installed' && echo yes || echo no)"
 
 echo "== build seeding & push gate (hermetic) =="
 # No real Lean here: a stub `lake` stands in for the build so publish/seed and

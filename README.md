@@ -21,6 +21,7 @@ deterministic umask and permission pass every time.
 ```
 lean-cache install <version>     # build & install a mathlib version
 lean-cache uninstall <version>   # remove a version's lake cache and elan toolchain
+lean-cache set-default-toolchain <version>  # default for bare lean/lake outside a project
 lean-cache link <version>        # print the packages path to symlink against
 lean-cache use [version] [path]  # set up .lake/packages in a project
 lean-cache refresh [path]        # re-overlay only if the toolchain changed
@@ -38,10 +39,10 @@ lean-cache config                # show resolved owner/group/root/builds/bin
 an RC like `4.30.0-rc2`. Bare `major.minor` expands to `major.minor.0`;
 otherwise the version is exact (no "latest patch" resolution).
 
-`install` and `uninstall` re-exec themselves as the cache owner via sudo on a
-multi-user host, so they work from any group member while always producing
-owner-owned files. On a single-user host the current user IS the owner, so no
-sudo is needed. `link`, `use`, `refresh`, `list`, `config`, and `resolve` only
+`install`, `uninstall`, and `set-default-toolchain` re-exec themselves as the
+cache owner via sudo on a multi-user host, so they work from any group member
+while always producing owner-owned files. On a single-user host the current user
+IS the owner, so no sudo is needed. `link`, `use`, `refresh`, `list`, `config`, and `resolve` only
 read the shared cache (writing at most into the consuming project) and need no
 privilege.
 

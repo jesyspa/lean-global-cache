@@ -99,6 +99,10 @@ Usage: $PROG <command> [args]
                         Build & install a mathlib version into the shared cache.
                         --force rebuilds a version already present.
   uninstall <version>   Remove a version from the shared cache.
+  set-default-toolchain <version>
+                        Set the shared elan's default toolchain — what bare
+                        lean/lake use outside a project (inside one, the
+                        project's lean-toolchain wins). Must already be installed.
   link <version>        Print the packages path to symlink a project's
                         .lake/packages at.
   use [version] [path]  Symlink .lake/packages of the project at <path> (default
@@ -782,7 +786,7 @@ cmd_uninstall() {
   # default toolchain breaks elan for every other toolchain too.
   local tc_list; tc_list="$(elan toolchain list 2>/dev/null || true)"
   if printf '%s\n' "$tc_list" | grep -qxF "$TOOLCHAIN (default)"; then
-    log "toolchain $TOOLCHAIN is elan's default — skipping removal (uninstalling it would break elan); switch the default toolchain first if you really want it gone"
+    log "toolchain $TOOLCHAIN is elan's default — skipping removal (uninstalling it would break elan); switch it first with '$PROG set-default-toolchain <other>' if you really want it gone"
   elif printf '%s\n' "$tc_list" | grep -qxF "$TOOLCHAIN"; then
     log "removing toolchain $TOOLCHAIN"
     elan toolchain uninstall "$TOOLCHAIN"
@@ -797,6 +801,28 @@ cmd_uninstall() {
   else
     log "$TCVER: nothing to do"
   fi
+}
+
+# Set the shared elan's default toolchain, i.e. what bare `lean`/`lake`/`elan`
+# resolve to *outside* a project (inside one, the project's lean-toolchain always
+# wins). Writes settings.toml in the owner-only ELAN_HOME, so it re-execs as
+# OWNER. The version must already be installed: `elan default` would otherwise
+# download an uncached toolchain into the shared tree, bypassing `install`'s lake
+# build and leaving a toolchain with no matching cache — exactly the pollution
+# the single-writer model exists to prevent.
+cmd_set_default() {
+  [[ $# -eq 1 ]] || usage
+  normalize_version "$1"
+  require_owner set-default-toolchain "$1"
+
+  # elan suffixes the current default with " (default)", so strip it before the
+  # exact match (mirrors cmd_install), else an already-default toolchain reads as
+  # missing.
+  if ! elan toolchain list 2>/dev/null | sed 's/ (default)$//' | grep -qxF "$TOOLCHAIN"; then
+    die "$TCVER is not installed; run: $PROG install $TCVER"
+  fi
+  elan default "$TOOLCHAIN"
+  log "default toolchain set to $TOOLCHAIN (bare lean/lake outside a project now use it)"
 }
 
 # Build an overlay: .lake/packages is a real directory holding one symlink per
@@ -1418,6 +1444,7 @@ cmd="$1"; shift
 case "$cmd" in
   install)   cmd_install   "$@" ;;
   uninstall) cmd_uninstall "$@" ;;
+  set-default-toolchain) cmd_set_default "$@" ;;
   link)      cmd_link      "$@" ;;
   use)          cmd_use           "$@" && wire_elan ;;
   refresh)      cmd_refresh       "$@" ;;

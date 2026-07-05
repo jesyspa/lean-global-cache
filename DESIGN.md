@@ -148,6 +148,15 @@ compares by `realpath`, so a symlinked `~/.elan` reads as correctly wired and a
 genuine shadow is flagged. A single-user cache the caller owns (`ELAN_HOME ==
 ~/.elan`) needs no wiring and is skipped.
 
+Inside a project the `lean-toolchain` file selects the toolchain, so wiring is
+all a consumer needs. *Outside* any project, bare `lean`/`lake` fall back to
+elan's default toolchain, which a fresh shared `ELAN_HOME` does not set — so they
+error with "no default toolchain configured". `set-default-toolchain <version>`
+sets it (owner-only, re-execs as `OWNER`, and requires the version already
+installed so `elan default` cannot download an uncached toolchain into the shared
+tree behind `install`'s back). It is optional: the cache is fully usable for
+project work without a default.
+
 ### Keeping the overlay fresh across git operations
 
 The overlay is toolchain-specific: it points at `lakes/<slug>/packages`, and a

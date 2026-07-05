@@ -30,12 +30,19 @@ log "installing $BIN_DST"
 mkdir -p "$(dirname "$BIN_DST")"
 install -m 0755 "$REPO_DIR/bin/lean-cache" "$BIN_DST"
 
-# Install the transparent `lake` shim next to lean-cache. Placed ahead of the
+# The transparent `lake` shim (opt-in via INSTALL_LAKE_SHIM). Placed ahead of the
 # real lake on PATH, it makes bare `lake build` route through the shared build
-# policy while every other subcommand (and the LSP) passes straight through.
+# policy while every other subcommand (and the LSP) passes straight through. Off
+# by default; only remove a shim this tool installed (carries its marker), never
+# a real lake that happens to sit there.
 LAKE_SHIM_DST="$(dirname "$BIN_DST")/lake"
-log "installing $LAKE_SHIM_DST"
-install -m 0755 "$REPO_DIR/bin/lake-shim" "$LAKE_SHIM_DST"
+if [[ "$INSTALL_LAKE_SHIM" == 1 ]]; then
+  log "installing $LAKE_SHIM_DST"
+  install -m 0755 "$REPO_DIR/bin/lake-shim" "$LAKE_SHIM_DST"
+elif grep -q 'LEAN_CACHE_LAKE_SHIM' "$LAKE_SHIM_DST" 2>/dev/null; then
+  log "removing $LAKE_SHIM_DST (INSTALL_LAKE_SHIM off)"
+  rm -f "$LAKE_SHIM_DST"
+fi
 
 # --- 2. Ensure the cache root exists, OWNER-owned, not group-writable --------
 # (Ownership of any pre-existing tree is fixed once by admin/migrate-ownership.sh;

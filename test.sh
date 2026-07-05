@@ -63,6 +63,13 @@ check "LEAN_CACHE_OWNER override" \
 check "LEAN_CACHE_ROOT override" \
   "/tmp/x" \
   "$(cfg_field LEAN_CACHE_ROOT=/tmp/x root)"
+# The per-user config file (XDG) is read when LEAN_CACHE_CONF is unset.
+_xdg="$(mktemp -d)"; mkdir -p "$_xdg/lean-cache"
+echo 'ROOT=/tmp/from-xdg-conf' > "$_xdg/lean-cache/lean-cache.conf"
+check "XDG config file is read" \
+  "/tmp/from-xdg-conf" \
+  "$(env -u LEAN_CACHE_CONF -u LEAN_CACHE_ROOT XDG_CONFIG_HOME="$_xdg" "$CLI" config | awk '$1=="root:"{print $2}')"
+rm -rf "$_xdg"
 
 echo "== overlay staleness & hooks (hermetic) =="
 # Everything here runs against a throwaway cache and throwaway git repos, so it

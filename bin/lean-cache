@@ -22,13 +22,30 @@
 set -euo pipefail
 
 # --- Config resolution -------------------------------------------------------
-# Precedence: env var > /etc/lean-cache.conf (or LEAN_CACHE_CONF) > built-in default.
+# The single-user default needs no config file at all: the cache is owned by and
+# lives under the current user's home. A config file is only for a shared,
+# multi-user cache (one writer, many readers). LEAN_CACHE_CONF, if set, is used
+# exclusively (a non-existent path selects no config); otherwise read the first
+# of these that exists:
+#   ~/.config/lean-cache/lean-cache.conf         the owner's config (per-user)
+#   /etc/lean-cache/lean-cache.conf              system config (multi-user)
+#   /etc/lean-cache.conf                         legacy system config
 # This block is inlined (not sourced from lib/config.sh) so the CLI stays a
-# single self-contained file installable via `install bin/lean-cache`.
-
+# single self-contained file installable via `install bin/lean-cache`; keep the
+# two in sync.
+_conf=""
+if [[ -n "${LEAN_CACHE_CONF:-}" ]]; then
+  [[ -r "$LEAN_CACHE_CONF" ]] && _conf="$LEAN_CACHE_CONF"
+else
+  for _c in "${XDG_CONFIG_HOME:-$HOME/.config}/lean-cache/lean-cache.conf" \
+            /etc/lean-cache/lean-cache.conf /etc/lean-cache.conf; do
+    [[ -r "$_c" ]] && { _conf="$_c"; break; }
+  done
+fi
 # shellcheck source=/dev/null
-[[ -r "${LEAN_CACHE_CONF:-/etc/lean-cache.conf}" ]] \
-  && . "${LEAN_CACHE_CONF:-/etc/lean-cache.conf}"
+[[ -n "$_conf" ]] && . "$_conf"
+CONFIG_FILE="$_conf"          # the config file in effect, empty if none (check-env reports it)
+unset _c _conf
 
 OWNER="${LEAN_CACHE_OWNER:-${OWNER:-$(id -un)}}"
 GROUP="${LEAN_CACHE_GROUP:-${GROUP:-$(id -gn)}}"
@@ -39,6 +56,7 @@ BIN="${LEAN_CACHE_BIN:-${BIN:-$SELF}}"
 
 LAKES="$ROOT/lakes"
 export ELAN_HOME="$ROOT/elan"
+CALLER_PATH="$PATH"          # the caller's PATH, before we prepend the shared elan
 PATH="$ELAN_HOME/bin:$PATH"
 
 # Per-user store of warm PROJECT build artifacts (.lake/build), keyed by
@@ -134,6 +152,8 @@ Usage: $PROG <command> [args]
   resolve <version>     Print the normalized toolchain / rev / slug for a
                         version string (no side effects).
   config                Print the four resolved config values (owner/group/root/bin).
+  check-env             Check that this user's environment is wired to the cache
+                        (toolchain on PATH, cache readable, repos git-trusted).
 
 Version accepts: 4.30  4.30.0  v4.30.0  leanprover/lean4:v4.30.0  4.30.0-rc2
 EOF
@@ -488,6 +508,61 @@ cmd_resolve() {
   echo "rev:       $REV"
   echo "slug:      $SLUG"
   echo "packages:  $(packages_for "$SLUG")"
+}
+
+# Check that the calling user's environment is wired to the cache: the shared
+# toolchain is reachable for bare lean/lake and the editor's Lean server, the
+# cache is readable, and (for a consumer) its repos are git-trusted so Lake will
+# not try to re-clone them. Aimed at a multi-user cache; a single-user cache the
+# caller owns passes trivially. Exits non-zero on a hard problem; a warning
+# (wiring that only affects interactive/editor use) does not.
+cmd_check_env() {
+  [[ $# -eq 0 ]] || usage
+  local fails=0 warns=0 me; me="$(id -un)"
+  pass() { echo "  ok    $*"; }
+  warn() { echo "  warn  $*"; warns=$((warns + 1)); }
+  fail() { echo "  FAIL  $*"; fails=$((fails + 1)); }
+
+  echo "config      ${CONFIG_FILE:-<none — built-in defaults>}"
+  echo "cache root  $ROOT"
+  echo "owner       $OWNER   (you are $me)"
+
+  if [[ -d "$LAKES" && -r "$LAKES" ]]; then pass "cache readable"
+  elif [[ -e "$LAKES" ]]; then fail "cache $LAKES is not readable"
+  else warn "no cache yet at $LAKES (install a version to create it)"; fi
+
+  if [[ -x "$ELAN_HOME/bin/lean" ]]; then pass "shared elan present ($ELAN_HOME)"
+  else fail "no elan at $ELAN_HOME — the cache owner must bootstrap it"; fi
+
+  # We prepend the shared elan for our own commands, but bare lean/lake and the
+  # editor's Lean server inherit the caller's PATH, so check that.
+  local first_lean; first_lean="$(PATH="$CALLER_PATH" command -v lean 2>/dev/null || true)"
+  if [[ "$first_lean" == "$ELAN_HOME/bin/lean" ]]; then pass "bare lean/lake resolve to the shared elan"
+  elif [[ -z "$first_lean" ]]; then
+    warn "shared elan not on your PATH; add to your shell rc: export PATH=\"$ELAN_HOME/bin:\$PATH\""
+  else
+    warn "bare lean resolves to $first_lean, not the shared elan; put $ELAN_HOME/bin first on PATH"
+  fi
+
+  # Consumer git-trust: without it Lake mistakes the OWNER-owned dep repos for a
+  # changed URL and re-clones. `use` registers these; the OWNER needs nothing.
+  if [[ "$me" != "$OWNER" ]]; then
+    local anyrepo; anyrepo="$(find "$LAKES" -maxdepth 4 -name .git -printf '%h\n' -quit 2>/dev/null || true)"
+    if [[ -z "$anyrepo" ]]; then :
+    elif git -C "$anyrepo" rev-parse --git-dir >/dev/null 2>&1; then pass "cache repos are git-trusted (no re-clone)"
+    else warn "cache repos not git-trusted; run 'lean-cache use' in a project, or: git config --global --add safe.directory \"$LAKES/*\""; fi
+  fi
+
+  if grep -q 'LEAN_CACHE_LAKE_SHIM' "$(dirname "$BIN")/lake" 2>/dev/null; then
+    echo "lake shim   installed"
+  else
+    echo "lake shim   off (bare 'lake build' is unpoliced; use 'lean-cache build' for the slot policy)"
+  fi
+
+  echo
+  if [[ "$fails" -gt 0 ]]; then echo "$fails problem(s), $warns warning(s)"; return 1; fi
+  [[ "$warns" -gt 0 ]] && echo "$warns warning(s)" || echo "all wired up"
+  return 0
 }
 
 cmd_link() {
@@ -1328,6 +1403,7 @@ case "$cmd" in
   list)      cmd_list      "$@" ;;
   resolve)   cmd_resolve   "$@" ;;
   config)    cmd_config    "$@" ;;
+  check-env) cmd_check_env "$@" ;;
   -h|--help|help) usage 0 ;;
   *) die "unknown command: $cmd (try --help)" ;;
 esac

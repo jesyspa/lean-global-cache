@@ -1,20 +1,30 @@
-# lean-cache.conf — host configuration for the lean-global-cache CLI and scripts.
+# lean-cache.conf — configuration for the lean-global-cache CLI and scripts.
 #
 # This file is sourced as plain shell by bin/lean-cache, deploy.sh, and
-# admin/*.sh. It may set any subset of the four variables below.
+# admin/*.sh. It may set any subset of the variables below.
 #
-# Precedence (highest to lowest):
-#   1. Environment variables: LEAN_CACHE_OWNER, LEAN_CACHE_GROUP,
-#                             LEAN_CACHE_ROOT, LEAN_CACHE_BIN
-#   2. This file (or the file at $LEAN_CACHE_CONF if set)
-#   3. Built-in defaults (current user, ~/.local/share/lean-global-cache)
+# A single-user cache does NOT need this file: the built-in defaults own the
+# cache as the current user under their home, need no sudo, and install no lake
+# shim. This file is for a shared, multi-user cache (one writer, many readers).
 #
-# A single-user host does NOT need this file at all: the built-in defaults
-# target the current user and require no sudo or admin scripts. Copy this file
-# to /etc/lean-cache.conf only when configuring a shared (multi-user) host.
+# Location — the first that exists is read (LEAN_CACHE_CONF, if set, wins and is
+# used exclusively):
+#   ~/.config/lean-cache/lean-cache.conf   the owner's config (per-user)
+#   /etc/lean-cache/lean-cache.conf        system config (multi-user: readers
+#                                          find owner/root here)
+# Each setting also has an env override (LEAN_CACHE_OWNER/_GROUP/_ROOT/_BIN/
+# _INSTALL_LAKE_SHIM) that beats the file.
 #
-# Fleet values:
-OWNER=hostbot
+# Defaults: OWNER=current user, GROUP=current group,
+#           ROOT=~/.local/share/lean-global-cache, BIN=~/.local/bin/lean-cache,
+#           INSTALL_LAKE_SHIM=0.
+
+OWNER=hostbot                 # the single writer that owns the cache
 GROUP=bots
-ROOT=/opt/bots/lean
-BIN=/opt/bots/bin/lean-cache
+ROOT=/opt/bots/lean           # cache tree: lakes/, elan/
+BIN=/opt/bots/bin/lean-cache  # install path; the sudoers re-exec target
+
+# Install the transparent `lake` shim ahead of the real lake on PATH, so bare
+# `lake build` routes through the shared build-slot policy. Off by default; set
+# to 1 on a contended shared host.
+INSTALL_LAKE_SHIM=1

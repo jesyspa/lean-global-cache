@@ -77,7 +77,10 @@ usage() {
   cat >&2 <<EOF
 Usage: $PROG <command> [args]
 
-  install <version>     Build & install a mathlib version into the shared cache.
+  install [--force] <version>
+                        Build & install a mathlib version into the shared cache
+                        (incl. ProofWidgets' npm-built widget JS). --force
+                        rebuilds a version already present.
   uninstall <version>   Remove a version from the shared cache.
   link <version>        Print the packages path to symlink a project's
                         .lake/packages at.
@@ -433,6 +436,44 @@ ignore_filemode() { # arg: packages dir
   done
 }
 
+# Register the shared cache's package repos as git-"safe" for the calling user,
+# idempotently. The cache is OWNER-owned; when the caller is not OWNER, git
+# aborts any command run inside a cache repo with "detected dubious ownership",
+# and Lake misreads that failure as the dependency's git URL having changed — so
+# it deletes the (read-only, symlinked) package and tries to re-clone it. Scoped
+# to the exact cache package paths so git's ownership check stays active
+# everywhere else. A no-op for OWNER (who owns the tree) and for already-present
+# entries.
+register_safe_dirs() { # arg: shared packages dir being overlaid
+  local shared="$1" repo have
+  [[ "$(id -un)" == "$OWNER" ]] && return 0
+  command -v git >/dev/null 2>&1 || return 0
+  have="$(git config --global --get-all safe.directory 2>/dev/null || true)"
+  for repo in "$shared"/*/; do
+    repo="${repo%/}"
+    [[ -e "$repo/.git" ]] || continue
+    grep -qxF "$repo" <<<"$have" && continue
+    git config --global --add safe.directory "$repo" 2>/dev/null || true
+  done
+}
+
+# When the cache uses a shared ELAN_HOME (a fleet/standalone host) rather than
+# the caller's own ~/.elan, bare `lean`/`lake` and an editor's Lean server
+# resolve via the caller's PATH, NOT through `lean-cache`, so they miss the
+# shared toolchain — and a stale personal elan on PATH can shadow it entirely.
+# Print the one-time shell wiring. Skipped when the cache IS the caller's own
+# elan (nothing to wire).
+print_elan_hint() {
+  [[ "$ELAN_HOME" == "$HOME/.elan" ]] && return 0
+  cat >&2 <<EOF
+==> To run lean/lake or your editor's Lean server (outside \`lean-cache\`) against
+    the shared toolchain, add to your shell rc (e.g. ~/.zshrc or ~/.profile):
+        export ELAN_HOME="$ELAN_HOME"
+        export PATH="\$ELAN_HOME/bin:\$PATH"
+    Place it after any line that adds \$HOME/.elan/bin so the shared elan wins.
+EOF
+}
+
 # --- Commands ----------------------------------------------------------------
 
 cmd_resolve() {
@@ -482,17 +523,28 @@ cmd_fix_filemode() {
 }
 
 cmd_install() {
+  local force=0 rest=()
+  for a in "$@"; do
+    case "$a" in
+      --force) force=1 ;;
+      *) rest+=("$a") ;;
+    esac
+  done
+  set -- ${rest[@]+"${rest[@]}"}
   [[ $# -eq 1 ]] || usage
   normalize_version "$1"
-  require_owner install "$1"
+  local force_arg=()
+  [[ "$force" -eq 1 ]] && force_arg=(--force)
+  require_owner install ${force_arg[@]+"${force_arg[@]}"} "$1"
 
   umask 022
   local dest pkgs; dest="$(dest_for "$SLUG")"; pkgs="$(packages_for "$SLUG")"
 
-  if [[ -d "$pkgs" ]]; then
-    log "$TCVER already installed at $pkgs (nothing to do)"
+  if [[ -d "$pkgs" && "$force" -eq 0 ]]; then
+    log "$TCVER already installed at $pkgs (nothing to do; pass --force to rebuild)"
     return 0
   fi
+  [[ "$force" -eq 1 && -d "$pkgs" ]] && log "$TCVER already installed; --force: rebuilding"
 
   # Serialize installs of the same version.
   mkdir -p "$LAKES"
@@ -552,6 +604,20 @@ EOF
   [[ -d "$build/.lake/packages" ]] \
     || die "lake produced no .lake/packages directory — aborting"
 
+  # Materialize ProofWidgets' TypeScript widgets now, as OWNER, so their build
+  # outputs (dist JS, package-lock.json, and the input-hash markers) live in the
+  # shared cache. ProofWidgets ships prebuilt JS, but Lake still runs `npm
+  # install` for the lockfile the first time a project builds it; without this,
+  # every consumer's first full `lake build` tries to write that under the
+  # read-only cache and dies with "permission denied". A no-op when the closure
+  # has no proofwidgets. Requires npm + network (present on the build host); a
+  # widget-build failure is fatal — a cache that would break every consumer
+  # build is worse than no cache.
+  if [[ -d "$build/.lake/packages/proofwidgets" ]]; then
+    log "building ProofWidgets widget JS (npm) into the cache (target: widgetJsAll)"
+    ( cd "$build" && lake build widgetJsAll )
+  fi
+
   log "publishing to $pkgs"
   mkdir -p "$dest"
   local incoming="$dest/.packages.incoming.$$"
@@ -559,7 +625,17 @@ EOF
   mv "$build/.lake/packages" "$incoming"
   normalize_perms "$incoming"
   ignore_filemode "$incoming"
-  mv "$incoming" "$pkgs"          # atomic swap into place
+  # A --force rebuild finds $pkgs already populated; swap the new tree in and
+  # drop the old one so the replace stays atomic from a concurrent reader's view.
+  if [[ -d "$pkgs" ]]; then
+    local old="$dest/.packages.old.$$"
+    rm -rf "$old"
+    mv "$pkgs" "$old"
+    mv "$incoming" "$pkgs"
+    rm -rf "$old"
+  else
+    mv "$incoming" "$pkgs"          # atomic swap into place
+  fi
 
   rm -rf "$build"; trap - EXIT
   normalize_perms "$dest"
@@ -690,6 +766,9 @@ cmd_use() {
   done
 
   log "overlaid $linked shared package(s) into $pkgdir (-> $shared)"
+  # Trust the OWNER-owned cache repos so the calling user's git (and Lake) can
+  # read them without a "dubious ownership" abort that triggers a re-clone.
+  register_safe_dirs "$shared"
   install_hooks "$proj"
   # Seed a warm project build if one is stored for this exact (commit, slug).
   # A no-op when none is stored.
@@ -1225,7 +1304,7 @@ case "$cmd" in
   install)   cmd_install   "$@" ;;
   uninstall) cmd_uninstall "$@" ;;
   link)      cmd_link      "$@" ;;
-  use)          cmd_use           "$@" ;;
+  use)          cmd_use           "$@" && print_elan_hint ;;
   refresh)      cmd_refresh       "$@" ;;
   seed-build)   cmd_seed_build    "$@" ;;
   clean)        cmd_clean         "$@" ;;

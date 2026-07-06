@@ -465,25 +465,22 @@ ignore_filemode() { # arg: packages dir
   done
 }
 
-# Register the shared cache's package repos as git-"safe" for the calling user,
-# idempotently. The cache is OWNER-owned; when the caller is not OWNER, git
-# aborts any command run inside a cache repo with "detected dubious ownership",
-# and Lake misreads that failure as the dependency's git URL having changed — so
-# it deletes the (read-only, symlinked) package and tries to re-clone it. Scoped
-# to the exact cache package paths so git's ownership check stays active
-# everywhere else. A no-op for OWNER (who owns the tree) and for already-present
-# entries.
-register_safe_dirs() { # arg: shared packages dir being overlaid
-  local shared="$1" repo have
+# Register the shared cache as git-"safe" for the calling user, idempotently.
+# The cache is OWNER-owned; when the caller is not OWNER, git aborts any command
+# run inside a cache repo with "detected dubious ownership", and Lake misreads
+# that failure as the dependency's git URL having changed — so it deletes the
+# (read-only, symlinked) package and tries to re-clone it. A single "$LAKES/*"
+# entry trusts every repo under the cache root recursively (git's documented
+# trailing-/* rule), so it covers packages of versions installed later too,
+# without re-registering. The check stays active everywhere outside the cache.
+# A no-op for OWNER (who owns the tree) and when the entry is already present.
+register_safe_dirs() {
+  local glob="$LAKES/*" have
   [[ "$(id -un)" == "$OWNER" ]] && return 0
   command -v git >/dev/null 2>&1 || return 0
   have="$(git config --global --get-all safe.directory 2>/dev/null || true)"
-  for repo in "$shared"/*/; do
-    repo="${repo%/}"
-    [[ -e "$repo/.git" ]] || continue
-    grep -qxF "$repo" <<<"$have" && continue
-    git config --global --add safe.directory "$repo" 2>/dev/null || true
-  done
+  grep -qxF "$glob" <<<"$have" && return 0
+  git config --global --add safe.directory "$glob" 2>/dev/null || true
 }
 
 # When the cache uses a shared ELAN_HOME (a fleet/standalone host) rather than
@@ -909,7 +906,7 @@ cmd_use() {
   log "overlaid $linked shared package(s) into $pkgdir (-> $shared)"
   # Trust the OWNER-owned cache repos so the calling user's git (and Lake) can
   # read them without a "dubious ownership" abort that triggers a re-clone.
-  register_safe_dirs "$shared"
+  register_safe_dirs
   install_hooks "$proj"
   # Seed a warm project build if one is stored for this exact (commit, slug).
   # A no-op when none is stored.

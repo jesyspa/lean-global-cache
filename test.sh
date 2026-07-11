@@ -1253,8 +1253,10 @@ check "orphan cache dir flagged"               "yes" \
   "$(grep -qi 'orphan cache dir .*v9-1-0' <<<"$out" && echo yes || echo no)"
 
 # Violation 7: install scratch older than a day -> warn; a fresh one is skipped
-# (it may be an in-flight install).
-mkdir -p "$VROOT/lakes/.build.v9-1-0.stale"
+# (it may be an in-flight install). chmod go-w: mkdir honors the ambient umask
+# (e.g. group-writable under umask 002), which would otherwise trip check 2
+# (permissions) and mask the scratch check this scenario targets.
+mkdir -p "$VROOT/lakes/.build.v9-1-0.stale"; chmod go-w "$VROOT/lakes/.build.v9-1-0.stale"
 touch -d '2 days ago' "$VROOT/lakes/.build.v9-1-0.stale"
 rc=0; out="$(run_verify 2>&1)" || rc=$?
 check "stale install scratch -> exit 0 (warn only)" "0" "$rc"
@@ -1262,7 +1264,7 @@ check "stale install scratch flagged"               "yes" \
   "$(grep -qi 'stale install scratch' <<<"$out" && echo yes || echo no)"
 rm -rf "$VROOT/lakes/.build.v9-1-0.stale"
 
-mkdir -p "$VROOT/lakes/.build.v9-1-0.fresh"
+mkdir -p "$VROOT/lakes/.build.v9-1-0.fresh"; chmod go-w "$VROOT/lakes/.build.v9-1-0.fresh"
 rc=0; out="$(run_verify 2>&1)" || rc=$?
 check "fresh install scratch not flagged"    "0" "$rc"
 check "fresh install scratch not flagged (2)" "no" \

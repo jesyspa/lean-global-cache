@@ -1011,6 +1011,81 @@ check "rotation drops non-latest past window"    "no"  "$(exists "$RB/oldcommit/
 check "rotation keeps lone latest even if old"   "yes" "$(exists "$RB/loneold/v8-8-8")"
 check "rotation removes emptied commit dir"      "no"  "$(exists "$RB/oldcommit")"
 
+echo "== event log & stats (hermetic) =="
+# Redirect the event log to a throwaway dir and drive a use/seed/publish/gate
+# flow (stub lake), asserting each event lands with the right fields. Then check
+# that an unusable log dir never breaks a command, and that `stats` summarizes a
+# synthetic log deterministically.
+export LEAN_CACHE_LOG_DIR="$TMP/eventlog"
+export LEAN_CACHE_NO_PUBLISH_ON_PUSH=1     # keep the gate's own event isolated
+evlog="$LEAN_CACHE_LOG_DIR/events.$(id -un).log"
+# Value of <key> from the LAST line of event <ev> (empty if none).
+ev_field() { awk -F'\t' -v ev="$2" -v key="$3" \
+  '$3==ev{for(i=4;i<=NF;i++){p=index($i,"=");if(substr($i,1,p-1)==key)val=substr($i,p+1)}} END{print val}' "$1"; }
+
+EV="$TMP/evproj"; mkdir -p "$EV/Proj"; gitc "$EV" init -q
+pin v4.30.0 "$EV"; printf 'name="e"\n' > "$EV/lakefile.toml"
+printf '.lake/\n' > "$EV/.gitignore"
+printf 'def a := 1\n' > "$EV/Proj/A.lean"
+gitc "$EV" add -A; gitc "$EV" commit -qm init
+evcommit="$(gitc "$EV" rev-parse HEAD)"
+
+# use: logs a use event (auto_install=0; v4-30-0 exists in the throwaway cache)
+# and, via its trailing seed-build, a seed MISS (nothing stored for this commit).
+"$CLI" use "$EV" >/dev/null 2>&1
+check "use created this user's log file"       "yes" "$([[ -f "$evlog" ]] && echo yes || echo no)"
+check "use event records the slug"             "v4-30-0" "$(ev_field "$evlog" use slug)"
+check "use event auto_install=0"               "0" "$(ev_field "$evlog" use auto_install)"
+check "seed miss logged on first use"          "0" "$(ev_field "$evlog" seed hit)"
+
+# publish: build (stub) to completion and store, logging a publish event.
+mkdir -p "$EV/.lake/build/lib/lean/Proj"
+printf 'OLEAN-A' > "$EV/.lake/build/lib/lean/Proj/A.olean"
+PATH="$STUB:$PATH" "$CLI" publish-build "$EV" >/dev/null 2>&1
+check "publish event green=1"                  "1" "$(ev_field "$evlog" publish green)"
+check "publish event records the short commit" "${evcommit:0:12}" "$(ev_field "$evlog" publish commit)"
+
+# seed: now a build is stored for this exact commit, so seeding HITS.
+"$CLI" seed-build "$EV" >/dev/null 2>&1
+check "seed hit logged after a matching publish" "1" "$(ev_field "$evlog" seed hit)"
+
+# gate: a green build is stored for HEAD, so the push gate SKIPs and logs it.
+git init -q --bare -b main "$TMP/evremote.git"
+gitc "$EV" remote add origin "$TMP/evremote.git"
+PATH="$STUB:$PATH" gitc "$EV" push -q origin HEAD:main >/dev/null 2>&1 || true
+check "gate skip logged (stored green build)"  "skip" "$(ev_field "$evlog" gate outcome)"
+check "gate skip records secs=0"               "0" "$(ev_field "$evlog" gate secs)"
+
+# gate build: a new commit with no stored build, gate skip forced off -> ok.
+printf 'def b := 2\n' > "$EV/Proj/B.lean"; gitc "$EV" add -A; gitc "$EV" commit -qm addb
+PATH="$STUB:$PATH" LEAN_CACHE_NO_GATE_SKIP=1 gitc "$EV" push -q origin HEAD:main >/dev/null 2>&1 || true
+check "gate ok logged on a built push"         "ok" "$(ev_field "$evlog" gate outcome)"
+
+# An unusable log dir must never break a command. Point LOG_DIR below a regular
+# file: mkdir -p fails (ENOTDIR) even for root, so log_event silently no-ops.
+printf 'x' > "$TMP/notadir"
+evrc=0; LEAN_CACHE_LOG_DIR="$TMP/notadir/sub" "$CLI" use "$EV" >/dev/null 2>&1 || evrc=$?
+check "command survives an unusable log dir"   "0" "$evrc"
+check "nothing written under the bogus path"   "no" "$([[ -e "$TMP/notadir/sub" ]] && echo yes || echo no)"
+
+# stats: summarize a synthetic multi-field log; an out-of-window event is dropped.
+SL="$TMP/statslog"; mkdir -p "$SL"; snow="$(date +%s)"
+{
+  printf '%s\tu1\tseed\thit=1\trepo=r\tcommit=c\tslug=s\n'          "$snow"
+  printf '%s\tu1\tseed\thit=0\trepo=r\tcommit=c\tslug=s\n'          "$snow"
+  printf '%s\tu1\tinstall\tslug=s\tsecs=100\tok=1\tforced=0\n'      "$snow"
+  printf '%s\tu1\tinstall\tslug=s\tsecs=300\tok=0\tforced=0\n'      "$snow"
+  printf '%s\tu1\tgate\toutcome=ok\trepo=r\tcommit=c\tsecs=50\n'    "$snow"
+  printf '%s\tu1\tgate\toutcome=skip\trepo=r\tcommit=c\tsecs=0\n'   "$snow"
+  printf '%s\tu1\tinstall\tslug=s\tsecs=999\tok=1\tforced=0\n' "$(( snow - 30*86400 ))"  # out of window
+} > "$SL/events.u1.log"
+sout="$(LEAN_CACHE_LOG_DIR="$SL" "$CLI" stats --since 7 2>/dev/null)"
+seen() { grep -qE "$2" <<<"$1" && echo yes || echo no; }
+check "stats: seed hit rate"       "yes" "$(seen "$sout" 'seed +2 applicable, 1 hit, 1 miss \(50% hit rate\)')"
+check "stats: install durations exclude out-of-window" "yes" \
+  "$(seen "$sout" 'install +2 run: 1 ok, 1 fail.*median 200, max 300')"
+check "stats: gate outcomes"       "yes" "$(seen "$sout" 'gate +2 engaged: 1 ok, 1 skip, 0 fail')"
+
 echo
 if [[ "$fail" -eq 0 ]]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; fi
 exit "$fail"

@@ -13,7 +13,7 @@
 #   /etc/lean-cache/lean-cache.conf        system config (multi-user: readers
 #                                          find owner/root here)
 # Each setting also has an env override (LEAN_CACHE_OWNER/_GROUP/_ROOT/_BIN/
-# _INSTALL_LAKE_SHIM) that beats the file.
+# _INSTALL_LAKE_SHIM/_LOG_DIR) that beats the file.
 #
 # Defaults: OWNER=current user, GROUP=current group,
 #           ROOT=~/.local/share/lean-global-cache, BIN=~/.local/bin/lean-cache,
@@ -28,3 +28,8 @@ BIN=/opt/bots/bin/lean-cache  # install path; the sudoers re-exec target
 # `lake build` routes through the shared build-slot policy. Off by default; set
 # to 1 on a contended shared host.
 INSTALL_LAKE_SHIM=1
+
+# Append-only event log (telemetry; `lean-cache stats` reads it). Defaults to
+# $ROOT/log; deploy.sh provisions it setgid+sticky so each group member writes
+# only its own events.<user>.log. Uncomment to relocate.
+# LOG_DIR=/opt/bots/lean/log

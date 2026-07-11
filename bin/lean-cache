@@ -187,6 +187,9 @@ Usage: $PROG <command> [args]
   config                Print the four resolved config values (owner/group/root/bin).
   check-env             Check that this user's environment is wired to the cache
                         (toolchain on PATH, cache readable, repos git-trusted).
+  stats [--since DAYS]  Summarize the event log over the last DAYS (default 7):
+                        per-event counts, seed hit rate, gate outcomes, build
+                        durations, slot waits. Read-only, no privilege.
 
 Version accepts: 4.30  4.30.0  v4.30.0  leanprover/lean4:v4.30.0  4.30.0-rc2
 EOF
@@ -1553,6 +1556,115 @@ cmd_config() {
     "$OWNER" "$GROUP" "$ROOT" "$BIN" "$BUILDS"
 }
 
+# Summarize the event log: read every readable events.*.log, keep events within
+# the --since window, and print a compact per-event summary (counts, seed hit
+# rate, gate outcomes, install/publish build durations, slot waits), split by
+# user when more than one wrote. Read-only, no privilege — any user can run it.
+cmd_stats() {
+  local since=7
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --since)   since="${2:-}"; shift 2 ;;
+      --since=*) since="${1#*=}"; shift ;;
+      *) usage ;;
+    esac
+  done
+  [[ "$since" =~ ^[0-9]+$ ]] || die "--since must be a non-negative integer"
+
+  [[ -d "$LOG_DIR" ]] || { echo "no event log at $LOG_DIR (nothing logged yet)"; return 0; }
+  local now cutoff; now="$(date +%s)"; cutoff=$(( now - since * 86400 ))
+
+  local files=() f
+  for f in "$LOG_DIR"/events.*.log; do
+    [[ -f "$f" && -r "$f" ]] && files+=("$f")
+  done
+  [[ "${#files[@]}" -gt 0 ]] || { echo "no readable event logs in $LOG_DIR"; return 0; }
+
+  echo "lean-cache stats — last $since day(s), since $(date -d "@$cutoff" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "@$cutoff")"
+  echo "logs: $LOG_DIR (${#files[@]} user file(s))"
+  echo
+
+  # One awk pass builds the whole report. median() is a self-contained insertion
+  # sort (no gawk asort), fine for the small counts here. Fields are
+  # tab-separated: $1 epoch, $2 user, $3 event, $4.. key=value.
+  awk -F'\t' -v cutoff="$cutoff" '
+    function median(a, n,   i, j, key) {
+      for (i = 2; i <= n; i++) { key = a[i]; j = i - 1
+        while (j >= 1 && a[j] > key) { a[j+1] = a[j]; j-- }
+        a[j+1] = key }
+      if (n == 0) return 0
+      if (n % 2) return a[int((n+1)/2)]
+      return int((a[n/2] + a[n/2+1]) / 2)
+    }
+    $1 !~ /^[0-9]+$/ { next }        # skip blank/garbled lines
+    $1 < cutoff { next }             # outside the window
+    {
+      ev = $3; total[ev]++; nuser[$2] = 1; ue[$2 SUBSEP ev]++
+      delete kv
+      for (i = 4; i <= NF; i++) { p = index($i, "=")
+        if (p) kv[substr($i, 1, p-1)] = substr($i, p+1) }
+      if (ev == "seed")       { seed_t++; if (kv["hit"] == "1") seed_h++ }
+      else if (ev == "gate")  { gate_t++; go[kv["outcome"]]++ }
+      else if (ev == "use")   { use_t++;  if (kv["auto_install"] == "1") use_ai++ }
+      else if (ev == "bail")  { bail_t++; bw[kv["where"]]++ }
+      else if (ev == "install") {
+        inst_t++; if (kv["ok"] == "1") inst_ok++; else inst_fail++
+        if (kv["secs"] ~ /^[0-9]+$/) { v = kv["secs"]+0; inst_s[++inst_n] = v; if (v > inst_max) inst_max = v }
+      }
+      else if (ev == "publish") {
+        pub_t++; if (kv["green"] == "1") pub_g++
+        if (kv["secs"] ~ /^[0-9]+$/) { v = kv["secs"]+0; pub_s[++pub_n] = v; if (v > pub_max) pub_max = v }
+      }
+      else if (ev == "slot") {
+        slot_t++; if (kv["outcome"] == "unserialized") slot_u++
+        if (kv["wait"] ~ /^[0-9]+$/) { v = kv["wait"]+0; slot_w[++slot_n] = v; if (v > slot_max) slot_max = v }
+      }
+    }
+    END {
+      split("install use seed publish gate slot bail", order, " ")
+      nev = 0; for (e in total) nev += total[e]
+      if (nev == 0) { print "(no events in the window)"; exit }
+
+      print "events"
+      for (k = 1; k <= 7; k++) { e = order[k]; if (total[e]) printf "  %-9s %d\n", e, total[e] }
+      print ""
+
+      if (use_t)  printf "use      %d overlaid, %d triggered an auto-install\n", use_t, use_ai+0
+      if (seed_t) printf "seed     %d applicable, %d hit, %d miss (%d%% hit rate)\n", \
+                          seed_t, seed_h+0, seed_t-(seed_h+0), (seed_h+0)*100/seed_t
+      if (gate_t) printf "gate     %d engaged: %d ok, %d skip, %d fail\n", \
+                          gate_t, go["ok"]+0, go["skip"]+0, go["fail"]+0
+      if (inst_t) {
+        printf "install  %d run: %d ok, %d fail", inst_t, inst_ok+0, inst_fail+0
+        if (inst_n) printf "  (build secs: median %d, max %d)", median(inst_s, inst_n), inst_max+0
+        print ""
+      }
+      if (pub_t) {
+        printf "publish  %d run: %d green", pub_t, pub_g+0
+        if (pub_n) printf "  (build secs: median %d, max %d)", median(pub_s, pub_n), pub_max+0
+        print ""
+      }
+      if (slot_t) printf "slot     %d waited/degraded: median %ds, max %ds, %d unserialized\n", \
+                          slot_t, (slot_n ? median(slot_w, slot_n) : 0), slot_max+0, slot_u+0
+      if (bail_t) {
+        printf "bail     %d:", bail_t
+        for (w in bw) printf " %s=%d", w, bw[w]
+        print ""
+      }
+
+      un = 0; for (u in nuser) un++
+      if (un > 1) {
+        print ""; print "by user"
+        for (u in nuser) {
+          line = ""
+          for (k = 1; k <= 7; k++) { e = order[k]; c = ue[u SUBSEP e]; if (c) line = line sprintf("  %s %d", e, c) }
+          printf "  %-10s%s\n", u, line
+        }
+      }
+    }
+  ' "${files[@]}"
+}
+
 # --- Dispatch ----------------------------------------------------------------
 
 [[ $# -ge 1 ]] || usage
@@ -1576,6 +1688,7 @@ case "$cmd" in
   resolve)   cmd_resolve   "$@" ;;
   config)    cmd_config    "$@" ;;
   check-env) cmd_check_env "$@" ;;
+  stats)     cmd_stats     "$@" ;;
   -h|--help|help) usage 0 ;;
   *) die "unknown command: $cmd (try --help)" ;;
 esac

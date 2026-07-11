@@ -33,6 +33,7 @@ lean-cache prune-builds [--keep-days N]  # rotate the warm-build store
 lean-cache list                  # installed versions + sizes
 lean-cache resolve <version>     # show normalized toolchain/rev/slug
 lean-cache config                # show resolved owner/group/root/builds/bin
+lean-cache stats [--since DAYS]  # summarize the event log (default 7 days)
 ```
 
 `<version>` accepts `4.30`, `4.30.0`, `v4.30.0`, `leanprover/lean4:v4.30.0`, or
@@ -180,6 +181,33 @@ one-line reminder that `lean-cache publish-build` is available (silence with
 `LEAN_CACHE_NO_COMMIT_HINT=1`); it's just a nudge, since a clean push publishes
 automatically.
 
+## Monitoring
+
+The CLI keeps an append-only event log so the warm-build machinery (seeding,
+the gate skip, build slots) can be measured rather than trusted on faith. Each
+mutating or build-policy path appends one tab-separated line to
+`$LOG_DIR/events.<user>.log` (`LEAN_CACHE_LOG_DIR`, else the config `LOG_DIR`,
+else `<root>/log`): `install`, `use`, `seed` (hit/miss), `publish`, the push
+`gate` (skip/ok/fail), a foreground build `bail`, and build-`slot` waits.
+Logging is best-effort — a single guarded `>>` that silently no-ops if the log
+dir is unwritable — so it can never fail or slow a build, a hook, or a push.
+
+The dir is shared like the cache, but every user writes only its own file, so
+the single-writer model holds: one writer per file. `deploy.sh` provisions it
+setgid+sticky (mode `3775`, group `$GROUP`), so any group member can create its
+own file but not remove another's; on a single-user host it sits under your own
+`$ROOT` and just works.
+
+```bash
+lean-cache stats            # summary over the last 7 days
+lean-cache stats --since 30 # …over the last 30 days
+```
+
+`stats` reads every readable `events.*.log` and prints per-event counts, the
+seed hit rate, gate outcomes, install/publish build durations (median/max),
+and slot waits — split by user when more than one wrote. It is read-only and
+needs no privilege.
+
 ## Layout it manages
 
 ```
@@ -203,6 +231,7 @@ These settings control the host layout:
 | ROOT              | LEAN_CACHE_ROOT              | `$HOME/.local/share/lean-global-cache`             |
 | BIN               | LEAN_CACHE_BIN               | realpath of the running `lean-cache` script itself |
 | INSTALL_LAKE_SHIM | LEAN_CACHE_INSTALL_LAKE_SHIM | `0` (no `lake` shim)                               |
+| LOG_DIR           | LEAN_CACHE_LOG_DIR           | `$ROOT/log` (event log, see [Monitoring](#monitoring)) |
 
 **Precedence:** env var > config file > built-in default.
 

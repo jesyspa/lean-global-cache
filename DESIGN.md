@@ -524,6 +524,66 @@ intermediate/WIP states, so it would store partial or non-compiling builds (whic
 `seed-build` would then have to reject) and rebuild repeatedly for commits no one
 seeds from. Publishing off the push's completed, gated build avoids both.
 
+## Event log
+
+The warm-build machinery makes strong performance claims — seeding replays a
+build in seconds, the gate skips an already-green rebuild, slots keep cold
+builds from thrashing the host — with no way to see whether any of it fires in
+practice. An append-only event log closes that gap: `stats` turns it into a
+seed hit rate, a gate skip/build/fail split, build durations, and slot-wait
+counts.
+
+### What is logged
+
+Each event is one tab-separated line —
+`epoch<TAB>user<TAB>event<TAB>key=value<TAB>…` — appended to the acting user's
+file. The whole set:
+
+- `install` — `slug secs ok forced`. Emitted from an EXIT trap, so a failed
+  install (any `die` on the path) still records `ok=0`.
+- `use` — `slug auto_install`. `auto_install=1` marks a `use` that provisioned
+  the version on first touch.
+- `seed` — `hit repo commit slug`. `hit=1` when a stored build matched the
+  worktree's exact (commit, slug) and was seeded; `hit=0` when seeding was
+  applicable (valid commit+toolchain) but the store held no match. The two
+  together are the seed hit rate.
+- `publish` — `repo commit slug green secs`.
+- `gate` — `outcome=skip|ok|fail`, `repo commit secs` (`secs=0` for a skip).
+  Logged only when the gate actually engaged (the push changed `*.lean` at the
+  checked-out HEAD).
+- `bail` — `where=build|use`, the foreground exit-75 paths that decline to start
+  a multi-minute build inside a bounded foreground call.
+- `slot` — `wait outcome=acquired|unserialized`, logged only when a cold build
+  actually waited for a slot or degraded to unserialized; the instant-acquire
+  common case logs nothing.
+
+Attribution follows who acts. `install` re-execs as OWNER, so its event lands in
+OWNER's file — correct, OWNER did the build. `use`'s auto-install *trigger* is
+logged as the calling user (its own file), while the install it spawns logs
+separately as OWNER: the two events attribute the two distinct actors.
+
+### One writer per file
+
+The log dir is shared like the cache, but the file name embeds the writer
+(`events.<user>.log`), so every file has exactly one writer. This preserves the
+single-writer model that governs the rest of the tree — no file is ever written
+by two users — without a lock: concurrent writers touch disjoint files.
+`deploy.sh` provisions the dir mode `3775` (setgid so files inherit `$GROUP`,
+sticky so a group member cannot remove another's file), the first real consumer
+of the `GROUP` setting. On a single-user host the dir sits under the user's own
+`$ROOT` and the modes are moot. `stats` only reads, and reads every file it can,
+so it needs no privilege and no coordination.
+
+### Never break work
+
+Logging is telemetry, not function: it must never fail or slow a build, a hook,
+or a push. `log_event` builds the whole line first, then writes it with a single
+`>>`; every step is guarded and the helper always returns 0, so a missing or
+unwritable log dir, a full disk, or a `date`/`id` that somehow fails just drops
+the event silently. Nothing downstream branches on a log write, and no caller
+checks its result — the event log can degrade to writing nothing and every other
+guarantee in this document still holds.
+
 ## Version normalization
 
 A version string is reduced to four canonical forms:
@@ -546,7 +606,10 @@ Standard hostbot deploy-handler repo. `deploy.sh` (as `OWNER`):
 1. installs `bin/lean-cache` to `BIN`,
 2. installs the transparent `lake` shim (`bin/lake-shim`) as `$(dirname BIN)/lake`,
 3. ensures `ROOT/{lakes,elan}` exist `2755`,
-4. reconciles the `versions` manifest — each listed version is `install`ed
+4. ensures the event-log dir (`LOG_DIR`, default `ROOT/log`) exists `3775`
+   (setgid+sticky, group `GROUP`), so any group member writes its own
+   `events.<user>.log` but cannot remove another's,
+5. reconciles the `versions` manifest — each listed version is `install`ed
    (idempotent). The manifest is a **floor**: ad-hoc installs are never
    auto-removed, and pruning is manual via `uninstall`.
 
@@ -554,9 +617,12 @@ Standard hostbot deploy-handler repo. `deploy.sh` (as `OWNER`):
 resolution unit tests, validation-rejects-junk tests, the overlay/hooks
 scenarios, the build-seeding + push-gate scenarios, the warm/cold build-policy
 scenarios (warm runs unslotted, cold serializes, foreground bails, background /
-force-wait / slot-held build to completion), and the `lake` shim scenarios
-(non-build passthrough, build delegation, no self-recursion) — all with a stub
-`lake`. It does not touch the real cache or the network.
+force-wait / slot-held build to completion), the `lake` shim scenarios
+(non-build passthrough, build delegation, no self-recursion), and the event-log
+scenarios (events written with the right fields across a use/seed/publish/gate
+flow, an unwritable log dir does not break the command, and `stats` summarizes a
+synthetic log) — all with a stub `lake`. It does not touch the real cache or the
+network.
 
 `publish-build` / `seed-build` are not part of `deploy.sh`: they are per-user,
 per-project operations a bot runs in its own worktrees, not a host-level deploy

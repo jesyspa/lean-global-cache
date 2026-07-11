@@ -89,7 +89,12 @@ best-effort — which is the intended outcome.
    dependency closure).
 6. Integrity check: abort unless mathlib oleans are actually present.
 7. Atomically move `.lake/packages` into `lakes/<slug>/packages`, then normalize
-   permissions.
+   permissions. A `--force` rebuild finds the destination already populated and
+   swaps the new tree in with `mv --exchange` (renameat2 `RENAME_EXCHANGE`,
+   coreutils ≥9.5) — a single atomic swap, so a concurrent consumer never sees
+   the destination missing or a dangling overlay through it — falling back to a
+   two-mv sequence (with a brief absent window) where `--exchange` is
+   unsupported.
 
 Idempotent: a version that already exists is a no-op.
 

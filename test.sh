@@ -71,6 +71,22 @@ check "XDG config file is read" \
   "$(env -u LEAN_CACHE_CONF -u LEAN_CACHE_ROOT XDG_CONFIG_HOME="$_xdg" "$CLI" config | awk '$1=="root:"{print $2}')"
 rm -rf "$_xdg"
 
+echo "== config block parity (bin/lean-cache vs lib/config.sh) =="
+# The config-resolution block at the top of bin/lean-cache is inlined from
+# lib/config.sh (the CLI stays a single self-contained file); nothing at runtime
+# keeps them in sync. Fail the moment they drift on the parts they genuinely
+# share: the config-file discovery block and the OWNER/GROUP/ROOT resolution
+# lines. They are NOT byte-identical by design — the CLI adds CONFIG_FILE
+# bookkeeping and a different BIN default — so compare only the shared regions.
+config_discovery() { # the _conf discovery block, from `_conf=""` to the source line
+  awk '/^_conf=""/{f=1} f{print} index($0, ". \"$_conf\""){if(f)exit}' "$1"
+}
+config_resolution() { grep -E '^(OWNER|GROUP|ROOT)=' "$1"; }
+check "config discovery block matches" \
+  "$(config_discovery "$CLI")" "$(config_discovery "$REPO_DIR/lib/config.sh")"
+check "OWNER/GROUP/ROOT resolution matches" \
+  "$(config_resolution "$CLI")" "$(config_resolution "$REPO_DIR/lib/config.sh")"
+
 echo "== overlay staleness & hooks (hermetic) =="
 # Everything here runs against a throwaway cache and throwaway git repos, so it
 # touches neither the real /opt/bots/lean tree nor the network. LEAN_CACHE_ROOT
@@ -356,7 +372,19 @@ check "slot-held install acquires no new slot"     "no" \
 kill $(ps -o pid= --ppid "$ilocker" 2>/dev/null) 2>/dev/null || true
 kill "$ilocker" 2>/dev/null || true; wait "$ilocker" 2>/dev/null || true
 
-# (c) `use`'s foreground auto-install bail (fix in cmd_use) and its overrides,
+# (c) A --force rebuild swaps the freshly built tree into an already-populated
+# $pkgs and leaves no scratch dirs behind — via mv --exchange (coreutils >=9.5)
+# or the two-mv fallback, whichever this host has. OLEAN_CONTENT marks the new
+# tree so the swap is observable; v4-55-0 exists from (a).
+: > "$TMP/i.log"
+PATH="$ISTUB:$PATH" LEAN_CACHE_BUILD_LOCK_DIR="$TMP" OLEAN_CONTENT=NEW \
+  LAKE_LOG="$TMP/i.log" "$CLI" install --force 4.55.0 >/dev/null 2>&1
+check "force rebuild replaced the packages tree"  "NEW" \
+  "$(cat "$TMP/cache/lakes/v4-55-0/packages/mathlib/.lake/build/lib/M.olean" 2>/dev/null)"
+check "force rebuild left no scratch dirs"        "0" \
+  "$(find "$TMP/cache/lakes/v4-55-0" -maxdepth 1 -name '.packages.*' 2>/dev/null | wc -l)"
+
+# (d) `use`'s foreground auto-install bail (fix in cmd_use) and its overrides,
 # exercised offline via the stubs: a plain foreground call bails (75) and
 # provisions nothing; force-wait overrides the bail and installs to completion.
 # HOME/BUILDS are redirected so wire_elan and seeding never touch the real home.

@@ -218,6 +218,18 @@ normalize_version() {
 dest_for()     { echo "$LAKES/$1"; }          # arg: slug
 packages_for() { echo "$LAKES/$1/packages"; } # arg: slug
 
+# True if this `mv` supports --exchange (renameat2 RENAME_EXCHANGE, coreutils
+# >=9.5), which atomically swaps two existing paths — used to replace a rebuilt
+# package tree with no window where the destination is missing. Memoized.
+MV_HAS_EXCHANGE=""
+mv_has_exchange() {
+  if [[ -z "$MV_HAS_EXCHANGE" ]]; then
+    if mv --help 2>/dev/null | grep -q -- '--exchange'; then MV_HAS_EXCHANGE=yes
+    else MV_HAS_EXCHANGE=no; fi
+  fi
+  [[ "$MV_HAS_EXCHANGE" == yes ]]
+}
+
 # Stable identity for the repo a worktree belongs to. All worktrees of one repo
 # share a common git dir, so its realpath identifies the repo on this host; we
 # slugify it as "<workdir-basename>-<short-hash>" so two repos that happen to
@@ -804,13 +816,23 @@ EOF
   normalize_perms "$incoming"
   ignore_filemode "$incoming"
   # A --force rebuild finds $pkgs already populated; swap the new tree in and
-  # drop the old one so the replace stays atomic from a concurrent reader's view.
+  # drop the old one. `mv --exchange` swaps the two trees in a single atomic
+  # renameat2, so a concurrent reader never sees $pkgs missing (nor a dangling
+  # overlay symlink through it). Where --exchange is unsupported, fall back to
+  # the two-mv sequence, which has a brief window with $pkgs absent.
   if [[ -d "$pkgs" ]]; then
-    local old="$dest/.packages.old.$$"
-    rm -rf "$old"
-    mv "$pkgs" "$old"
-    mv "$incoming" "$pkgs"
-    rm -rf "$old"
+    if mv_has_exchange; then
+      # -T so $pkgs (an existing dir) is the swap target itself, not a directory
+      # to move $incoming into. After: $pkgs = new tree, $incoming = old tree.
+      mv -T --exchange "$incoming" "$pkgs"
+      rm -rf "$incoming"
+    else
+      local old="$dest/.packages.old.$$"
+      rm -rf "$old"
+      mv "$pkgs" "$old"
+      mv "$incoming" "$pkgs"
+      rm -rf "$old"
+    fi
   else
     mv "$incoming" "$pkgs"          # atomic swap into place
   fi

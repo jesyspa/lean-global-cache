@@ -947,6 +947,7 @@ cmd_use() {
           echo "    $PROG install $TCVER"
           echo "  Or set LEAN_CACHE_FORCE_WAIT=1 to install to completion regardless of mode."
         } >&2
+        log_event bail where=use
         exit "$BUILD_BAIL_CODE"
       fi
       log "$TCVER not installed; provisioning it into the shared cache (first use)"

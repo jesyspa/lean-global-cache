@@ -160,6 +160,17 @@ rc=0; "$CLI" refresh "$U" >/dev/null 2>&1 || rc=$?
 check "refresh of uninstalled ver exits 0"    "0" "$rc"
 check "refresh of uninstalled ver no overlay" "" "$(live_slug "$U")"
 
+# A bounded foreground call must NOT launch the multi-minute auto-install (the
+# harness would kill it mid-build). It bails with the distinct code and names
+# the install command to run instead — but still installs nothing.
+rc=0; out="$(CLAUDE_BASH_MODE=foreground "$CLI" use "$U" 2>&1)" && rc=0 || rc=$?
+check "foreground use of uninstalled ver bails, code 75" "75" "$rc"
+check "foreground use bail names the install command"    "yes" \
+  "$(printf '%s' "$out" | grep -q "install v4.99.0" && echo yes || echo no)"
+check "foreground use bail installed nothing"            "" "$(live_slug "$U")"
+# (force-wait and slot-held override the bail — exercised with stubs in the
+# install section, where the auto-install can run offline.)
+
 echo "== elan wiring (hermetic) =="
 # `use` points ~/.elan at the shared ELAN_HOME ($LEAN_CACHE_ROOT/elan) so bare
 # lean/lake and the editor resolve the shared toolchain, unless a real personal
@@ -288,6 +299,82 @@ rc=0; out="$(PATH="$ELANSTUB:$PATH" ELAN_STATE_FILE="$ELAN_STATE" "$CLI" set-def
 check "set-default of uninstalled ver fails"   "1" "$rc"
 check "set-default names the install remedy"   "yes" \
   "$(printf '%s' "$out" | grep -qi 'not installed' && echo yes || echo no)"
+
+echo "== install: build slot (hermetic) =="
+# cmd_install's replay build (lake build Mathlib …) is a cold build and must take
+# a host build slot like any policied cold build, so a cache install can't thrash
+# alongside them. Stub elan + lake so install runs fully offline; OWNER is the
+# current user (exported above) so require_owner passes without sudo.
+ISTUB="$TMP/istub"; mkdir -p "$ISTUB"
+cat > "$ISTUB/elan" <<'EL'
+#!/usr/bin/env bash
+# Minimal elan: `toolchain list` is empty (so install takes the install path);
+# every call is a no-op success.
+exit 0
+EL
+chmod +x "$ISTUB/elan"
+cat > "$ISTUB/lake" <<'LK'
+#!/usr/bin/env bash
+echo "lake $*" >> "${LAKE_LOG:-/dev/null}"
+if [[ "$1 $2" == "update mathlib" ]]; then
+  # Fabricate the flat packages tree with a mathlib olean, as real lake would,
+  # so install's integrity check passes. OLEAN_CONTENT lets a --force rebuild be
+  # told apart from the original tree.
+  mkdir -p .lake/packages/mathlib/.lake/build/lib
+  printf '%s' "${OLEAN_CONTENT:-OLE}" > .lake/packages/mathlib/.lake/build/lib/M.olean
+fi
+exit "${LAKE_RC:-0}"
+LK
+chmod +x "$ISTUB/lake"
+
+# (a) Contend the only slot with zero wait: install must still complete AND
+# announce it degraded to unserialized — proving it tried to take a slot.
+flock "$TMP/lean-cache-build-slot.0.lock" sleep 60 &
+ilocker=$!
+until ! flock -n "$TMP/lean-cache-build-slot.0.lock" true 2>/dev/null; do sleep 0.1; done
+: > "$TMP/i.log"
+out="$(PATH="$ISTUB:$PATH" LEAN_CACHE_BUILD_LOCK_DIR="$TMP" \
+       LEAN_CACHE_BUILD_SLOTS=1 LEAN_CACHE_BUILD_WAIT=0 \
+       LAKE_LOG="$TMP/i.log" "$CLI" install 4.55.0 2>&1)"; rc=$?
+check "install completes despite a contended slot" "0" "$rc"
+check "install ran the replay build"               "1" "$(grep -c '^lake build Mathlib' "$TMP/i.log" 2>/dev/null)"
+check "install acquires a build slot (degrades under contention)" "yes" \
+  "$(printf '%s' "$out" | grep -q 'proceeding unserialized' && echo yes || echo no)"
+check "install published the version"              "yes" "$(has_dir "$TMP/cache/lakes/v4-55-0/packages")"
+
+# (b) A nested install riding a parent's slot (LEAN_CACHE_BUILD_SLOT_HELD) takes
+# no new slot, so a `use`-triggered auto-install inside a slotted build never
+# deadlocks — even with the slot contended it proceeds without waiting.
+: > "$TMP/i.log"
+out="$(PATH="$ISTUB:$PATH" LEAN_CACHE_BUILD_LOCK_DIR="$TMP" LEAN_CACHE_BUILD_SLOT_HELD=1 \
+       LEAN_CACHE_BUILD_SLOTS=1 LEAN_CACHE_BUILD_WAIT=0 \
+       LAKE_LOG="$TMP/i.log" "$CLI" install 4.56.0 2>&1)"; rc=$?
+check "slot-held install completes"                "0" "$rc"
+check "slot-held install acquires no new slot"     "no" \
+  "$(printf '%s' "$out" | grep -q 'build slot' && echo yes || echo no)"
+# flock(1) forks: kill the child holding the lock, then the wrapper.
+kill $(ps -o pid= --ppid "$ilocker" 2>/dev/null) 2>/dev/null || true
+kill "$ilocker" 2>/dev/null || true; wait "$ilocker" 2>/dev/null || true
+
+# (c) `use`'s foreground auto-install bail (fix in cmd_use) and its overrides,
+# exercised offline via the stubs: a plain foreground call bails (75) and
+# provisions nothing; force-wait overrides the bail and installs to completion.
+# HOME/BUILDS are redirected so wire_elan and seeding never touch the real home.
+mkdir -p "$TMP/ihome"
+UFG="$TMP/usefg"; mkdir -p "$UFG"; gitc "$UFG" init -q
+pin v4.57.0 "$UFG"; printf 'name="p"\n' > "$UFG/lakefile.toml"
+gitc "$UFG" add -A; gitc "$UFG" commit -qm init
+rc=0; PATH="$ISTUB:$PATH" LEAN_CACHE_BUILD_LOCK_DIR="$TMP" LEAN_CACHE_BUILDS="$TMP/ibuilds" \
+  HOME="$TMP/ihome" CLAUDE_BASH_MODE=foreground "$CLI" use "$UFG" >/dev/null 2>&1 && rc=0 || rc=$?
+check "foreground use bails before an offline install too" "75" "$rc"
+check "bailed foreground use provisioned nothing"          "no" \
+  "$(has_dir "$TMP/cache/lakes/v4-57-0/packages")"
+rc=0; PATH="$ISTUB:$PATH" LEAN_CACHE_BUILD_LOCK_DIR="$TMP" LEAN_CACHE_BUILDS="$TMP/ibuilds" \
+  HOME="$TMP/ihome" CLAUDE_BASH_MODE=foreground LEAN_CACHE_FORCE_WAIT=1 \
+  "$CLI" use "$UFG" >/dev/null 2>&1 || rc=$?
+check "force-wait overrides the foreground use bail"       "0" "$rc"
+check "force-wait foreground use provisioned the version"  "yes" \
+  "$(has_dir "$TMP/cache/lakes/v4-57-0/packages")"
 
 echo "== build seeding & push gate (hermetic) =="
 # No real Lean here: a stub `lake` stands in for the build so publish/seed and

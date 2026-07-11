@@ -72,7 +72,12 @@ best-effort — which is the intended outcome.
 
 `lean-cache install <version>`:
 
-1. Re-exec as `hostbot` if needed; `umask 022`; take a per-version `flock`.
+1. Re-exec as `hostbot` if needed; `umask 022`; take a per-version `flock` and a
+   host build slot (`acquire_build_slot`), so the replay build in step 7
+   serializes with policied cold builds instead of thrashing alongside them. A
+   nested install riding a parent's slot (`LEAN_CACHE_BUILD_SLOT_HELD`) skips
+   re-acquiring, so a `use`-triggered auto-install inside a slotted build never
+   deadlocks; the slot degrades to unserialized rather than blocking.
 2. `elan toolchain install leanprover/lean4:<version>` into `ELAN_HOME`.
 3. Build in a temp project **on the same filesystem** as the destination (so
    the final move is atomic): a `lean-toolchain` pinned to the version and a
@@ -450,6 +455,17 @@ circuits all of this and completes in place — the parent already committed to
 building, so a nested build must finish, never bail. `lean-cache build` is an
 explicit alias for the same policy; instances no longer need it, but it stays
 useful (and `--wait` maps to force-wait).
+
+`use`'s auto-install applies the same foreground bail. `lean-cache use` on a
+not-yet-installed version otherwise launches a multi-minute cold install, which
+a bounded foreground call would kill mid-build; so in `foreground` mode (and
+without `LEAN_CACHE_FORCE_WAIT` or a held parent slot) `use` does not start the
+install — it prints the `lean-cache install <version>` command to run
+backgrounded / with a long timeout and exits `BUILD_BAIL_CODE`. Background or
+absent mode, force-wait, a held slot, and an explicit `lean-cache install` all
+proceed to install. The git-hook path (`refresh`) never reaches this — it no-ops
+on an uninstalled version rather than provisioning — so a checkout can't trip
+the bail either.
 
 Like the two overlay hooks (which delegate to `refresh`), the installed
 `pre-push` hook is a thin stub: it does the cheap guards (`SKIP_LEAN_PUSH_GATE`,

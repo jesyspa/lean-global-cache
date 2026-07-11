@@ -109,7 +109,10 @@ Usage: $PROG <command> [args]
                         cwd) to the cache. Version defaults to the project's
                         lean-toolchain. Auto-installs the version if it is not
                         in the cache yet (set LEAN_CACHE_AUTO_INSTALL=0 to
-                        hard-fail instead). Also installs the overlay git hooks.
+                        hard-fail instead); in a bounded foreground call
+                        (CLAUDE_BASH_MODE=foreground) it bails with re-run
+                        instructions rather than start the multi-minute install.
+                        Also installs the overlay git hooks.
   refresh [path]        Re-overlay only if the live overlay's toolchain differs
                         from the project's lean-toolchain (a cheap no-op
                         otherwise). This is what the git hooks call.
@@ -667,6 +670,16 @@ cmd_install() {
   rm -rf "$LAKES"/.build."$SLUG".* 2>/dev/null || true
   rm -rf "$dest"/.packages.incoming.* "$dest"/.packages.old.* 2>/dev/null || true
 
+  # The install-time replay build (lake build Mathlib widgetJsAll) is a cold
+  # from-scratch build — as thrash-prone as any `lean-cache build`, and reached
+  # not just by hand but by `use`'s auto-install and deploy.sh's versions
+  # reconcile. Take a host build slot so it serializes with policied cold builds
+  # instead of stacking on top of them. Held (fd 8) until this process exits;
+  # a nested install riding a parent's slot (LEAN_CACHE_BUILD_SLOT_HELD) skips
+  # re-acquiring, so a `use`-triggered auto-install during a slotted build never
+  # deadlocks. Degrades to unserialized, never blocks (see acquire_build_slot).
+  acquire_build_slot "$PROG install $TCVER"
+
   # `elan toolchain install` errors (nonzero) if the toolchain already exists,
   # which would abort under `set -e`; only install when it's actually missing.
   # elan suffixes the default toolchain with " (default)", so strip that before
@@ -868,6 +881,22 @@ cmd_use() {
     # can't trigger a multi-minute build. Set LEAN_CACHE_AUTO_INSTALL=0 to keep
     # the old hard-fail.
     if [[ "${LEAN_CACHE_AUTO_INSTALL:-1}" == 1 ]]; then
+      # Auto-install is a multi-minute cold build. In a bounded foreground call
+      # (CLAUDE_BASH_MODE=foreground) the harness would kill it mid-flight, so
+      # bail like run_build_policied does: don't start it, print the command to
+      # run backgrounded / with a long timeout, and exit the distinct bail code.
+      # A build riding a parent's slot (LEAN_CACHE_BUILD_SLOT_HELD), force-wait,
+      # and background/absent mode all proceed to install.
+      if [[ -z "${LEAN_CACHE_BUILD_SLOT_HELD:-}" && -z "${LEAN_CACHE_FORCE_WAIT:-}" \
+            && "${CLAUDE_BASH_MODE:-background}" == foreground ]]; then
+        {
+          echo "$PROG use: $TCVER is not installed; installing it is a multi-minute cold build that would exceed this call's ~2-minute foreground limit, so not starting it here."
+          echo "  Install it backgrounded (you'll be woken on completion) or with a 10-minute timeout, then re-run your command:"
+          echo "    $PROG install $TCVER"
+          echo "  Or set LEAN_CACHE_FORCE_WAIT=1 to install to completion regardless of mode."
+        } >&2
+        exit "$BUILD_BAIL_CODE"
+      fi
       log "$TCVER not installed; provisioning it into the shared cache (first use)"
       "$INSTALLED_SELF" install "$TCVER" \
         || die "auto-install of $TCVER failed; run: $PROG install $TCVER"

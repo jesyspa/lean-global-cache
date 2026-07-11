@@ -584,6 +584,30 @@ the event silently. Nothing downstream branches on a log write, and no caller
 checks its result — the event log can degrade to writing nothing and every other
 guarantee in this document still holds.
 
+## `verify`
+
+The event log measures whether the warm-build machinery fires; `verify`
+measures whether the cache's own invariants still hold. It re-checks, over the
+whole configured cache, everything `install` establishes at write time but
+nothing enforces afterward: mathlib oleans present per version, no group- or
+other-writable path (the single-writer invariant itself), everything owned by
+`OWNER`, `core.fileMode=false` on every package repo, elan toolchains and
+`lakes/<slug>` dirs in sync in both directions, and no `.build.*`/
+`.packages.incoming.*`/`.packages.old.*` scratch left over from an install
+interrupted mid-flight (a fresh one is skipped — it may be a live install).
+
+It is deliberately report-only: unprivileged, takes no lock, and never writes
+under the cache, so it can run from cron on any group member's account without
+a sudoers rule and without racing a concurrent `install`. Output mirrors
+`check-env`'s `ok`/`warn`/`FAIL` lines — a FAIL is a broken invariant a
+consumer's build will hit (missing oleans, a writable path); a warn is drift
+that degrades ergonomics or signals a half-finished operation (fileMode noise,
+an orphaned toolchain/cache-dir pair, stale scratch) without breaking a build
+outright. Exit code follows: 0 clean or warnings-only, 1 on any FAIL, so a cron
+wrapper can page on the exit code alone. It ends with a `verify` event
+(`fails=N warns=N ok=0/1`) in the same log `stats` reads, so a FAIL streak is
+visible there too.
+
 ## Version normalization
 
 A version string is reduced to four canonical forms:
@@ -618,10 +642,12 @@ resolution unit tests, validation-rejects-junk tests, the overlay/hooks
 scenarios, the build-seeding + push-gate scenarios, the warm/cold build-policy
 scenarios (warm runs unslotted, cold serializes, foreground bails, background /
 force-wait / slot-held build to completion), the `lake` shim scenarios
-(non-build passthrough, build delegation, no self-recursion), and the event-log
+(non-build passthrough, build delegation, no self-recursion), the event-log
 scenarios (events written with the right fields across a use/seed/publish/gate
 flow, an unwritable log dir does not break the command, and `stats` summarizes a
-synthetic log) — all with a stub `lake`. It does not touch the real cache or the
+synthetic log), and the `verify` scenarios (a clean pass, then one violation
+per check planted at a time against a hand-built cache tree with a stub
+`elan`) — all with a stub `lake`. It does not touch the real cache or the
 network.
 
 `publish-build` / `seed-build` are not part of `deploy.sh`: they are per-user,

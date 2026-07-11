@@ -1086,6 +1086,115 @@ check "stats: install durations exclude out-of-window" "yes" \
   "$(seen "$sout" 'install +2 run: 1 ok, 1 fail.*median 200, max 300')"
 check "stats: gate outcomes"       "yes" "$(seen "$sout" 'gate +2 engaged: 1 ok, 1 skip, 0 fail')"
 
+echo "== verify (hermetic) =="
+# A fresh cache tree with one installed version, planted with one violation per
+# check at a time. LEAN_CACHE_LOG_DIR is still $TMP/eventlog from the event-log
+# section above, so verify's own event lands in the same log we already probe.
+VROOT="$TMP/vcache"
+mkdir -p "$VROOT/lakes/v9-1-0/packages/mathlib/.lake/build" \
+         "$VROOT/lakes/v9-1-0/packages/batteries" "$VROOT/elan/bin"
+: > "$VROOT/lakes/v9-1-0/packages/mathlib/.lake/build/M.olean"
+: > "$VROOT/elan/bin/lean"
+gitc "$VROOT/lakes/v9-1-0/packages/batteries" init -q
+gitc "$VROOT/lakes/v9-1-0/packages/batteries" config core.fileMode false
+chmod -R u=rwX,go=rX "$VROOT"  # normalize_perms' own baseline, so a loose umask can't fake a violation
+
+VELANSTUB="$TMP/velanstub"; mkdir -p "$VELANSTUB"
+cat > "$VELANSTUB/elan" <<'EL'
+#!/usr/bin/env bash
+# Matches VROOT exactly: one toolchain, one cache dir, nothing orphaned.
+case "$1 $2" in
+  "toolchain list") printf 'leanprover/lean4:v9.1.0 (default)\n' ;;
+  *) exit 0 ;;
+esac
+EL
+chmod +x "$VELANSTUB/elan"
+run_verify() { PATH="$VELANSTUB:$PATH" LEAN_CACHE_ROOT="$VROOT" "$CLI" verify "$@"; }
+
+rc=0; out="$(run_verify 2>&1)" || rc=$?
+check "clean cache verifies ok (exit 0)"    "0" "$rc"
+check "clean cache: no FAIL lines"          "no" "$(grep -q FAIL <<<"$out" && echo yes || echo no)"
+check "clean cache: no warn lines"          "no" "$(grep -q '  warn  ' <<<"$out" && echo yes || echo no)"
+check "clean cache: oleans check passes"    "yes" "$(grep -q 'mathlib oleans present' <<<"$out" && echo yes || echo no)"
+
+# Violation 1: a group-writable file trips the single-writer invariant itself.
+chmod g+w "$VROOT/lakes/v9-1-0/packages/mathlib/.lake/build/M.olean"
+rc=0; out="$(run_verify 2>&1)" || rc=$?
+check "group-writable file -> FAIL, exit 1" "1" "$rc"
+check "group-writable file flagged"         "yes" "$(grep -qi 'group/other-writable path' <<<"$out" && echo yes || echo no)"
+chmod g-w "$VROOT/lakes/v9-1-0/packages/mathlib/.lake/build/M.olean"
+
+# Violation 2: an installed version with no mathlib oleans.
+mkdir -p "$VROOT/lakes/v9-2-0/packages/mathlib/.lake/build"
+rc=0; out="$(run_verify 2>&1)" || rc=$?
+check "missing oleans -> FAIL, exit 1"      "1" "$rc"
+check "missing oleans names the slug"       "yes" \
+  "$(grep -q 'v9-2-0: no mathlib oleans' <<<"$out" && echo yes || echo no)"
+rm -rf "$VROOT/lakes/v9-2-0"
+
+# Violation 3: ownership. Hermetic without root — declare a bogus numeric
+# OWNER so every real file (owned by us) reads as "not owned by $OWNER".
+rc=0; out="$(PATH="$VELANSTUB:$PATH" LEAN_CACHE_ROOT="$VROOT" LEAN_CACHE_OWNER=999999 "$CLI" verify 2>&1)" || rc=$?
+check "ownership mismatch -> FAIL, exit 1"  "1" "$rc"
+check "ownership mismatch flagged"          "yes" "$(grep -qi 'not owned by 999999' <<<"$out" && echo yes || echo no)"
+
+# Violation 4: fileMode untracked on a package repo -> warn, not FAIL.
+gitc "$VROOT/lakes/v9-1-0/packages/batteries" config --unset core.fileMode
+rc=0; out="$(run_verify 2>&1)" || rc=$?
+check "unset fileMode -> exit 0 (warn only)" "0" "$rc"
+check "unset fileMode names the remedy"      "yes" "$(grep -qi 'fix-filemode' <<<"$out" && echo yes || echo no)"
+gitc "$VROOT/lakes/v9-1-0/packages/batteries" config core.fileMode false
+
+# Violation 5: an elan toolchain with no matching cache dir -> warn.
+OELANSTUB="$TMP/oelanstub"; mkdir -p "$OELANSTUB"
+cat > "$OELANSTUB/elan" <<'EL'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "toolchain list") printf 'leanprover/lean4:v9.1.0 (default)\nleanprover/lean4:v9.9.9\n' ;;
+  *) exit 0 ;;
+esac
+EL
+chmod +x "$OELANSTUB/elan"
+rc=0; out="$(PATH="$OELANSTUB:$PATH" LEAN_CACHE_ROOT="$VROOT" "$CLI" verify 2>&1)" || rc=$?
+check "orphan elan toolchain -> exit 0 (warn only)" "0" "$rc"
+check "orphan elan toolchain flagged"               "yes" \
+  "$(grep -qi 'orphan elan toolchain leanprover/lean4:v9.9.9' <<<"$out" && echo yes || echo no)"
+
+# Violation 6: a cache dir with no matching elan toolchain -> warn.
+NELANSTUB="$TMP/nelanstub"; mkdir -p "$NELANSTUB"
+cat > "$NELANSTUB/elan" <<'EL'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "toolchain list") printf '' ;;
+  *) exit 0 ;;
+esac
+EL
+chmod +x "$NELANSTUB/elan"
+rc=0; out="$(PATH="$NELANSTUB:$PATH" LEAN_CACHE_ROOT="$VROOT" "$CLI" verify 2>&1)" || rc=$?
+check "orphan cache dir -> exit 0 (warn only)" "0" "$rc"
+check "orphan cache dir flagged"               "yes" \
+  "$(grep -qi 'orphan cache dir .*v9-1-0' <<<"$out" && echo yes || echo no)"
+
+# Violation 7: install scratch older than a day -> warn; a fresh one is skipped
+# (it may be an in-flight install).
+mkdir -p "$VROOT/lakes/.build.v9-1-0.stale"
+touch -d '2 days ago' "$VROOT/lakes/.build.v9-1-0.stale"
+rc=0; out="$(run_verify 2>&1)" || rc=$?
+check "stale install scratch -> exit 0 (warn only)" "0" "$rc"
+check "stale install scratch flagged"               "yes" \
+  "$(grep -qi 'stale install scratch' <<<"$out" && echo yes || echo no)"
+rm -rf "$VROOT/lakes/.build.v9-1-0.stale"
+
+mkdir -p "$VROOT/lakes/.build.v9-1-0.fresh"
+rc=0; out="$(run_verify 2>&1)" || rc=$?
+check "fresh install scratch not flagged"    "0" "$rc"
+check "fresh install scratch not flagged (2)" "no" \
+  "$(grep -qi 'stale install scratch' <<<"$out" && echo yes || echo no)"
+rm -rf "$VROOT/lakes/.build.v9-1-0.fresh"
+
+check "verify logs a verify event"       "yes" "$(grep -q $'\tverify\t' "$evlog" 2>/dev/null && echo yes || echo no)"
+check "verify event records the clean run" "1" "$(ev_field "$evlog" verify ok)"
+
 echo
 if [[ "$fail" -eq 0 ]]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; fi
 exit "$fail"

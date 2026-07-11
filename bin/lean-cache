@@ -187,6 +187,13 @@ Usage: $PROG <command> [args]
   config                Print the four resolved config values (owner/group/root/bin).
   check-env             Check that this user's environment is wired to the cache
                         (toolchain on PATH, cache readable, repos git-trusted).
+  verify                Read-only sweep of the shared cache's invariants: oleans
+                        present, no group/other-writable paths, everything owned
+                        by OWNER, fileMode untracked, elan toolchains and cache
+                        dirs in sync, no stale install scratch. Unprivileged,
+                        never mutates anything, cron-friendly. ok/warn/FAIL
+                        output like check-env; exits 0 clean or warnings-only,
+                        1 on any FAIL.
   stats [--since DAYS]  Summarize the event log over the last DAYS (default 7):
                         per-event counts, seed hit rate, gate outcomes, build
                         durations, slot waits. Read-only, no privilege.
@@ -640,6 +647,108 @@ cmd_check_env() {
   echo
   if [[ "$fails" -gt 0 ]]; then echo "$fails problem(s), $warns warning(s)"; return 1; fi
   [[ "$warns" -gt 0 ]] && echo "$warns warning(s)" || echo "all wired up"
+  return 0
+}
+
+# Read-only invariant sweep over the shared cache itself (as opposed to
+# check-env, which checks the calling user's wiring to it). Unprivileged,
+# mutates nothing, safe to cron. ok/warn/FAIL output mirrors check-env; exits
+# 0 when clean or warnings-only, 1 on any FAIL.
+cmd_verify() {
+  [[ $# -eq 0 ]] || usage
+  local fails=0 warns=0
+  pass() { echo "  ok    $*"; }
+  warn() { echo "  warn  $*"; warns=$((warns + 1)); }
+  fail() { echo "  FAIL  $*"; fails=$((fails + 1)); }
+
+  echo "cache root  $ROOT"
+
+  # 1. Oleans present: every installed version must actually carry mathlib
+  # oleans, or a consumer's build fails outright. Same find-one-olean pattern
+  # cmd_install's own integrity check uses.
+  local -a slugs=()
+  if [[ -d "$LAKES" ]]; then
+    local d slug mlbuild first_olean
+    for d in "$LAKES"/*/; do
+      [[ -d "${d}packages" ]] || continue
+      slug="$(basename "$d")"; slugs+=("$slug")
+      mlbuild="${d}packages/mathlib/.lake/build"
+      first_olean="$(find "$mlbuild" -name '*.olean' -print -quit 2>/dev/null || true)"
+      if [[ -n "$first_olean" ]]; then pass "$slug: mathlib oleans present"
+      else fail "$slug: no mathlib oleans under $mlbuild"; fi
+    done
+    [[ "${#slugs[@]}" -gt 0 ]] || pass "no versions installed"
+  else
+    warn "no cache yet at $LAKES (install a version to create it)"
+  fi
+
+  # 2. Permissions: the single-writer invariant itself — nothing under the
+  # cache may be group- or other-writable. Same -perm tests cmd_seed_build
+  # uses to vouch for the (separate) build store.
+  local wpath
+  wpath="$(find "$LAKES" "$ELAN_HOME" \( -perm -0020 -o -perm -0002 \) -print -quit 2>/dev/null || true)"
+  if [[ -n "$wpath" ]]; then fail "group/other-writable path under the cache: $wpath"
+  else pass "no group/other-writable paths under \$LAKES or \$ELAN_HOME"; fi
+
+  # 3. Ownership: everything under the cache must be owned by $OWNER, or a
+  # consumer's read depends on some other user's session/umask/lifetime —
+  # the exact "permission lottery" the single-writer model exists to end.
+  local opath
+  opath="$(find "$LAKES" "$ELAN_HOME" -not -user "$OWNER" -print -quit 2>/dev/null || true)"
+  if [[ -n "$opath" ]]; then fail "path not owned by $OWNER: $opath"
+  else pass "everything under the cache is owned by $OWNER"; fi
+
+  # 4. fileMode untracked: install sets core.fileMode=false on every package
+  # repo (fix-filemode backfills older caches); without it, normalize_perms'
+  # exec-bit flip makes every consumer build spam "local changes" warnings.
+  local s repo bad
+  for s in "${slugs[@]}"; do
+    bad=0
+    for repo in "$LAKES/$s/packages"/*/; do
+      [[ -e "$repo/.git" ]] || continue
+      [[ "$(git -C "$repo" config --get core.fileMode 2>/dev/null)" == false ]] || bad=1
+    done
+    [[ "$bad" -eq 0 ]] || warn "$s: core.fileMode not set on every package repo; run '$PROG fix-filemode'"
+  done
+
+  # 5. Orphans: an elan toolchain with no matching cache dir, or a cache dir
+  # with no matching toolchain, each mean install/uninstall left the two out
+  # of sync. Only leanprover/lean4:v* entries count; elan's " (default)"
+  # suffix is stripped before matching.
+  local -A tc_slug=()
+  local line
+  while IFS= read -r line; do
+    line="${line% (default)}"
+    case "$line" in leanprover/lean4:v*) ;; *) continue ;; esac
+    s="$( { normalize_version "$line" && printf '%s' "$SLUG"; } 2>/dev/null )" || continue
+    tc_slug["$s"]="$line"
+  done < <(elan toolchain list 2>/dev/null || true)
+  for s in "${!tc_slug[@]}"; do
+    [[ -d "$LAKES/$s/packages" ]] \
+      || warn "orphan elan toolchain ${tc_slug[$s]}: no matching cache at $LAKES/$s/packages (run '$PROG install <version>' to add it, or remove the toolchain with elan)"
+  done
+  for s in "${slugs[@]}"; do
+    [[ -n "${tc_slug[$s]:-}" ]] \
+      || warn "orphan cache dir $LAKES/$s: no matching elan toolchain (run '$PROG install <version>' to add it, or '$PROG uninstall <version>' to remove the orphaned cache)"
+  done
+
+  # 6. Stale scratch: leftovers from an install interrupted mid-flight
+  # (cmd_install's own .build.<slug>.* and .packages.incoming/old.* dirs). A
+  # fresh one may be an in-flight install, so only flag entries over a day old.
+  local now p mtime age; now="$(date +%s)"
+  for p in "$LAKES"/.build.* "$LAKES"/*/.packages.incoming.* "$LAKES"/*/.packages.old.*; do
+    [[ -e "$p" ]] || continue
+    mtime="$(stat -c '%Y' "$p" 2>/dev/null || echo "$now")"
+    age=$(( now - mtime ))
+    [[ "$age" -gt 86400 ]] \
+      && warn "stale install scratch: $p (~$(( age / 86400 ))d old; a fresh one may be an in-flight install)"
+  done
+
+  echo
+  local ok=1; [[ "$fails" -eq 0 ]] || ok=0
+  log_event verify fails="$fails" warns="$warns" ok="$ok"
+  if [[ "$fails" -gt 0 ]]; then echo "$fails problem(s), $warns warning(s)"; return 1; fi
+  [[ "$warns" -gt 0 ]] && echo "$warns warning(s)" || echo "all clean"
   return 0
 }
 
@@ -1688,6 +1797,7 @@ case "$cmd" in
   resolve)   cmd_resolve   "$@" ;;
   config)    cmd_config    "$@" ;;
   check-env) cmd_check_env "$@" ;;
+  verify)    cmd_verify    "$@" ;;
   stats)     cmd_stats     "$@" ;;
   -h|--help|help) usage 0 ;;
   *) die "unknown command: $cmd (try --help)" ;;

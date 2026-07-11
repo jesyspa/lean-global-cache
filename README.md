@@ -33,6 +33,7 @@ lean-cache prune-builds [--keep-days N]  # rotate the warm-build store
 lean-cache list                  # installed versions + sizes
 lean-cache resolve <version>     # show normalized toolchain/rev/slug
 lean-cache config                # show resolved owner/group/root/builds/bin
+lean-cache verify                # read-only cache invariant sweep (cron-friendly)
 lean-cache stats [--since DAYS]  # summarize the event log (default 7 days)
 ```
 
@@ -207,6 +208,17 @@ lean-cache stats --since 30 # …over the last 30 days
 seed hit rate, gate outcomes, install/publish build durations (median/max),
 and slot waits — split by user when more than one wrote. It is read-only and
 needs no privilege.
+
+```bash
+lean-cache verify   # invariant sweep — safe to run from cron
+```
+
+`verify` is the cronnable integrity sweep: it checks the shared cache itself
+(mathlib oleans present, no group/other-writable paths, everything owned by
+`OWNER`, `core.fileMode` untracked, elan toolchains and cache dirs in sync, no
+stale install scratch) and reports `ok`/`warn`/`FAIL` per check, the same style
+as `check-env`. It is read-only and needs no privilege; exit 0 when clean or
+warnings-only, 1 on any FAIL, so it fits a cron job that pages on the exit code.
 
 ## Layout it manages
 

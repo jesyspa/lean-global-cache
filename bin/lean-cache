@@ -186,6 +186,10 @@ Usage: $PROG <command> [args]
                         so the read-only cache's normalized exec bits stop
                         showing as \`lake build\` "local changes" warnings. New
                         installs do this automatically; this backfills old ones.
+  fix-perms [version]   Re-normalize cache permissions (owner-writable, group/
+                        other read-only) over every installed version, or just
+                        one. The remedy for verify's group/other-writable FAIL.
+                        Owner-only. Covers the lake cache, not elan's tree.
   list                  List installed versions with disk usage.
   resolve <version>     Print the normalized toolchain / rev / slug for a
                         version string (no side effects).
@@ -348,11 +352,27 @@ acquire_build_slot() { # arg: message prefix
   [[ "$wait" =~ ^[0-9]+$ ]] || wait=3600
   while :; do
     for ((i = 0; i < slots; i++)); do
-      # Brace group: the 2>/dev/null must scope to this open only — putting it
-      # on the exec itself would permanently silence the script's stderr, and a
-      # failed exec redirection kills a non-interactive shell despite the ||.
-      { exec 8>>"$base.$i.lock"; } 2>/dev/null || continue
-      chmod 0666 "$base.$i.lock" 2>/dev/null || true
+      # Open the lock coping with fs.protected_regular (>=1; this host runs 1,
+      # Arch default is 2). With that sysctl on, opening an *existing* file owned
+      # by another user in the sticky world-writable /tmp with O_CREAT fails
+      # EACCES even at mode 0666 — so a bot that owns neither slot lock (both
+      # created by other users) could otherwise open neither and would silently
+      # defeat the whole policy. flock(2) takes LOCK_EX on a read-only fd fine,
+      # so open an already-present lock read-only (no O_CREAT); only create an
+      # absent one, then chmod it world-writable so the next user can lock it. A
+      # lost create race (another user created it just now, so our O_CREAT open
+      # of their fresh file EACCESes) falls back to the read-only open. Keep it
+      # on fd 8 so run_lake_build's heartbeat can shed the slot with `8>&-`; a
+      # dynamic fd would escape that and let an orphaned sleep pin the slot.
+      # Brace-group the redirect so the 2>/dev/null scopes to the open alone (a
+      # failed exec redirection otherwise kills a non-interactive shell).
+      if [[ -e "$base.$i.lock" ]]; then
+        { exec 8<"$base.$i.lock"; } 2>/dev/null || continue
+      elif { exec 8>>"$base.$i.lock"; } 2>/dev/null; then
+        chmod 0666 "$base.$i.lock" 2>/dev/null || true
+      else
+        { exec 8<"$base.$i.lock"; } 2>/dev/null || continue
+      fi
       if flock -n 8; then
         export LEAN_CACHE_BUILD_SLOT_HELD=1
         # Log only a slot that actually waited; the instant-acquire common case
@@ -398,7 +418,11 @@ cmd_slots() {
     lock="$base.$i.lock"
     state="free"; holder=""
     if [[ -e "$lock" ]]; then
-      if { exec 9>>"$lock"; } 2>/dev/null; then
+      # Open the existing lock read-only (no O_CREAT), so a slot another user
+      # holds probes as held rather than "unknown" under fs.protected_regular;
+      # flock -n on a read-only fd still reports the state. (acquire_build_slot's
+      # comment covers why O_CREAT on another user's file fails there.)
+      if { exec 9<"$lock"; } 2>/dev/null; then
         if flock -n 9; then
           flock -u 9
         else
@@ -747,7 +771,7 @@ cmd_verify() {
   # uses to vouch for the (separate) build store.
   local wpath
   wpath="$(find "$LAKES" "$ELAN_HOME" \( -perm -0020 -o -perm -0002 \) -print -quit 2>/dev/null || true)"
-  if [[ -n "$wpath" ]]; then fail "group/other-writable path under the cache: $wpath"
+  if [[ -n "$wpath" ]]; then fail "group/other-writable path under the cache: $wpath (run '$PROG fix-perms' to re-normalize)"
   else pass "no group/other-writable paths under \$LAKES or \$ELAN_HOME"; fi
 
   # 3. Ownership: everything under the cache must be owned by $OWNER, or a
@@ -845,6 +869,37 @@ cmd_fix_filemode() {
     slug="$(basename "$d")"; found=1
     log "untracking file-mode in $slug"
     ignore_filemode "${d}packages"
+  done
+  [[ "$found" -eq 1 ]] || log "(no versions installed)"
+}
+
+# Re-run normalize_perms over installed versions to repair permission drift —
+# the single-writer remedy verify's group/other-writable FAIL points at (a
+# stray group-writable file that crept into a version tree). Owner-only, like
+# fix-filemode, so it re-execs as OWNER on a multi-user host. Covers $LAKES
+# only: elan manages its own tree, so normalizing $ELAN_HOME wholesale is
+# riskier than the drift is worth. With a version argument it normalizes just
+# that version's dir; with none, every installed version.
+cmd_fix_perms() {
+  [[ $# -le 1 ]] || usage
+  local target="" ver_arg=()
+  if [[ $# -eq 1 ]]; then normalize_version "$1"; target="$SLUG"; ver_arg=("$1"); fi
+  require_owner fix-perms ${ver_arg[@]+"${ver_arg[@]}"}
+  umask 022
+  if [[ -n "$target" ]]; then
+    local dir="$LAKES/$target"
+    [[ -d "$dir" ]] || die "version $TCVER is not installed (no $dir)"
+    log "normalizing permissions in $target"
+    normalize_perms "$dir"
+    return 0
+  fi
+  [[ -d "$LAKES" ]] || { log "(no versions installed)"; return 0; }
+  local d slug found=0
+  for d in "$LAKES"/*/; do
+    [[ -d "${d}packages" ]] || continue
+    slug="$(basename "$d")"; found=1
+    log "normalizing permissions in $slug"
+    normalize_perms "${d%/}"
   done
   [[ "$found" -eq 1 ]] || log "(no versions installed)"
 }
@@ -1805,12 +1860,20 @@ cmd_stats() {
       }
     }
     END {
-      split("install use seed publish gate slot bail", order, " ")
       nev = 0; for (e in total) nev += total[e]
       if (nev == 0) { print "(no events in the window)"; exit }
 
+      # Count EVERY event type generically, sorted, one line each — the
+      # specialized sections below only know a fixed set, so a new/unknown event
+      # type (a future kind, or one a stats build predates) must still surface
+      # here rather than vanishing. Insertion sort; no gawk asorti dependency.
+      nk = 0; for (e in total) evs[++nk] = e
+      for (i = 2; i <= nk; i++) { key = evs[i]; j = i - 1
+        while (j >= 1 && evs[j] > key) { evs[j+1] = evs[j]; j-- }
+        evs[j+1] = key }
+
       print "events"
-      for (k = 1; k <= 7; k++) { e = order[k]; if (total[e]) printf "  %-9s %d\n", e, total[e] }
+      for (k = 1; k <= nk; k++) { e = evs[k]; printf "  %-9s %d\n", e, total[e] }
       print ""
 
       if (use_t)  printf "use      %d overlaid, %d triggered an auto-install\n", use_t, use_ai+0
@@ -1841,7 +1904,7 @@ cmd_stats() {
         print ""; print "by user"
         for (u in nuser) {
           line = ""
-          for (k = 1; k <= 7; k++) { e = order[k]; c = ue[u SUBSEP e]; if (c) line = line sprintf("  %s %d", e, c) }
+          for (k = 1; k <= nk; k++) { e = evs[k]; c = ue[u SUBSEP e]; if (c) line = line sprintf("  %s %d", e, c) }
           printf "  %-10s%s\n", u, line
         }
       }
@@ -1867,6 +1930,7 @@ case "$cmd" in
   prune-builds) cmd_prune_builds  "$@" ;;
   slots)        cmd_slots         "$@" ;;
   fix-filemode) cmd_fix_filemode  "$@" ;;
+  fix-perms)    cmd_fix_perms     "$@" ;;
   pre-push-gate) cmd_pre_push_gate "$@" ;;
   commit-hint)  cmd_commit_hint   "$@" ;;
   list)      cmd_list      "$@" ;;

@@ -25,8 +25,8 @@ Order:
    the cache is now read-only to consumers).
 
 3. `sudo ./admin/install-sudoers.sh` — install `/etc/sudoers.d/lean-cache`
-   so any GROUP-member user can run `lean-cache install`/`uninstall`/`fix-filemode`
-   as OWNER.
+   so any GROUP-member user can run `lean-cache install`/`uninstall`/
+   `set-default-toolchain`/`fix-filemode`/`fix-perms` as OWNER.
 
 After all three, deploy the repo through the hostbot deploy-handler as usual;
 `deploy.sh` installs the CLI and reconciles the `versions` manifest.

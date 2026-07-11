@@ -30,7 +30,9 @@ cat > "$TMP" <<EOF
 %$GROUP ALL=($OWNER) NOPASSWD: $BIN install *, \\
 $(printf '%*s' ${#GROUP} '')            $BIN uninstall *, \\
 $(printf '%*s' ${#GROUP} '')            $BIN set-default-toolchain *, \\
-$(printf '%*s' ${#GROUP} '')            $BIN fix-filemode
+$(printf '%*s' ${#GROUP} '')            $BIN fix-filemode, \\
+$(printf '%*s' ${#GROUP} '')            $BIN fix-perms, \\
+$(printf '%*s' ${#GROUP} '')            $BIN fix-perms *
 EOF
 
 visudo -cf "$TMP" >/dev/null || { echo "sudoers syntax check failed" >&2; exit 1; }

@@ -36,6 +36,7 @@ lean-cache resolve <version>     # show normalized toolchain/rev/slug
 lean-cache config                # show resolved owner/group/root/builds/bin
 lean-cache verify                # read-only cache invariant sweep (cron-friendly)
 lean-cache stats [--since DAYS]  # summarize the event log (default 7 days)
+lean-cache fix-perms [version]   # re-normalize cache permissions (verify's remedy)
 ```
 
 `<version>` accepts `4.30`, `4.30.0`, `v4.30.0`, `leanprover/lean4:v4.30.0`, or

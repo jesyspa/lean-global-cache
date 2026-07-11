@@ -608,6 +608,14 @@ wrapper can page on the exit code alone. It ends with a `verify` event
 (`fails=N warns=N ok=0/1`) in the same log `stats` reads, so a FAIL streak is
 visible there too.
 
+The group/other-writable FAIL has a single-writer remedy: `lean-cache fix-perms
+[version]` re-runs the install-time `normalize_perms` pass over the lake cache
+(one version or all) as OWNER, putting a stray writable file that drifted in
+back to owner-writable/group-read without a hand `chmod`; verify's FAIL line
+names it. It covers `$LAKES` only — elan owns `$ELAN_HOME` and normalizing that
+tree wholesale is riskier than the drift is worth. Owner-only, so it re-execs
+via the same sudoers rule as `install`/`fix-filemode`.
+
 ## Version normalization
 
 A version string is reduced to four canonical forms:

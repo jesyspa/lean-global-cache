@@ -447,6 +447,30 @@ out="$(slots_cli)"
 check "slots sees the slot free again after release" "yes" \
   "$(printf '%s' "$out" | grep -qE '^  slot 0: free' && echo yes || echo no)"
 
+# fs.protected_regular hardening: with the sysctl >=1, an O_CREAT open of a lock
+# file another user already created (in sticky world-writable /tmp) fails EACCES
+# even at mode 0666 — so the CLI must open an ALREADY-PRESENT lock read-only, no
+# O_CREAT. The cross-user uid case can't be simulated single-user, so cover the
+# code path: a pre-existing lock still probes free (CLI opened it read-only),
+# and one held via a read-only fd (which is all flock(2) needs for LOCK_EX)
+# probes held.
+prelock="$SLOTS_DIR/lean-cache-build-slot.0.lock"
+: > "$prelock"                 # exists before the CLI ever opens it
+out="$(slots_cli)"
+check "pre-existing lock probes free (opened without O_CREAT)" "yes" \
+  "$(printf '%s' "$out" | grep -qE '^  slot 0: free' && echo yes || echo no)"
+
+exec 7<"$prelock"; flock -x 7; frc=$?
+check "flock -x acquires LOCK_EX on a read-only fd"  "0" "$frc"
+out="$(slots_cli)"
+check "read-only-fd holder probes as held"           "yes" \
+  "$(printf '%s' "$out" | grep -qE '^  slot 0: held' && echo yes || echo no)"
+flock -u 7; exec 7<&-
+out="$(slots_cli)"
+check "released read-only-fd lock probes free again"  "yes" \
+  "$(printf '%s' "$out" | grep -qE '^  slot 0: free' && echo yes || echo no)"
+rm -f "$prelock"
+
 out="$(LEAN_CACHE_BUILD_LOCK_DIR="$SLOTS_DIR" LEAN_CACHE_BUILD_SLOTS=0 "$CLI" slots 2>&1)"; rc=$?
 check "SLOTS=0 reports serialization disabled" "yes" \
   "$(printf '%s' "$out" | grep -q 'disabled' && echo yes || echo no)"
@@ -1154,6 +1178,8 @@ SL="$TMP/statslog"; mkdir -p "$SL"; snow="$(date +%s)"
   printf '%s\tu1\tinstall\tslug=s\tsecs=300\tok=0\tforced=0\n'      "$snow"
   printf '%s\tu1\tgate\toutcome=ok\trepo=r\tcommit=c\tsecs=50\n'    "$snow"
   printf '%s\tu1\tgate\toutcome=skip\trepo=r\tcommit=c\tsecs=0\n'   "$snow"
+  printf '%s\tu1\tverify\tfails=0\twarns=1\tok=1\n'                 "$snow"  # a type the specialized sections don't know
+  printf '%s\tu1\tfrobnicate\tx=1\n'                               "$snow"  # a type stats has never heard of
   printf '%s\tu1\tinstall\tslug=s\tsecs=999\tok=1\tforced=0\n' "$(( snow - 30*86400 ))"  # out of window
 } > "$SL/events.u1.log"
 sout="$(LEAN_CACHE_LOG_DIR="$SL" "$CLI" stats --since 7 2>/dev/null)"
@@ -1162,6 +1188,11 @@ check "stats: seed hit rate"       "yes" "$(seen "$sout" 'seed +2 applicable, 1 
 check "stats: install durations exclude out-of-window" "yes" \
   "$(seen "$sout" 'install +2 run: 1 ok, 1 fail.*median 200, max 300')"
 check "stats: gate outcomes"       "yes" "$(seen "$sout" 'gate +2 engaged: 1 ok, 1 skip, 0 fail')"
+# The per-event counts must be generic: an event type none of the specialized
+# sections know (verify) and one stats has never heard of (frobnicate) still
+# show up, rather than vanishing.
+check "stats: known-but-unspecialized event counted" "yes" "$(seen "$sout" '^  verify +1$')"
+check "stats: wholly-unknown event counted"          "yes" "$(seen "$sout" '^  frobnicate +1$')"
 
 echo "== verify (hermetic) =="
 # A fresh cache tree with one installed version, planted with one violation per
@@ -1273,6 +1304,32 @@ rm -rf "$VROOT/lakes/.build.v9-1-0.fresh"
 
 check "verify logs a verify event"       "yes" "$(grep -q $'\tverify\t' "$evlog" 2>/dev/null && echo yes || echo no)"
 check "verify event records the clean run" "1" "$(ev_field "$evlog" verify ok)"
+
+echo "== fix-perms (hermetic) =="
+# fix-perms re-normalizes a version tree's permissions — the remedy for verify's
+# group/other-writable FAIL. OWNER == caller here (no sudo), so it runs in place.
+# Plant a group-writable file, confirm verify FAILs, then fix-perms cleans it and
+# verify goes green. run_verify/VROOT are still set up from the section above.
+fpfile="$VROOT/lakes/v9-1-0/packages/mathlib/scripts/bench.txt"
+mkdir -p "$(dirname "$fpfile")"; : > "$fpfile"; chmod g+w "$fpfile"
+rc=0; out="$(run_verify 2>&1)" || rc=$?
+check "drifted group-writable file -> verify FAIL" "1" "$rc"
+check "verify FAIL names fix-perms as the remedy"  "yes" \
+  "$(grep -qi 'fix-perms' <<<"$out" && echo yes || echo no)"
+
+LEAN_CACHE_OWNER="$(id -un)" LEAN_CACHE_ROOT="$VROOT" "$CLI" fix-perms >/dev/null 2>&1
+check "fix-perms cleared the group-writable bit" "no" \
+  "$(find "$VROOT/lakes" -perm -0020 -print -quit | grep -q . && echo yes || echo no)"
+rc=0; out="$(run_verify 2>&1)" || rc=$?
+check "verify green again after fix-perms"       "0" "$rc"
+
+# A single-version fix-perms targets just that version; an unknown version errors.
+chmod g+w "$fpfile"
+LEAN_CACHE_OWNER="$(id -un)" LEAN_CACHE_ROOT="$VROOT" "$CLI" fix-perms v9.1.0 >/dev/null 2>&1
+check "fix-perms <version> cleaned the named version" "no" \
+  "$(find "$VROOT/lakes/v9-1-0" -perm -0020 -print -quit | grep -q . && echo yes || echo no)"
+rc=0; LEAN_CACHE_OWNER="$(id -un)" LEAN_CACHE_ROOT="$VROOT" "$CLI" fix-perms v9.9.9 >/dev/null 2>&1 || rc=$?
+check "fix-perms of an uninstalled version fails"    "1" "$rc"
 
 echo
 if [[ "$fail" -eq 0 ]]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; fi

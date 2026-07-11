@@ -51,6 +51,17 @@ fi
 mkdir -p "$ROOT/lakes" "$ROOT/elan"
 chmod 2755 "$ROOT" "$ROOT/lakes" "$ROOT/elan" 2>/dev/null || true
 
+# --- 2b. Event log dir --------------------------------------------------------
+# Shared, but every user writes only its own events.<user>.log — the same
+# single-writer model as the cache, one writer per file. 3775 = setgid (files
+# inherit $GROUP) + sticky (a group member can create its file but not remove
+# another's), so the dir is safely group-writable. On a single-user host it sits
+# under the owner's own ROOT and just works.
+log "ensuring event log dir $LOG_DIR"
+mkdir -p "$LOG_DIR"
+chgrp "$GROUP" "$LOG_DIR" 2>/dev/null || true
+chmod 3775 "$LOG_DIR" 2>/dev/null || true
+
 # --- 3. Reconcile versions ----------------------------------------------------
 
 if [[ -f "$REPO_DIR/versions" ]]; then

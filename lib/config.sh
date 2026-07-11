@@ -33,6 +33,11 @@ GROUP="${LEAN_CACHE_GROUP:-${GROUP:-$(id -gn)}}"
 ROOT="${LEAN_CACHE_ROOT:-${ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/lean-global-cache}}"
 BIN="${LEAN_CACHE_BIN:-${BIN:-$HOME/.local/bin/lean-cache}}"
 
+# Shared event-log dir. deploy.sh provisions it setgid+sticky so any group
+# member creates its own events.<user>.log but cannot remove another's. Kept in
+# sync with the same default in bin/lean-cache.
+LOG_DIR="${LEAN_CACHE_LOG_DIR:-${LOG_DIR:-$ROOT/log}}"
+
 # Install the transparent `lake` shim ahead of the real lake on PATH? Off by
 # default (plain `lake`); a shared, contended host sets this to 1 to route bare
 # `lake build` through the build-slot policy.

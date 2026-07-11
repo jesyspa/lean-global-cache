@@ -73,6 +73,14 @@ BUILDS="${LEAN_CACHE_BUILDS:-${BUILDS:-${XDG_CACHE_HOME:-$HOME/.cache}/lean-glob
 # this many days ago is pruned. Override with LEAN_CACHE_BUILD_KEEP_DAYS.
 BUILD_KEEP_DAYS="${LEAN_CACHE_BUILD_KEEP_DAYS:-${BUILD_KEEP_DAYS:-7}}"
 
+# Append-only event log (telemetry for the warm-build machinery). The dir is
+# shared like the cache, but every user writes only its OWN file
+# ($LOG_DIR/events.<user>.log), so the single-writer model holds: one writer per
+# file. Same env > config > default precedence as the settings above; deploy.sh
+# provisions the dir setgid+sticky so any group member can create its file but
+# not remove another's. `stats` reads it; nothing else depends on it.
+LOG_DIR="${LEAN_CACHE_LOG_DIR:-${LOG_DIR:-$ROOT/log}}"
+
 # Absolute path the sudoers rule pins; re-exec must use exactly this.
 INSTALLED_SELF="$BIN"
 # Path the installed hooks invoke to refresh the overlay.
@@ -90,6 +98,24 @@ BUILD_BAIL_CODE=75
 
 die()  { echo "$PROG: $*" >&2; exit 1; }
 log()  { echo "==> $*" >&2; }
+
+# Append one event to this user's log file. Line format (tab-separated):
+#   epoch<TAB>user<TAB>event<TAB>key=value<TAB>key=value...
+# The whole line is built first and written with a single `>>`. Logging must
+# never fail or slow a build, a hook, or a push, so every step is guarded and
+# the helper always returns 0: a missing/unwritable dir just drops the event.
+# Values are repo slugs, commits, integers, and small enums — none contain a
+# tab or newline — so the line stays one field-per-value.
+log_event() { # args: event [key=value ...]
+  local event="$1"; shift || return 0
+  local ts user; ts="$(date +%s 2>/dev/null)" || return 0
+  user="$(id -un 2>/dev/null)" || return 0
+  local line="$ts"$'\t'"$user"$'\t'"$event" kv
+  for kv in "$@"; do line+=$'\t'"$kv"; done
+  [[ -d "$LOG_DIR" ]] || mkdir -p "$LOG_DIR" 2>/dev/null || return 0
+  printf '%s\n' "$line" >> "$LOG_DIR/events.$user.log" 2>/dev/null || true
+  return 0
+}
 
 usage() {
   cat >&2 <<EOF
@@ -293,13 +319,16 @@ acquire_build_slot() { # arg: message prefix
       chmod 0666 "$base.$i.lock" 2>/dev/null || true
       if flock -n 8; then
         export LEAN_CACHE_BUILD_SLOT_HELD=1
-        [[ "$waited" -eq 0 ]] || echo "$who: build slot free after ${waited}s — proceeding" >&2
+        # Log only a slot that actually waited; the instant-acquire common case
+        # is not worth an event.
+        [[ "$waited" -eq 0 ]] || { echo "$who: build slot free after ${waited}s — proceeding" >&2; log_event slot wait="$waited" outcome=acquired; }
         return 0
       fi
       exec 8>&-
     done
     if [[ "$waited" -ge "$wait" ]]; then
       echo "$who: no build slot after ${waited}s; proceeding unserialized" >&2
+      log_event slot wait="$waited" outcome=unserialized
       return 0
     fi
     if [[ "$waited" -eq 0 ]]; then
@@ -421,6 +450,7 @@ run_build_policied() { # args: proj who [lake build args...]
       echo "    ${RERUN_HINT:-lake build}"
       echo "  Or set LEAN_CACHE_FORCE_WAIT=1 to block to completion regardless of mode."
     } >&2
+    log_event bail where=build
     exit "$BUILD_BAIL_CODE"
   fi
   acquire_build_slot "$who"
@@ -635,6 +665,19 @@ cmd_fix_filemode() {
   [[ "$found" -eq 1 ]] || log "(no versions installed)"
 }
 
+# EXIT-trap body for cmd_install: clean the temp build tree and log the install
+# event with ok reflecting the exit status, so a failed install (any `die`)
+# records ok=0. Reads the INSTALL_* globals cmd_install sets — the trap fires in
+# global scope after cmd_install has returned, where its locals are gone (the
+# same reason `build` is a global).
+_install_exit() {
+  local rc=$?
+  rm -rf "${build:-}"
+  local ok=1; [[ "$rc" -eq 0 ]] || ok=0
+  log_event install slug="${INSTALL_SLUG:-}" secs="$(( $(date +%s) - ${INSTALL_T0:-0} ))" \
+    ok="$ok" forced="${INSTALL_FORCED:-0}"
+}
+
 cmd_install() {
   local force=0 rest=()
   for a in "$@"; do
@@ -658,6 +701,12 @@ cmd_install() {
     return 0
   fi
   [[ "$force" -eq 1 && -d "$pkgs" ]] && log "$TCVER already installed; --force: rebuilding"
+
+  # Event-log context for the EXIT trap below. Globals on purpose: the trap fires
+  # in global scope (after cmd_install returns), where a local would be invisible
+  # — the same reason `build` below is global. The trap logs the install event on
+  # every exit path, so a failure (any `die`) records ok=0 as well.
+  INSTALL_SLUG="$SLUG"; INSTALL_FORCED="$force"; INSTALL_T0="$(date +%s)"
 
   # Serialize installs of the same version.
   mkdir -p "$LAKES"
@@ -695,7 +744,7 @@ cmd_install() {
   # is atomic. `build` is intentionally NOT `local`: the EXIT trap runs in
   # global scope, where a local would be invisible (and would trip `set -u`).
   build="$(mktemp -d "$LAKES/.build.$SLUG.XXXXXX")"
-  trap 'rm -rf "${build:-}"' EXIT
+  trap _install_exit EXIT
 
   printf '%s\n' "$TOOLCHAIN" > "$build/lean-toolchain"
   cat > "$build/lakefile.toml" <<EOF
@@ -766,9 +815,12 @@ EOF
     mv "$incoming" "$pkgs"          # atomic swap into place
   fi
 
-  rm -rf "$build"; trap - EXIT
+  rm -rf "$build"
   normalize_perms "$dest"
   log "installed $TCVER -> $pkgs"
+  # Leave the EXIT trap set: it fires at process exit with rc=0 and logs the
+  # install event (ok=1). $build is already gone, so its rm -rf is a harmless
+  # no-op.
 }
 
 cmd_uninstall() {
@@ -855,7 +907,7 @@ cmd_use() {
   set -- ${rest[@]+"${rest[@]}"}
   [[ $# -le 2 ]] || usage
 
-  local version="" proj="."
+  local version="" proj="." auto_installed=0
   # Args: [version] [path]. A single arg is a path if it's an existing dir or
   # ".", otherwise a version. (Two args are unambiguous: version then path.)
   if [[ $# -ge 1 ]]; then
@@ -898,6 +950,7 @@ cmd_use() {
         exit "$BUILD_BAIL_CODE"
       fi
       log "$TCVER not installed; provisioning it into the shared cache (first use)"
+      auto_installed=1
       "$INSTALLED_SELF" install "$TCVER" \
         || die "auto-install of $TCVER failed; run: $PROG install $TCVER"
       [[ -d "$shared" ]] \
@@ -937,6 +990,10 @@ cmd_use() {
   # read them without a "dubious ownership" abort that triggers a re-clone.
   register_safe_dirs
   install_hooks "$proj"
+  # The overlay was (re)built for the acting user, so attribute the event to
+  # them; auto_install records whether this use triggered a first-time install
+  # (which lands its own install event in OWNER's file).
+  log_event use slug="$SLUG" auto_install="$auto_installed"
   # Seed a warm project build if one is stored for this exact (commit, slug).
   # A no-op when none is stored.
   cmd_seed_build "$proj" || true
@@ -1022,7 +1079,10 @@ cmd_seed_build() {
   normalize_version "$(cat "$proj/lean-toolchain")"
 
   local store; store="$(build_store_for "$proj" "$commit" "$SLUG")" || return 0
-  [[ -d "$store/lib" ]] || return 0           # no warm build stored for this exact (commit, slug)
+  if [[ ! -d "$store/lib" ]]; then            # no warm build stored for this exact (commit, slug)
+    log_event seed hit=0 repo="$(repo_identity "$proj")" commit="${commit:0:12}" slug="$SLUG"
+    return 0
+  fi
 
   # Safety: only hardlink out of a store we own and that is not group/other
   # writable — otherwise a hardlinked artifact could be mutated underneath a
@@ -1039,6 +1099,7 @@ cmd_seed_build() {
   rm -rf "$proj/.lake/build/lib" "$proj/.lake/build/ir"
   seed_tree "$store/lib" "$proj/.lake/build/lib"
   seed_tree "$store/ir"  "$proj/.lake/build/ir"
+  log_event seed hit=1 repo="$(repo_identity "$proj")" commit="${commit:0:12}" slug="$SLUG"
   log "seeded warm build for $TCVER @ ${commit:0:12} into $proj/.lake/build"
 }
 
@@ -1083,6 +1144,7 @@ cmd_publish_build() {
   tree_clean_for_build "$proj" \
     || die "refusing to publish a dirty tree; commit your changes first"
 
+  local pub_t0; pub_t0="$(date +%s)"
   log "building $proj before publishing (this can take minutes)"
   acquire_build_slot "$PROG publish-build"
   # A failed build is still publishable: its .lake/build holds honest olean/trace
@@ -1106,6 +1168,7 @@ cmd_publish_build() {
   # switch off the gate's skip. Leave the stored green build in place, and never
   # fail the caller (a push must not be affected).
   if [[ "$green" -eq 0 ]] && grep -qx 'tree_clean=1' "$store/.seed-manifest" 2>/dev/null; then
+    log_event publish repo="$(repo_identity "$proj")" commit="${commit:0:12}" slug="$SLUG" green="$green" secs=$(( $(date +%s) - pub_t0 ))
     log "keeping stored green build for $TCVER @ ${commit:0:12}; not overwriting with a non-green build"
     return 0
   fi
@@ -1123,6 +1186,7 @@ cmd_publish_build() {
 
   rm -rf "$store"
   mv "$incoming" "$store"
+  log_event publish repo="$(repo_identity "$proj")" commit="${commit:0:12}" slug="$SLUG" green="$green" secs=$(( $(date +%s) - pub_t0 ))
   log "published $([[ "$green" -eq 1 ]] && echo green || echo non-green) build for $TCVER @ ${commit:0:12} -> $store"
 
   # Rotate this repo's store: the build just published is now "latest" and is
@@ -1302,7 +1366,7 @@ cmd_pre_push_gate() {
   # never take the cold-build bail path.
   export LEAN_CACHE_FORCE_WAIT=1
   local remote="${1:-}" root head changed new base parent f tip know
-  local gate=0 undecided=0 ungated=""
+  local gate=0 undecided=0 ungated="" gate_t0=0
   root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
   [[ -f "$root/lakefile.toml" || -f "$root/lakefile.lean" ]] || exit 0
   head="$(git rev-parse -q --verify HEAD 2>/dev/null || true)"
@@ -1357,6 +1421,7 @@ cmd_pre_push_gate() {
        && [[ "$(stat -c '%U' "$store" 2>/dev/null)" == "$(id -un)" ]] \
        && grep -qx 'tree_clean=1' "$store/.seed-manifest" 2>/dev/null; then
       echo "lean push gate: green build already stored for HEAD (${head:0:12}, $slug) — skipping the gate build" >&2
+      log_event gate outcome=skip repo="$(repo_identity "$root")" commit="${head:0:12}" secs=0
       exit 0
     fi
   fi
@@ -1379,9 +1444,11 @@ cmd_pre_push_gate() {
   # checkout, so Lake sees a bogus URL mismatch and tries to re-clone the
   # (read-only, cache-symlinked) package. run_lake_build scrubs the injected
   # vars so the gate build matches a plain interactive lake build.
+  gate_t0="$(date +%s)"
   acquire_build_slot "lean push gate"
   run_lake_build "$root" "lean push gate" \
-    || { echo 'lean push gate: lake build FAILED — push aborted (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; exit 1; }
+    || { echo 'lean push gate: lake build FAILED — push aborted (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; log_event gate outcome=fail repo="$(repo_identity "$root")" commit="${head:0:12}" secs=$(( $(date +%s) - gate_t0 )); exit 1; }
+  log_event gate outcome=ok repo="$(repo_identity "$root")" commit="${head:0:12}" secs=$(( $(date +%s) - gate_t0 ))
   echo 'lean push gate: build OK — allowing push' >&2
   # The full build just passed, so .lake/build is a complete warm build for this
   # exact commit — capture it for reuse now. publish-build's own `lake build` is

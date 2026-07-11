@@ -168,7 +168,12 @@ Usage: $PROG <command> [args]
   prune-builds [--keep-days N]
                         Rotate the warm-build store: keep the newest build per
                         (repo, toolchain) indefinitely, drop any other older than
-                        N days (default $BUILD_KEEP_DAYS). Runs after each publish.
+                        N days (default $BUILD_KEEP_DAYS). Runs after each publish,
+                        and opportunistically (at most once a day) at the end of
+                        \`use\`.
+  slots                 Report the state of the host build slots (free/held, and
+                        the holder when it can be identified) — answers "why is
+                        my build queued". Read-only, no privilege.
   pre-push-gate <remote>
                         Run the push build gate (reads the pushed ref list on
                         stdin). On a clean gate build it also publishes the warm
@@ -314,6 +319,16 @@ tree_clean_for_build() { # arg: proj
   return 0
 }
 
+# Resolve the build-slot count and lock-file base path. Both acquire_build_slot
+# and the read-only `slots` command need these, and they must never disagree
+# about where the locks live — so this is the one place the strings live.
+# Sets BUILD_SLOT_COUNT and BUILD_SLOT_BASE.
+build_slot_config() {
+  BUILD_SLOT_COUNT="${LEAN_CACHE_BUILD_SLOTS:-${BUILD_SLOTS:-2}}"
+  [[ "$BUILD_SLOT_COUNT" =~ ^[0-9]+$ ]] || BUILD_SLOT_COUNT=2
+  BUILD_SLOT_BASE="${LEAN_CACHE_BUILD_LOCK_DIR:-${TMPDIR:-/tmp}}/lean-cache-build-slot"
+}
+
 # Acquire one of the host-wide build slots (world-openable lock files under
 # /tmp), so at most LEAN_CACHE_BUILD_SLOTS heavy `lake build`s run concurrently
 # host-wide and each gets real parallelism instead of all of them thrashing a
@@ -326,12 +341,11 @@ tree_clean_for_build() { # arg: proj
 acquire_build_slot() { # arg: message prefix
   [[ -n "${LEAN_CACHE_BUILD_SLOT_HELD:-}" ]] && return 0
   local who="${1:-$PROG}" slots wait base i waited=0
-  slots="${LEAN_CACHE_BUILD_SLOTS:-${BUILD_SLOTS:-2}}"
+  build_slot_config
+  slots="$BUILD_SLOT_COUNT"; base="$BUILD_SLOT_BASE"
   wait="${LEAN_CACHE_BUILD_WAIT:-${BUILD_WAIT:-3600}}"
-  [[ "$slots" =~ ^[0-9]+$ ]] || slots=2
   [[ "$slots" -gt 0 ]] || return 0
   [[ "$wait" =~ ^[0-9]+$ ]] || wait=3600
-  base="${LEAN_CACHE_BUILD_LOCK_DIR:-${TMPDIR:-/tmp}}/lean-cache-build-slot"
   while :; do
     for ((i = 0; i < slots; i++)); do
       # Brace group: the 2>/dev/null must scope to this open only — putting it
@@ -360,6 +374,52 @@ acquire_build_slot() { # arg: message prefix
     fi
     sleep 15; waited=$((waited + 15))
   done
+}
+
+# Read-only, unprivileged: report the state of the host build slots — answers
+# "why is my build queued". Reuses build_slot_config, so this can never
+# disagree with acquire_build_slot about where the locks live or how many
+# there are. A slot is "held" when a non-blocking flock probe on its lock file
+# fails; the probe opens on a private fd and releases immediately either way,
+# so it never leaves a slot held past this command. Best-effort identifies a
+# held slot's holder via `fuser -v`, degrading silently when fuser isn't
+# installed (or the lock file can't even be opened). Always exits 0.
+cmd_slots() {
+  [[ $# -eq 0 ]] || usage
+  build_slot_config
+  local slots="$BUILD_SLOT_COUNT" base="$BUILD_SLOT_BASE"
+  if [[ "$slots" -le 0 ]]; then
+    echo "build serialization disabled (LEAN_CACHE_BUILD_SLOTS=0)"
+    return 0
+  fi
+  echo "build slots: $slots configured ($base.N.lock)"
+  local i lock state holder
+  for ((i = 0; i < slots; i++)); do
+    lock="$base.$i.lock"
+    state="free"; holder=""
+    if [[ -e "$lock" ]]; then
+      if { exec 9>>"$lock"; } 2>/dev/null; then
+        if flock -n 9; then
+          flock -u 9
+        else
+          state="held"
+          if command -v fuser >/dev/null 2>&1; then
+            holder="$(fuser -v "$lock" 2>&1 | tail -n +2 | head -1 \
+                       | sed -e 's/^[^:]*: *//' -e 's/^ *//' -e 's/ *$//')" || true
+          fi
+        fi
+        exec 9>&-
+      else
+        state="unknown"
+      fi
+    fi
+    if [[ "$state" == held && -n "$holder" ]]; then
+      echo "  slot $i: held ($holder)"
+    else
+      echo "  slot $i: $state"
+    fi
+  done
+  return 0
 }
 
 # Resolve the real `lake` binary, skipping our own `lake` shim wherever it sits
@@ -1132,6 +1192,21 @@ cmd_use() {
   # Seed a warm project build if one is stored for this exact (commit, slug).
   # A no-op when none is stored.
   cmd_seed_build "$proj" || true
+
+  # Opportunistic prune: the store is otherwise only rotated by publish-build,
+  # so a repo that stops being published to keeps its stale non-latest builds
+  # forever unless something crons prune-builds. `use` is a much lower-frequency
+  # path than refresh/seed-build (the git-hook path), so piggyback here instead,
+  # at most once a day via a stamp file. A fresh stamp is one stat and prints
+  # nothing, so this never changes `use`'s output on the common day-fresh path.
+  if [[ -d "$BUILDS" ]]; then
+    local prune_stamp="$BUILDS/.last-prune" prune_stamp_age
+    prune_stamp_age="$(stat -c %Y "$prune_stamp" 2>/dev/null || echo 0)"
+    if [[ $(( $(date +%s) - prune_stamp_age )) -ge 86400 ]]; then
+      cmd_prune_builds || true
+      touch "$prune_stamp" 2>/dev/null || true
+    fi
+  fi
 }
 
 # Print the cache slug embedded in the live overlay's mathlib symlink, or
@@ -1790,6 +1865,7 @@ case "$cmd" in
   publish-build) cmd_publish_build "$@" ;;
   build)        cmd_build         "$@" ;;
   prune-builds) cmd_prune_builds  "$@" ;;
+  slots)        cmd_slots         "$@" ;;
   fix-filemode) cmd_fix_filemode  "$@" ;;
   pre-push-gate) cmd_pre_push_gate "$@" ;;
   commit-hint)  cmd_commit_hint   "$@" ;;

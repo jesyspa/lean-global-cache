@@ -30,6 +30,7 @@ lean-cache publish-build [path]  # store this project's warm build for reuse
 lean-cache build [--wait] [path] [args]  # lake build under the shared build policy
 lean-cache clean [path]          # wipe .lake/build (cold-reset a reused worktree)
 lean-cache prune-builds [--keep-days N]  # rotate the warm-build store
+lean-cache slots                 # report host build-slot state (free/held)
 lean-cache list                  # installed versions + sizes
 lean-cache resolve <version>     # show normalized toolchain/rev/slug
 lean-cache config                # show resolved owner/group/root/builds/bin
@@ -116,7 +117,9 @@ The store is rotated automatically: `publish-build` keeps the newest build per
 `(repo, toolchain)` indefinitely (that is "latest main") and drops any older one
 past a window (`LEAN_CACHE_BUILD_KEEP_DAYS`, default 7). `lean-cache prune-builds
 [--keep-days N]` applies the same policy across the whole store on demand (cron-
-friendly).
+friendly). `use` also rotates the store opportunistically (at most once a day),
+so a repo that stops being published to doesn't accumulate stale builds forever
+even with no cron in place.
 
 ### Pre-push build gate
 
@@ -164,6 +167,8 @@ build`) to block to completion regardless of mode; the pre-push gate and
 `publish-build` force-wait internally, since they must complete synchronously. A
 build riding a parent's slot (`LEAN_CACHE_BUILD_SLOT_HELD`) completes in place —
 no second slot, no bail. `LEAN_CACHE_BUILD_SLOTS=0` disables serialization.
+`lean-cache slots` reports which slots are free or held (and the holder, when
+it can be identified) — read-only, for answering "why is my build queued".
 
 Before either path runs, the build policy also checks the project's package
 overlay: if a shared-cache symlink under `.lake/packages` has gone dangling

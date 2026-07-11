@@ -404,6 +404,54 @@ check "force-wait overrides the foreground use bail"       "0" "$rc"
 check "force-wait foreground use provisioned the version"  "yes" \
   "$(has_dir "$TMP/cache/lakes/v4-57-0/packages")"
 
+echo "== slots (hermetic) =="
+# `slots` is read-only: probe each lock file with a non-blocking flock and
+# report free/held (holder identification is best-effort and not asserted
+# here). Uses its own lock dir so it never collides with a concurrent test's
+# slot locks.
+SLOTS_DIR="$TMP/slotsdir"; mkdir -p "$SLOTS_DIR"
+slots_cli() { LEAN_CACHE_BUILD_LOCK_DIR="$SLOTS_DIR" LEAN_CACHE_BUILD_SLOTS=2 "$CLI" slots 2>&1; }
+
+out="$(slots_cli)"; rc=$?
+check "slots exits 0 with no locks yet"      "0" "$rc"
+check "slots reports the configured count"   "yes" \
+  "$(printf '%s' "$out" | grep -q '^build slots: 2 configured' && echo yes || echo no)"
+check "slots reports slot 0 free"            "yes" \
+  "$(printf '%s' "$out" | grep -qE '^  slot 0: free' && echo yes || echo no)"
+check "slots reports slot 1 free"            "yes" \
+  "$(printf '%s' "$out" | grep -qE '^  slot 1: free' && echo yes || echo no)"
+
+# Hold slot 0 from a background subshell, then assert the probe sees it held.
+flock "$SLOTS_DIR/lean-cache-build-slot.0.lock" sleep 20 &
+slocker=$!
+until ! flock -n "$SLOTS_DIR/lean-cache-build-slot.0.lock" true 2>/dev/null; do sleep 0.1; done
+out="$(slots_cli)"; rc=$?
+check "slots exits 0 even with a held slot"  "0" "$rc"
+check "slots sees the held slot"             "yes" \
+  "$(printf '%s' "$out" | grep -qE '^  slot 0: held' && echo yes || echo no)"
+check "slots leaves the other slot free"     "yes" \
+  "$(printf '%s' "$out" | grep -qE '^  slot 1: free' && echo yes || echo no)"
+# The probe must release immediately (never leave the fd held past the
+# command): a second run sees the same real holder still holding it, not a
+# lock our own probe accidentally released or left held.
+out2="$(slots_cli)"
+check "slots probe doesn't disturb the real holder's lock" "yes" \
+  "$(printf '%s' "$out2" | grep -qE '^  slot 0: held' && echo yes || echo no)"
+# flock(1) forks: kill the child actually holding the lock (killing only the
+# wrapper leaves an orphaned sleep pinning the slot), then the wrapper itself.
+# Plain kill by pid — pkill is unreliable here (shimmed on some hosts).
+kill $(ps -o pid= --ppid "$slocker" 2>/dev/null) 2>/dev/null || true
+kill "$slocker" 2>/dev/null || true; wait "$slocker" 2>/dev/null || true
+
+out="$(slots_cli)"
+check "slots sees the slot free again after release" "yes" \
+  "$(printf '%s' "$out" | grep -qE '^  slot 0: free' && echo yes || echo no)"
+
+out="$(LEAN_CACHE_BUILD_LOCK_DIR="$SLOTS_DIR" LEAN_CACHE_BUILD_SLOTS=0 "$CLI" slots 2>&1)"; rc=$?
+check "SLOTS=0 reports serialization disabled" "yes" \
+  "$(printf '%s' "$out" | grep -q 'disabled' && echo yes || echo no)"
+check "SLOTS=0 slots exits 0"                   "0" "$rc"
+
 echo "== build seeding & push gate (hermetic) =="
 # No real Lean here: a stub `lake` stands in for the build so publish/seed and
 # the push gate can be exercised without the toolchain or the network. The store
@@ -1010,6 +1058,35 @@ check "rotation keeps non-latest within window"  "yes" "$(exists "$RB/midcommit/
 check "rotation drops non-latest past window"    "no"  "$(exists "$RB/oldcommit/v9-9-9")"
 check "rotation keeps lone latest even if old"   "yes" "$(exists "$RB/loneold/v8-8-8")"
 check "rotation removes emptied commit dir"      "no"  "$(exists "$RB/oldcommit")"
+
+echo "== opportunistic prune on use (hermetic) =="
+# `use` rotates the whole build store at most once a day, guarded by a stamp
+# file, so a store that stops being published to doesn't accumulate stale
+# builds forever without a cron'd prune-builds. Reuses mkbuild/exists from the
+# rotation section above; $B (pinned v4.31.0, already `use`d earlier) is a
+# project `use` can run against without any stub lake.
+UP="$LEAN_CACHE_BUILDS/use-prune-repo"
+mkbuild "$UP" upnew v9-9-9 0     # newest -> keep
+mkbuild "$UP" upold v9-9-9 10    # non-latest, past the 7-day window -> prune
+prune_stamp="$LEAN_CACHE_BUILDS/.last-prune"
+rm -f "$prune_stamp"
+
+"$CLI" use "$B" >/dev/null 2>&1
+check "use with no stamp prunes the store"         "no"  "$(exists "$UP/upold/v9-9-9")"
+check "use with no stamp creates the stamp"        "yes" "$([[ -f "$prune_stamp" ]] && echo yes || echo no)"
+
+# A fresh stamp (just written above): a newly-eligible stale build is left alone.
+mkbuild "$UP" upnew2 v8-8-8 0
+mkbuild "$UP" upold2 v8-8-8 10
+"$CLI" use "$B" >/dev/null 2>&1
+check "use with a fresh stamp skips pruning"       "yes" "$(exists "$UP/upold2/v8-8-8")"
+
+# An old stamp (>1 day) triggers another prune, and refreshes the stamp.
+touch -d "@$(( $(date +%s) - 90000 ))" "$prune_stamp"
+"$CLI" use "$B" >/dev/null 2>&1
+check "use with a stale stamp prunes again"        "no"  "$(exists "$UP/upold2/v8-8-8")"
+check "use with a stale stamp refreshes the stamp" "yes" \
+  "$([[ -n "$(find "$prune_stamp" -mtime -1 2>/dev/null)" ]] && echo yes || echo no)"
 
 echo "== event log & stats (hermetic) =="
 # Redirect the event log to a throwaway dir and drive a use/seed/publish/gate

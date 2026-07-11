@@ -641,7 +641,10 @@ Standard hostbot deploy-handler repo. `deploy.sh` (as `OWNER`):
 resolution unit tests, validation-rejects-junk tests, the overlay/hooks
 scenarios, the build-seeding + push-gate scenarios, the warm/cold build-policy
 scenarios (warm runs unslotted, cold serializes, foreground bails, background /
-force-wait / slot-held build to completion), the `lake` shim scenarios
+force-wait / slot-held build to completion), the `slots` scenarios (a held lock
+probes as held without the probe itself holding it, a released one probes free
+again), the opportunistic-prune-on-use scenarios (an absent or stale stamp
+prunes and refreshes the stamp, a fresh stamp skips), the `lake` shim scenarios
 (non-build passthrough, build delegation, no self-recursion), the event-log
 scenarios (events written with the right fields across a use/seed/publish/gate
 flow, an unwritable log dir does not break the command, and `stats` summarizes a
@@ -666,9 +669,13 @@ step.
 - **Disk.** Each version is ~7–9 GB. No automatic GC; `uninstall` is manual.
 - **Build store rotation.** The warm-build store keeps the newest build per
   (repo, toolchain) indefinitely and drops other builds past `BUILD_KEEP_DAYS`
-  (default 7), rotated after each `publish-build` and on demand via
-  `prune-builds`. There is no scheduled sweep — a store that stops being
-  published to keeps its last build; a cron `prune-builds` covers that if wanted.
+  (default 7), rotated after each `publish-build`, on demand via `prune-builds`,
+  and opportunistically at the end of `use` (at most once a day, guarded by a
+  `$BUILDS/.last-prune` stamp file) — so a repo that stops being published to
+  still gets swept the next time anyone `use`s it, with no cron required. A
+  store no one ever `use`s again (and that stopped being published to) still
+  keeps its last build indefinitely; a cron `prune-builds` covers that
+  edge case if wanted.
 - **Toolchain removal.** `uninstall` removes both a version's lake cache and its
   elan toolchain, independently and idempotently — a re-run on a half-removed
   version finishes whichever side is left. It skips the toolchain (with a note)

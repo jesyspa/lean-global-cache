@@ -139,19 +139,14 @@ Usage: $PROG <command> [args]
                         (CLAUDE_BASH_MODE=foreground) it bails with re-run
                         instructions rather than start the multi-minute install.
                         Also installs the overlay git hooks.
-  refresh [--force-discard] [path]
-                        Re-overlay only if the live overlay's toolchain differs
+  refresh [path]        Re-overlay only if the live overlay's toolchain differs
                         from the project's lean-toolchain (a cheap no-op
-                        otherwise). This is what the git hooks call. Preserves an
-                        existing .lake/build; --force-discard lets seeding
-                        replace it with the stored snapshot.
-  seed-build [--force-discard] [path]
-                        Seed .lake/build from a stored warm build when HEAD
-                        exactly matches a stored (commit, toolchain) build. Only
-                        warms a cold worktree: a populated .lake/build is left
-                        untouched unless --force-discard is given. A no-op when
-                        no build is stored. Called automatically by \`use\` /
-                        \`refresh\` / the post-checkout hook.
+                        otherwise). This is what the git hooks call.
+  seed-build [path]     Seed .lake/build from a stored warm build when HEAD
+                        exactly matches a stored (commit, toolchain) build,
+                        replacing any existing build. A no-op when none is
+                        stored. Called automatically by \`use\` / \`refresh\` /
+                        the post-checkout hook.
   publish-build [path]  Build the project to completion and store its warm
                         .lake/build for the current (commit, toolchain), so
                         future fresh worktrees can be seeded from it.
@@ -306,16 +301,6 @@ seed_tree() { # args: src dst
       cp -p "$f" "$dst$rel"; chmod u+w "$dst$rel"
     fi
   done < <(find "$src" -type f -print0)
-}
-
-# True when the worktree already holds compiled build artifacts (oleans) that a
-# reseed would overwrite. Seeding warms a *cold* worktree; once a build exists,
-# replacing it with the stored snapshot throws away whatever the worktree built
-# past that snapshot (a stored non-green build is only a partial). So a reseed
-# skips a populated build unless --force-discard is given.
-build_populated() { # arg: proj
-  [[ -d "$1/.lake/build/lib" ]] || return 1
-  find "$1/.lake/build/lib" -name '*.olean' -print -quit 2>/dev/null | grep -q .
 }
 
 # True when the worktree carries nothing that could make its build differ from
@@ -1165,7 +1150,6 @@ cmd_use() {
   for a in "$@"; do
     case "$a" in
       --clean) clean=1 ;;
-      --force-discard) export LEAN_CACHE_FORCE_DISCARD=1 ;;
       *) rest+=("$a") ;;
     esac
   done
@@ -1316,14 +1300,6 @@ overlay_broken() { # arg: proj
 # yet). On a match this is a one-symlink-read no-op, which is what makes it safe
 # to call from a high-frequency hook. A non-Lean project is silently skipped.
 cmd_refresh() {
-  local rest=()
-  for a in "$@"; do
-    case "$a" in
-      --force-discard) export LEAN_CACHE_FORCE_DISCARD=1 ;;
-      *) rest+=("$a") ;;
-    esac
-  done
-  set -- ${rest[@]+"${rest[@]}"}
   [[ $# -le 1 ]] || usage
   export LEAN_CACHE_NO_HOOK=1
   local proj="${1:-.}"
@@ -1352,26 +1328,13 @@ cmd_refresh() {
 # The stored tree is an honest snapshot of this exact commit: every olean is
 # paired with its own true trace, so a green publish carries a full build and a
 # non-green publish carries a consistent partial one (built pairs up to the
-# failure, still-honest older pairs beyond it). lake re-elaborates any module
-# whose source or dependencies differ after seeding, so a seeded build can't be
-# a false green. Safe to call from a hook.
-#
-# Seeding only warms a *cold* worktree: if .lake/build already holds compiled
-# oleans, this leaves them untouched (a no-op) rather than discard work the
-# worktree built past the stored snapshot — a stored non-green build is only a
-# partial, so replacing a fuller local build with it is pure loss. Pass
-# --force-discard (or set LEAN_CACHE_FORCE_DISCARD=1) to replace an existing
-# build with the stored one. When the destructive replace does run, it drops
-# .lake/build/lib+ir first so a stale leftover leaves no orphan oleans behind.
+# failure, still-honest older pairs beyond it). Either way lake re-elaborates
+# any module whose source or dependencies differ after seeding, so we replace
+# whatever .lake/build holds (typically a stale leftover from a reused worktree)
+# rather than preserving it: the replacement can't be a false green, and
+# preserving a stale build is what forces a needless full rebuild. Safe to call
+# from a hook.
 cmd_seed_build() {
-  local rest=()
-  for a in "$@"; do
-    case "$a" in
-      --force-discard) export LEAN_CACHE_FORCE_DISCARD=1 ;;
-      *) rest+=("$a") ;;
-    esac
-  done
-  set -- ${rest[@]+"${rest[@]}"}
   [[ $# -le 1 ]] || usage
   local proj="${1:-.}"
   proj="$(cd "$proj" 2>/dev/null && pwd)" || return 0
@@ -1379,14 +1342,6 @@ cmd_seed_build() {
   local commit; commit="$(git -C "$proj" rev-parse HEAD 2>/dev/null)" || return 0
   [[ -n "$commit" ]] || return 0
   normalize_version "$(cat "$proj/lean-toolchain")"
-
-  # Never clobber an existing build unless explicitly forced: refresh calls this
-  # from the git-hook path on every checkout, and a worktree's own build is work
-  # to preserve, not to overwrite.
-  if [[ -z "${LEAN_CACHE_FORCE_DISCARD:-}" ]] && build_populated "$proj"; then
-    log_event seed hit=0 skip=populated repo="$(repo_identity "$proj")" commit="${commit:0:12}" slug="$SLUG"
-    return 0
-  fi
 
   local store; store="$(build_store_for "$proj" "$commit" "$SLUG")" || return 0
   if [[ ! -d "$store/lib" ]]; then            # no warm build stored for this exact (commit, slug)

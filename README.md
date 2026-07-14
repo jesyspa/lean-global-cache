@@ -24,8 +24,8 @@ lean-cache uninstall <version>   # remove a version's lake cache and elan toolch
 lean-cache set-default-toolchain <version>  # default for bare lean/lake outside a project
 lean-cache link <version>        # print the packages path to symlink against
 lean-cache use [version] [path]  # set up .lake/packages in a project
-lean-cache refresh [--force-discard] [path]    # re-overlay only if the toolchain changed
-lean-cache seed-build [--force-discard] [path] # seed a cold .lake/build from a stored warm build
+lean-cache refresh [path]        # re-overlay only if the toolchain changed
+lean-cache seed-build [path]     # seed .lake/build from a stored warm build
 lean-cache publish-build [path]  # store this project's warm build for reuse
 lean-cache build [--wait] [path] [args]  # lake build under the shared build policy
 lean-cache clean [path]          # wipe .lake/build (cold-reset a reused worktree)
@@ -105,12 +105,9 @@ lake build                         # re-elaborates only the files you edit
 the worktree's HEAD exactly matches a stored build's commit and the toolchain
 matches; on any mismatch it seeds nothing and the normal cold/incremental build
 runs, so a stale build can never replay as a false green. When HEAD does match,
-seeding only warms a *cold* worktree: if `.lake/build` already holds compiled
-oleans they are left untouched, since the hook path runs on every checkout and a
-worktree's own build is work to keep, not to overwrite (a stored non-green build
-is only a partial). Pass `--force-discard` to `seed-build`/`refresh`/`use` (or
-set `LEAN_CACHE_FORCE_DISCARD=1`) to replace an existing build with the stored
-snapshot; Lake still re-elaborates any module you have since edited. Oleans are hardlinked from the read-only store (so they cost no disk and
+seeding replaces any `.lake/build` already present (a reused worktree's stale
+leftover is exactly what otherwise forces a needless full rebuild); Lake still
+re-elaborates any module you have since edited. Oleans are hardlinked from the read-only store (so they cost no disk and
 can't be mutated through the worktree — a rebuild replaces the link with a fresh
 file); the small bookkeeping files Lake rewrites in place are copied. The store
 lives under `~/.cache/lean-global-cache/builds` by default (`LEAN_CACHE_BUILDS`

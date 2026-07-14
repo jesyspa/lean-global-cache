@@ -527,18 +527,26 @@ qti="$(inode "$Q/.lake/build/lib/lean/Proj/A.trace")"
 check "seeded trace is a writable copy (not the store inode)" "yes" \
   "$([[ -n "$qti" && "$qti" != "$(inode "$store/lib/lean/Proj/A.trace")" ]] && echo yes || echo no)"
 
-# Replace, not preserve: a stale leftover build (wrong content + an orphan olean
-# absent from the store) is fully overwritten by the stored build at this commit.
+# Preserve by default: a populated build is left untouched, so a reseed never
+# discards work the worktree built past the stored snapshot.
 rm -rf "$Q/.lake/build/lib" "$Q/.lake/build/ir"
 mkdir -p "$Q/.lake/build/lib/lean/Proj"
-printf 'STALE-A' > "$Q/.lake/build/lib/lean/Proj/A.olean"
-printf 'ORPHAN'  > "$Q/.lake/build/lib/lean/Proj/Z.olean"
+printf 'LOCAL-A' > "$Q/.lake/build/lib/lean/Proj/A.olean"
+printf 'EXTRA'   > "$Q/.lake/build/lib/lean/Proj/Z.olean"
 "$CLI" seed-build "$Q" >/dev/null 2>&1
-check "re-seed overwrote the stale olean"      "OLEAN-A" \
+check "seed-build preserves a populated build" "LOCAL-A" \
   "$(cat "$Q/.lake/build/lib/lean/Proj/A.olean" 2>/dev/null)"
-check "re-seed hardlinked the fresh olean to store" "$(inode "$store/lib/lean/Proj/A.olean")" \
+check "seed-build kept the local-only olean"   "yes" \
+  "$([[ -e "$Q/.lake/build/lib/lean/Proj/Z.olean" ]] && echo yes || echo no)"
+
+# --force-discard replaces: the stale build (wrong content + an orphan olean
+# absent from the store) is fully overwritten by the stored build at this commit.
+"$CLI" seed-build --force-discard "$Q" >/dev/null 2>&1
+check "force-discard overwrote the stale olean" "OLEAN-A" \
+  "$(cat "$Q/.lake/build/lib/lean/Proj/A.olean" 2>/dev/null)"
+check "force-discard hardlinked the fresh olean to store" "$(inode "$store/lib/lean/Proj/A.olean")" \
                                               "$(inode "$Q/.lake/build/lib/lean/Proj/A.olean")"
-check "re-seed dropped the orphan olean"       "no" \
+check "force-discard dropped the orphan olean"  "no" \
   "$([[ -e "$Q/.lake/build/lib/lean/Proj/Z.olean" ]] && echo yes || echo no)"
 
 # Safety: on a commit mismatch, seed NOTHING (never approximate a stale build).
@@ -551,14 +559,24 @@ check "seed-build no-ops on commit mismatch"   "0" \
   "$(find "$R/.lake/build" -name '*.olean' 2>/dev/null | wc -l)"
 
 # refresh seeds the new HEAD even when the overlay slug is already current: a
-# checkout can land on a published commit without changing the overlay, yet must
-# still pull in the warm build for that commit.
+# fresh checkout can land on a published commit without changing the overlay, yet
+# must still pull in the warm build for that (cold) worktree.
 "$CLI" use "$P" >/dev/null 2>&1                   # overlay current for v4-30-0
-rm -rf "$P/.lake/build/lib" "$P/.lake/build/ir"
-mkdir -p "$P/.lake/build/lib/lean/Proj"
-printf 'STALE-A' > "$P/.lake/build/lib/lean/Proj/A.olean"
+rm -rf "$P/.lake/build/lib" "$P/.lake/build/ir"   # cold worktree
 "$CLI" refresh "$P" >/dev/null 2>&1
-check "refresh seeds when overlay already current" "OLEAN-A" \
+check "refresh seeds a cold worktree when overlay current" "OLEAN-A" \
+  "$(cat "$P/.lake/build/lib/lean/Proj/A.olean" 2>/dev/null)"
+
+# refresh must NOT throw away a populated build (the default): the hook path runs
+# on every checkout, so a worktree carrying its own build keeps it; only
+# --force-discard reseeds over it.
+rm -f "$P/.lake/build/lib/lean/Proj/A.olean"
+printf 'MINE-A' > "$P/.lake/build/lib/lean/Proj/A.olean"
+"$CLI" refresh "$P" >/dev/null 2>&1
+check "refresh preserves a populated build"    "MINE-A" \
+  "$(cat "$P/.lake/build/lib/lean/Proj/A.olean" 2>/dev/null)"
+"$CLI" refresh --force-discard "$P" >/dev/null 2>&1
+check "refresh --force-discard reseeds over it" "OLEAN-A" \
   "$(cat "$P/.lake/build/lib/lean/Proj/A.olean" 2>/dev/null)"
 
 # clean wipes .lake/build (cold reset) but leaves the package overlay in place.
@@ -1146,7 +1164,9 @@ PATH="$STUB:$PATH" "$CLI" publish-build "$EV" >/dev/null 2>&1
 check "publish event green=1"                  "1" "$(ev_field "$evlog" publish green)"
 check "publish event records the short commit" "${evcommit:0:12}" "$(ev_field "$evlog" publish commit)"
 
-# seed: now a build is stored for this exact commit, so seeding HITS.
+# seed: now a build is stored for this exact commit, so seeding a cold worktree
+# HITS (a populated build would be preserved and log a miss instead).
+rm -rf "$EV/.lake/build/lib" "$EV/.lake/build/ir"
 "$CLI" seed-build "$EV" >/dev/null 2>&1
 check "seed hit logged after a matching publish" "1" "$(ev_field "$evlog" seed hit)"
 

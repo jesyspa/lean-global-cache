@@ -219,10 +219,10 @@ The check deliberately does **not** fire on a project with no overlay yet
 and forcing one into existence on every cold build would both mis-provision a
 project with no shared-cache dependency and, worse, risk masking the fact that
 the hooks never ran. It also must never be unconditional: `use`'s own
-`seed-build` replaces `.lake/build/{lib,ir}` when the worktree's HEAD matches
-a stored build, which is exactly the incremental build state a plain `lake
-build` must never disturb — so the repair is gated strictly on an actual
-dangling symlink, never run on the common warm/incremental path.
+`seed-build` touches `.lake/build/{lib,ir}`, which is exactly the incremental
+build state a plain `lake build` must never disturb — so the repair is gated
+strictly on an actual dangling symlink, never run on the common warm/incremental
+path.
 
 ## Project build seeding
 
@@ -292,15 +292,17 @@ it can never make Lake replay a stale olean as a false green. The exact-(commit,
 slug) gate is the whole safety argument: identical commit ⇒ byte-identical
 sources ⇒ every module legitimately replays.
 
-When HEAD does match, seeding **replaces** whatever `.lake/build` already holds
-(clearing `lib`/`ir` first, so a stale leftover leaves no orphan oleans). It does
-not preserve an existing build: the worktrees this targets are long-lived and
-reused across tenants, so they typically carry a `.lake/build` from an earlier
-commit, and preserving it is exactly what forces the full rebuild seeding exists
-to avoid. Replacing is safe because the stored tree *is* the true full build of
-this exact commit — and if the worktree's sources have since been edited, Lake's
-own mtime/hash staleness check re-elaborates the changed modules regardless of
-the seeded oleans, so the replacement cannot manufacture a false green.
+When HEAD does match, seeding only warms a **cold** worktree: if `.lake/build`
+already holds compiled oleans it is left untouched and seeding is a no-op. The
+hook path (`refresh`) runs on every checkout, and a worktree's own build is work
+to keep — a stored non-green build is only a partial, so replacing a fuller local
+build with it is pure loss. `--force-discard` (or `LEAN_CACHE_FORCE_DISCARD=1`)
+overrides this: it clears `lib`/`ir` first, so a stale leftover leaves no orphan
+oleans, then replaces the build with the stored snapshot. That is safe because
+the stored tree *is* the true full build of this exact commit — and if the
+worktree's sources have since been edited, Lake's own mtime/hash staleness check
+re-elaborates the changed modules regardless of the seeded oleans, so the
+replacement cannot manufacture a false green.
 
 Two artifact classes are handled differently:
 

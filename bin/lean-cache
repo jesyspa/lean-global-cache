@@ -1597,7 +1597,8 @@ install_one_hook() {
 }
 
 # Install the project hooks into the (worktree-shared) hooks directory:
-#   post-checkout         — checkout, switch, worktree-add
+#   post-checkout         — branch/commit checkout, switch, worktree-add
+#                           (skips a file checkout, which leaves HEAD put)
 #   reference-transaction — the only stock hook that also fires on
 #                           `git reset --hard` and `git cherry-pick`; it covers
 #                           rebase/amend too, so no separate post-rewrite hook
@@ -1618,7 +1619,12 @@ install_hooks() {
 
   install_one_hook "$gitdir/hooks/post-checkout" "#!/usr/bin/env bash
 # $HOOK_SENTINEL: re-establish the .lake/packages overlay after checkout.
+# git passes a branch-checkout flag as \$3 (1 = branch/commit checkout, worktree
+# add, clone; 0 = file checkout like \`git checkout -- <path>\`). A file checkout
+# leaves HEAD put, so it can't change the toolchain or land on a new commit —
+# skip it, so restoring a file never touches .lake/build.
 [[ -n \"\${LEAN_CACHE_NO_HOOK:-}\" ]] && exit 0
+[[ \"\$3\" == 1 ]] || exit 0
 root=\"\$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0
 [[ -f \"\$root/lean-toolchain\" ]] || exit 0
 \"\${LEAN_CACHE_BIN:-$HOOK_BIN}\" refresh \"\$root\" >/dev/null 2>&1 || true"

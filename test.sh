@@ -132,6 +132,25 @@ check "use overlays base toolchain"           "v4-30-0" "$(live_slug "$B")"
 gitc "$B" cherry-pick "$pick" >/dev/null 2>&1
 check "cherry-pick repoints overlay"          "v4-31-0" "$(live_slug "$B")"
 
+# Scenario: post-checkout fires on a branch checkout (git flag $3=1) but not on a
+# file checkout ($3=0, HEAD unchanged) — restoring a file must not trigger a
+# refresh that could touch .lake/build.
+D="$TMP/filecheckout"; mkdir -p "$D"; gitc "$D" init -q
+pin v4.30.0 "$D"; printf 'x\n' > "$D/f.txt"; gitc "$D" add -A; gitc "$D" commit -qm a30
+base_branch="$(gitc "$D" rev-parse --abbrev-ref HEAD)"
+gitc "$D" checkout -q -b bump
+pin v4.31.0 "$D"; gitc "$D" commit -qam b31
+gitc "$D" checkout -q "$base_branch"
+"$CLI" use "$D" >/dev/null 2>&1
+check "use overlays the base toolchain"        "v4-30-0" "$(live_slug "$D")"
+gitc "$D" checkout -q bump                       # branch checkout (flag=1): refreshes
+check "branch checkout repoints overlay"       "v4-31-0" "$(live_slug "$D")"
+# Sabotage the overlay to a stale slug by hand; a file checkout must leave it be.
+ln -sfn "$TMP/cache/lakes/v4-30-0/packages/mathlib" "$D/.lake/packages/mathlib"
+printf 'y\n' > "$D/f.txt"
+gitc "$D" checkout -q -- f.txt                   # file checkout (flag=0): no refresh
+check "file checkout does not refresh overlay" "v4-30-0" "$(live_slug "$D")"
+
 # Scenario: hooks are installed, sentinel-marked, and idempotent.
 C="$TMP/hooks"; mkdir -p "$C"; gitc "$C" init -q
 pin v4.30.0 "$C"; gitc "$C" add -A; gitc "$C" commit -qm a

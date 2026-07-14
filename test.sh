@@ -598,6 +598,19 @@ check "refresh preserves a populated build"    "MINE-A" \
 check "refresh --force-discard reseeds over it" "OLEAN-A" \
   "$(cat "$P/.lake/build/lib/lean/Proj/A.olean" 2>/dev/null)"
 
+# refresh must NEVER touch tracked source: an uncommitted edit is work in
+# progress, not stale drift, and refresh (fired recurringly by the hooks) must
+# leave the working tree exactly as it found it — no git checkout/reset to HEAD.
+printf 'def a := 42  -- uncommitted\n' > "$P/Proj/A.lean"
+dirty_before="$(gitc "$P" status --porcelain -- Proj/A.lean)"
+"$CLI" refresh "$P" >/dev/null 2>&1
+"$CLI" refresh "$P" >/dev/null 2>&1
+check "refresh keeps the uncommitted source edit" "def a := 42  -- uncommitted" \
+  "$(cat "$P/Proj/A.lean" 2>/dev/null)"
+check "refresh leaves the dirty state untouched"  "$dirty_before" \
+  "$(gitc "$P" status --porcelain -- Proj/A.lean)"
+gitc "$P" checkout -q -- Proj/A.lean   # restore for the clean-test below
+
 # clean wipes .lake/build (cold reset) but leaves the package overlay in place.
 check "clean: build present before"            "yes" \
   "$([[ -d "$P/.lake/build" ]] && echo yes || echo no)"

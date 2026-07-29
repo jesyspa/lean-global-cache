@@ -157,12 +157,14 @@ build`):
   every 30s during the build.
 
 A cold/full build cannot finish inside a bounded foreground tool call. The
-harness exports `CLAUDE_BASH_MODE=foreground|background` per Bash call
-(absent → treat as `background`). When a cold build is requested with
-`CLAUDE_BASH_MODE=foreground`, the policy does **not** build: it prints the exact
-command to re-run and exits code 75, so you re-run it backgrounded (woken on
-completion) or with a 10-minute timeout instead of having it killed mid-build.
-In `background` mode (or absent) a cold build queues on a slot and runs to
+harness stamps `CLAUDE_BASH_MODE=background` onto backgrounded Bash calls only,
+and exports `CLAUDECODE=1` into every call it launches, so a bounded foreground
+call is the one where `CLAUDECODE` is set and `CLAUDE_BASH_MODE` is unset. There,
+the policy does **not** build: it prints the exact command to re-run and exits
+code 75, so you re-run it backgrounded (woken on completion) or with a 10-minute
+timeout instead of having it killed mid-build. Backgrounded, and outside the
+harness entirely (a human terminal or cron, where neither variable is set and
+nothing gets killed at 2 minutes), a cold build queues on a slot and runs to
 completion. Set `LEAN_CACHE_FORCE_WAIT=1` (or pass `--wait` to `lean-cache
 build`) to block to completion regardless of mode; the pre-push gate and
 `publish-build` force-wait internally, since they must complete synchronously. A

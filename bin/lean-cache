@@ -89,7 +89,7 @@ HOOK_BIN="$BIN"
 PROG="lean-cache"
 
 # Exit code the cold-build policy uses to bail out of a bounded foreground call
-# (CLAUDE_BASH_MODE=foreground) rather than run a multi-minute build that the
+# (see in_bounded_foreground) rather than run a multi-minute build that the
 # harness would kill mid-flight. Distinct from a build failure (1) so a caller
 # can tell "re-run me backgrounded" from "the build broke".
 BUILD_BAIL_CODE=75
@@ -135,9 +135,9 @@ Usage: $PROG <command> [args]
                         cwd) to the cache. Version defaults to the project's
                         lean-toolchain. Auto-installs the version if it is not
                         in the cache yet (set LEAN_CACHE_AUTO_INSTALL=0 to
-                        hard-fail instead); in a bounded foreground call
-                        (CLAUDE_BASH_MODE=foreground) it bails with re-run
-                        instructions rather than start the multi-minute install.
+                        hard-fail instead); in a bounded foreground Claude Code
+                        call it bails with re-run instructions rather than start
+                        the multi-minute install.
                         Also installs the overlay git hooks.
   refresh [path]        Re-overlay only if the live overlay's toolchain differs
                         from the project's lean-toolchain (a cheap no-op
@@ -156,8 +156,8 @@ Usage: $PROG <command> [args]
                         \`lake\` shim. Warm/incremental builds run immediately;
                         cold/full builds serialize on a host slot (at most
                         LEAN_CACHE_BUILD_SLOTS, default 2) and run to completion,
-                        except in a bounded foreground call (CLAUDE_BASH_MODE=
-                        foreground) where they bail with re-run instructions.
+                        except in a bounded foreground Claude Code call, where
+                        they bail with re-run instructions.
                         --wait (or LEAN_CACHE_FORCE_WAIT=1) blocks to completion
                         regardless of mode. A bare-word first arg is a lake
                         target; a path must be \`.\` or contain a slash.
@@ -523,6 +523,35 @@ is_cold_build() { # arg: proj
   return 0
 }
 
+# True in a bounded foreground Claude Code call — the one mode where a
+# multi-minute build is killed mid-flight, so the policy bails instead of
+# starting it.
+#
+# The harness stamps CLAUDE_BASH_MODE onto backgrounded Bash calls only:
+# stamping every call echoes every command body back into the session
+# transcript, which the model then pays for twice. Foreground is therefore the
+# *unstamped* case, told apart from "not a harness shell at all" by CLAUDECODE,
+# which the harness exports into every Bash call it launches:
+#
+#   CLAUDE_BASH_MODE=background             background: block to completion
+#   CLAUDECODE set, CLAUDE_BASH_MODE unset  foreground: bounded, bail
+#   neither set                             human terminal, cron, a nested
+#                                           script: no guillotine, so block
+#
+# Reading unstamped-under-CLAUDECODE as foreground is the conservative side of
+# the ambiguity: a session whose stamping hook is missing or failed open bails
+# with re-run instructions instead of being killed at the timeout. An explicit
+# CLAUDE_BASH_MODE=foreground is still honoured, so this is correct against a
+# harness that stamps both directions as well as one that stamps only
+# background.
+in_bounded_foreground() {
+  case "${CLAUDE_BASH_MODE:-}" in
+    foreground) return 0 ;;
+    background) return 1 ;;
+  esac
+  [[ -n "${CLAUDECODE:-}" ]]
+}
+
 # The shared build policy, used by `lake build` (via the shim, which delegates to
 # `lean-cache build`) and by `lean-cache build` directly:
 #   - a build riding a parent's slot (LEAN_CACHE_BUILD_SLOT_HELD) completes now,
@@ -530,8 +559,8 @@ is_cold_build() { # arg: proj
 #   - warm/incremental builds run immediately, foreground, NO slot (feel exactly
 #     like a plain `lake build`);
 #   - cold/full builds serialize on a host slot and run to completion when we can
-#     block (force-wait, or a background/absent CLAUDE_BASH_MODE — the wake-on-
-#     completion path), but in a bounded foreground call they bail with
+#     block (force-wait, or anything in_bounded_foreground rejects — the
+#     wake-on-completion path), but in a bounded foreground call they bail with
 #     instructions rather than be killed mid-build.
 # RERUN_HINT (set by the caller) is the exact command to re-run on a bail.
 run_build_policied() { # args: proj who [lake build args...]
@@ -549,7 +578,7 @@ run_build_policied() { # args: proj who [lake build args...]
     acquire_build_slot "$who"
     run_lake_build "$proj" "$who" "$@"; return
   fi
-  if [[ "${CLAUDE_BASH_MODE:-background}" == foreground ]]; then
+  if in_bounded_foreground; then
     {
       echo "$who: cold full build of $proj will exceed this call's ~2-minute foreground limit; not building."
       echo "  Re-run it backgrounded (you'll be woken on completion) or with a 10-minute timeout:"
@@ -1183,13 +1212,13 @@ cmd_use() {
     # the old hard-fail.
     if [[ "${LEAN_CACHE_AUTO_INSTALL:-1}" == 1 ]]; then
       # Auto-install is a multi-minute cold build. In a bounded foreground call
-      # (CLAUDE_BASH_MODE=foreground) the harness would kill it mid-flight, so
-      # bail like run_build_policied does: don't start it, print the command to
-      # run backgrounded / with a long timeout, and exit the distinct bail code.
-      # A build riding a parent's slot (LEAN_CACHE_BUILD_SLOT_HELD), force-wait,
-      # and background/absent mode all proceed to install.
-      if [[ -z "${LEAN_CACHE_BUILD_SLOT_HELD:-}" && -z "${LEAN_CACHE_FORCE_WAIT:-}" \
-            && "${CLAUDE_BASH_MODE:-background}" == foreground ]]; then
+      # the harness would kill it mid-flight, so bail like run_build_policied
+      # does: don't start it, print the command to run backgrounded / with a
+      # long timeout, and exit the distinct bail code. A build riding a parent's
+      # slot (LEAN_CACHE_BUILD_SLOT_HELD), force-wait, and every non-foreground
+      # mode all proceed to install.
+      if [[ -z "${LEAN_CACHE_BUILD_SLOT_HELD:-}" && -z "${LEAN_CACHE_FORCE_WAIT:-}" ]] \
+         && in_bounded_foreground; then
         {
           echo "$PROG use: $TCVER is not installed; installing it is a multi-minute cold build that would exceed this call's ~2-minute foreground limit, so not starting it here."
           echo "  Install it backgrounded (you'll be woken on completion) or with a 10-minute timeout, then re-run your command:"
@@ -1735,7 +1764,7 @@ cmd_pre_push_gate() {
 # `lake build` under the shared build policy: an explicit alias for the same path
 # the transparent `lake` shim takes. Warm/incremental builds run immediately with
 # no slot; cold/full builds serialize on a host slot and either run to completion
-# (force-wait, or a background/absent CLAUDE_BASH_MODE) or bail in a bounded
+# (force-wait, or anything in_bounded_foreground rejects) or bail in a bounded
 # foreground call. `--wait` forces block-to-completion regardless of mode. Extra
 # args go to `lake build` verbatim.
 cmd_build() {

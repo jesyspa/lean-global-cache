@@ -5,6 +5,13 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLI="$REPO_DIR/bin/lean-cache"
+
+# The cold-build policy reads CLAUDE_BASH_MODE *and* CLAUDECODE (see
+# in_bounded_foreground in bin/lean-cache). Both are ambient inside a Claude Code
+# Bash call and absent under the deploy handler, so leaving them inherited would
+# make every unannotated build in this suite mean something different depending
+# on who ran it. Clear them once here; the cases that care set both explicitly.
+unset CLAUDE_BASH_MODE CLAUDECODE
 fail=0
 note() { echo "  $*"; }
 check() { # check <description> <expected> <actual>
@@ -422,6 +429,25 @@ rc=0; PATH="$ISTUB:$PATH" LEAN_CACHE_BUILD_LOCK_DIR="$TMP" LEAN_CACHE_BUILDS="$T
 check "force-wait overrides the foreground use bail"       "0" "$rc"
 check "force-wait foreground use provisioned the version"  "yes" \
   "$(has_dir "$TMP/cache/lakes/v4-57-0/packages")"
+
+# The same three env states as the build policy, on this second call site: an
+# unstamped call under CLAUDECODE is a bounded foreground call and bails; with
+# neither variable set there is no guillotine, so it installs.
+UCC="$TMP/usecc"; mkdir -p "$UCC"; gitc "$UCC" init -q
+pin v4.58.0 "$UCC"; printf 'name="p"\n' > "$UCC/lakefile.toml"
+gitc "$UCC" add -A; gitc "$UCC" commit -qm init
+rc=0; env -u CLAUDE_BASH_MODE CLAUDECODE=1 PATH="$ISTUB:$PATH" \
+  LEAN_CACHE_BUILD_LOCK_DIR="$TMP" LEAN_CACHE_BUILDS="$TMP/ibuilds" \
+  HOME="$TMP/ihome" "$CLI" use "$UCC" >/dev/null 2>&1 && rc=0 || rc=$?
+check "unstamped use under CLAUDECODE bails"               "75" "$rc"
+check "bailed unstamped use provisioned nothing"           "no" \
+  "$(has_dir "$TMP/cache/lakes/v4-58-0/packages")"
+rc=0; env -u CLAUDE_BASH_MODE -u CLAUDECODE PATH="$ISTUB:$PATH" \
+  LEAN_CACHE_BUILD_LOCK_DIR="$TMP" LEAN_CACHE_BUILDS="$TMP/ibuilds" \
+  HOME="$TMP/ihome" "$CLI" use "$UCC" >/dev/null 2>&1 || rc=$?
+check "use outside the harness installs"                   "0" "$rc"
+check "use outside the harness provisioned the version"    "yes" \
+  "$(has_dir "$TMP/cache/lakes/v4-58-0/packages")"
 
 echo "== slots (hermetic) =="
 # `slots` is read-only: probe each lock file with a non-blocking flock and
@@ -968,11 +994,32 @@ PATH="$STUB:$PATH" CLAUDE_BASH_MODE=background LAKE_LOG="$TMP/pol.log" "$CLI" bu
 check "cold background build runs lake"          "1" "$(grep -c '^lake build' "$TMP/pol.log" 2>/dev/null)"
 check "cold background build exits 0"            "0" "$rc"
 
-# (d) Absent CLAUDE_BASH_MODE defaults to background (queue-and-build, not bail).
+# (d) With no CLAUDE_BASH_MODE stamp, CLAUDECODE decides. The harness stamps
+# backgrounded calls only, and exports CLAUDECODE into every call it launches, so
+# unstamped-under-CLAUDECODE is a bounded foreground call and must bail, while
+# neither-set is a human terminal or cron with no guillotine and must build.
+# Every case sets both variables explicitly, so none of it turns on the ambient
+# environment of whoever runs the suite.
 : > "$TMP/pol.log"; rc=0
-env -u CLAUDE_BASH_MODE PATH="$STUB:$PATH" LAKE_LOG="$TMP/pol.log" "$CLI" build "$CP" >/dev/null 2>&1 || rc=$?
-check "absent mode builds (not bail)"            "1" "$(grep -c '^lake build' "$TMP/pol.log" 2>/dev/null)"
-check "absent mode exits 0"                      "0" "$rc"
+env -u CLAUDE_BASH_MODE -u CLAUDECODE PATH="$STUB:$PATH" LAKE_LOG="$TMP/pol.log" \
+  "$CLI" build "$CP" >/dev/null 2>&1 || rc=$?
+check "outside the harness: builds (not bail)"   "1" "$(grep -c '^lake build' "$TMP/pol.log" 2>/dev/null)"
+check "outside the harness: exits 0"             "0" "$rc"
+
+: > "$TMP/pol.log"
+out="$(env -u CLAUDE_BASH_MODE CLAUDECODE=1 PATH="$STUB:$PATH" LAKE_LOG="$TMP/pol.log" \
+       "$CLI" build "$CP" 2>&1)" && rc=0 || rc=$?
+check "unstamped under CLAUDECODE runs no lake"   "0" "$(grep -c '^lake build' "$TMP/pol.log" 2>/dev/null)"
+check "unstamped under CLAUDECODE bails, code 75" "75" "$rc"
+check "unstamped bail explains re-run"            "yes" \
+  "$(printf '%s' "$out" | grep -q 'backgrounded' && echo yes || echo no)"
+
+# The stamp wins over CLAUDECODE: a backgrounded harness call still builds.
+: > "$TMP/pol.log"; rc=0
+CLAUDECODE=1 CLAUDE_BASH_MODE=background PATH="$STUB:$PATH" LAKE_LOG="$TMP/pol.log" \
+  "$CLI" build "$CP" >/dev/null 2>&1 || rc=$?
+check "stamped background under CLAUDECODE builds" "1" "$(grep -c '^lake build' "$TMP/pol.log" 2>/dev/null)"
+check "stamped background under CLAUDECODE exits 0" "0" "$rc"
 
 # (e) Force-wait (--wait or LEAN_CACHE_FORCE_WAIT=1) builds a cold project to
 # completion even in a foreground call — no bail.

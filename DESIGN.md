@@ -436,23 +436,39 @@ on it. `LEAN_CACHE_BUILD_SLOTS=0` disables serialization.
 A cold/full build takes minutes and cannot finish inside a bounded foreground
 tool call — the harness terminates a foreground Bash call that exceeds its
 timeout (default ~2 min, max 10) rather than letting it run on or flipping it to
-the background. The harness signals which regime a call is in by exporting
-`CLAUDE_BASH_MODE=foreground|background` per Bash call; **absent means
-background** (a human terminal, cron, or nested script has no 2-minute guillotine
-and should just wait).
+the background.
 
-The policy reads that signal for a cold build:
+Which regime a call is in is read from a pair of environment variables, by
+`in_bounded_foreground`. The harness stamps `CLAUDE_BASH_MODE=background` onto
+backgrounded Bash calls only — stamping every call would echo every command body
+back into the session transcript, which the model then pays for twice — and it
+exports `CLAUDECODE=1` into every Bash call it launches. So:
+
+| `CLAUDE_BASH_MODE` | `CLAUDECODE` | regime |
+| --- | --- | --- |
+| `background` | either | background: no guillotine, block to completion |
+| unset | set | **foreground**: bounded, bail |
+| unset | unset | not a harness shell (human terminal, cron, nested script): no guillotine, block |
+
+Reading unstamped-under-`CLAUDECODE` as foreground is the conservative side of
+that ambiguity: a session whose stamping hook is missing or has failed open
+bails with re-run instructions rather than being killed mid-build. An explicit
+`CLAUDE_BASH_MODE=foreground` is still honoured, so the predicate is correct
+against a harness that stamps both directions as well as one that stamps only
+background.
+
+The policy reads that regime for a cold build:
 
 - **force-wait** (`LEAN_CACHE_FORCE_WAIT=1`, or `--wait` on `lean-cache build`) —
-  acquire a slot and build to completion regardless of mode. This is what the
+  acquire a slot and build to completion regardless of regime. This is what the
   pre-push gate and `publish-build` set internally, since they must complete
   synchronously (the gate blocks the push).
-- **`CLAUDE_BASH_MODE=foreground`** — do **not** build: print the exact command
-  to re-run (backgrounded, so the model is woken on completion, or with a
-  10-minute timeout) and exit a distinct code (75, so a caller can tell
-  "re-run me backgrounded" from a build failure). Bailing fast beats being killed
-  mid-build with a half-written `.lake/build`.
-- **`background` or absent** — acquire a slot and build to completion (the
+- **bounded foreground** — do **not** build: print the exact command to re-run
+  (backgrounded, so the model is woken on completion, or with a 10-minute
+  timeout) and exit a distinct code (75, so a caller can tell "re-run me
+  backgrounded" from a build failure). Bailing fast beats being killed mid-build
+  with a half-written `.lake/build`.
+- **anything else** — acquire a slot and build to completion (the
   wake-on-completion path).
 
 A build already riding a parent's slot (`LEAN_CACHE_BUILD_SLOT_HELD`) short-
@@ -463,11 +479,11 @@ useful (and `--wait` maps to force-wait).
 
 `use`'s auto-install applies the same foreground bail. `lean-cache use` on a
 not-yet-installed version otherwise launches a multi-minute cold install, which
-a bounded foreground call would kill mid-build; so in `foreground` mode (and
-without `LEAN_CACHE_FORCE_WAIT` or a held parent slot) `use` does not start the
-install — it prints the `lean-cache install <version>` command to run
-backgrounded / with a long timeout and exits `BUILD_BAIL_CODE`. Background or
-absent mode, force-wait, a held slot, and an explicit `lean-cache install` all
+a bounded foreground call would kill mid-build; so in a bounded foreground call
+(and without `LEAN_CACHE_FORCE_WAIT` or a held parent slot) `use` does not start
+the install — it prints the `lean-cache install <version>` command to run
+backgrounded / with a long timeout and exits `BUILD_BAIL_CODE`. Every other
+regime, force-wait, a held slot, and an explicit `lean-cache install` all
 proceed to install. The git-hook path (`refresh`) never reaches this — it no-ops
 on an uninstalled version rather than provisioning — so a checkout can't trip
 the bail either.

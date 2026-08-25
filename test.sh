@@ -213,6 +213,107 @@ check "foreground use bail installed nothing"            "" "$(live_slug "$U")"
 # (force-wait and slot-held override the bail — exercised with stubs in the
 # install section, where the auto-install can run offline.)
 
+echo "== multi-project discovery (hermetic) =="
+# A directory given to use/refresh/seed-build/clean/publish-build that is NOT
+# itself a Lake project is swept for Lake projects beneath it via
+# find_lake_projects/run_on_subprojects. A directory that IS a Lake project is
+# unaffected — covered by the existing tests above; this section only
+# exercises the sweep.
+
+MR="$TMP/monorepo"; mkdir -p "$MR/proj-a" "$MR/sub/proj-b"; gitc "$MR" init -q
+: > "$MR/proj-a/lakefile.toml"; pin v4.30.0 "$MR/proj-a"
+: > "$MR/sub/proj-b/lakefile.toml"; pin v4.31.0 "$MR/sub/proj-b"
+gitc "$MR" add -A; gitc "$MR" commit -qm root
+
+"$CLI" use "$MR" >/dev/null 2>&1
+check "use on monorepo root overlays proj-a"      "v4-30-0" "$(live_slug "$MR/proj-a")"
+check "use on monorepo root overlays proj-b"      "v4-31-0" "$(live_slug "$MR/sub/proj-b")"
+
+# Bumping one subproject's toolchain and refreshing the root repoints only
+# that one; the other, already fresh, is left alone.
+pin v4.31.0 "$MR/proj-a"
+"$CLI" refresh "$MR" >/dev/null 2>&1
+check "refresh repoints the bumped subproject"    "v4-31-0" "$(live_slug "$MR/proj-a")"
+check "refresh leaves the other subproject alone" "v4-31-0" "$(live_slug "$MR/sub/proj-b")"
+
+# A dependency checkout under .lake that happens to carry its own
+# lakefile.toml+lean-toolchain must not be discovered as a project — proves
+# the .lake prune in find_lake_projects.
+mkdir -p "$MR/proj-a/.lake/packages/fakedep"
+: > "$MR/proj-a/.lake/packages/fakedep/lakefile.toml"
+pin v4.30.0 "$MR/proj-a/.lake/packages/fakedep"
+rc=0; "$CLI" use "$MR" >/dev/null 2>&1 || rc=$?
+check "use still succeeds with a .lake dependency present" "0" "$rc"
+check ".lake dependency is not discovered as a project" "no" \
+  "$([[ -e "$MR/proj-a/.lake/packages/fakedep/.lake/packages/mathlib" ]] && echo yes || echo no)"
+
+# A root with no Lake projects beneath it at all falls back to today's
+# not-a-project behavior: use dies, refresh is a silent no-op.
+EMPTY="$TMP/emptyroot"; mkdir -p "$EMPTY"; gitc "$EMPTY" init -q
+: > "$EMPTY/README.md"; gitc "$EMPTY" add -A; gitc "$EMPTY" commit -qm empty
+rc=0; "$CLI" use "$EMPTY" >/dev/null 2>&1 || rc=$?
+check "use on a root with no Lake projects dies"         "1" "$rc"
+rc=0; "$CLI" refresh "$EMPTY" >/dev/null 2>&1 || rc=$?
+check "refresh on a root with no Lake projects exits 0"  "0" "$rc"
+
+# An explicit version bypasses the sweep entirely: it overlays the given path
+# directly, even though that path itself has no lean-toolchain.
+"$CLI" use v4.30.0 "$MR" >/dev/null 2>&1
+check "explicit version overlays the root directly" "v4-30-0" "$(live_slug "$MR")"
+
+# clean sweeps too: removing .lake/build from every discovered subproject.
+mkdir -p "$MR/proj-a/.lake/build" "$MR/sub/proj-b/.lake/build"
+: > "$MR/proj-a/.lake/build/marker"; : > "$MR/sub/proj-b/.lake/build/marker"
+"$CLI" clean "$MR" >/dev/null 2>&1
+check "clean removes proj-a's build" "no" "$([[ -e "$MR/proj-a/.lake/build" ]] && echo yes || echo no)"
+check "clean removes proj-b's build" "no" "$([[ -e "$MR/sub/proj-b/.lake/build" ]] && echo yes || echo no)"
+
+# Hook-path regression: the post-checkout hook must NOT bail out just because
+# the repo root carries no lean-toolchain of its own — it has to fall through
+# into refresh's own discovery. Installed by running `use` on one subproject
+# of a fresh monorepo (root has no lean-toolchain); hooks land at the repo's
+# shared .git/hooks, not a per-subproject one.
+HR="$TMP/hookmono"; mkdir -p "$HR/proj-x"; gitc "$HR" init -q
+: > "$HR/proj-x/lakefile.toml"; pin v4.30.0 "$HR/proj-x"
+gitc "$HR" add -A; gitc "$HR" commit -qm root
+"$CLI" use "$HR/proj-x" >/dev/null 2>&1
+gitdir="$(git -C "$HR" rev-parse --git-common-dir)"
+[[ "$gitdir" = /* ]] || gitdir="$HR/$gitdir"
+check "hooks installed at the repo's shared .git/hooks" "yes" \
+  "$([[ -f "$gitdir/hooks/post-checkout" ]] && echo yes || echo no)"
+
+pin v4.31.0 "$HR/proj-x"
+( cd "$HR" && "$gitdir/hooks/post-checkout" unused unused 1 >/dev/null 2>&1 )
+check "post-checkout hook re-overlays via subproject discovery" "v4-31-0" "$(live_slug "$HR/proj-x")"
+
+# Regression: a root that DOES carry its own lean-toolchain pin (so a
+# toolchain-only "is this a project" check would wrongly treat it as one) but
+# has no lakefile of its own must still be swept for the Lake projects beneath
+# it, not treated as a single overlay target itself. This is the actual
+# courses--fp--2026--admin shape (a root lean-toolchain, no root lakefile,
+# real Lake projects below it) — the case the discovery gate must key off
+# is_lake_project (lakefile + lean-toolchain), not lean-toolchain alone.
+PR="$TMP/pinnedroot"; mkdir -p "$PR/examples" "$PR/homework/hw00"; gitc "$PR" init -q
+pin v4.30.0 "$PR"                                     # root pin, no lakefile at root
+: > "$PR/examples/lakefile.toml"; pin v4.30.0 "$PR/examples"
+: > "$PR/homework/hw00/lakefile.toml"; pin v4.31.0 "$PR/homework/hw00"
+gitc "$PR" add -A; gitc "$PR" commit -qm root
+
+"$CLI" use "$PR" >/dev/null 2>&1
+check "toolchain-pinned lakefile-less root overlays examples/"      "v4-30-0" "$(live_slug "$PR/examples")"
+check "toolchain-pinned lakefile-less root overlays homework/hw00/" "v4-31-0" "$(live_slug "$PR/homework/hw00")"
+check "the root itself gets no overlay of its own" "no" \
+  "$([[ -e "$PR/.lake/packages" ]] && echo yes || echo no)"
+
+# Same shape through the hook path: the post-checkout hook must discover and
+# overlay homework/hw00/ even though root's own lean-toolchain pin is present
+# and unchanged.
+gitdir2="$(git -C "$PR" rev-parse --git-common-dir)"
+[[ "$gitdir2" = /* ]] || gitdir2="$PR/$gitdir2"
+pin v4.30.0 "$PR/homework/hw00"
+( cd "$PR" && "$gitdir2/hooks/post-checkout" unused unused 1 >/dev/null 2>&1 )
+check "hook repoints a subproject beneath a toolchain-pinned root" "v4-30-0" "$(live_slug "$PR/homework/hw00")"
+
 echo "== elan wiring (hermetic) =="
 # `use` points ~/.elan at the shared ELAN_HOME ($LEAN_CACHE_ROOT/elan) so bare
 # lean/lake and the editor resolve the shared toolchain, unless a real personal

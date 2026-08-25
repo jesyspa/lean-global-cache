@@ -75,6 +75,25 @@ repoints the shared symlinks (e.g. after a version bump) and leaves the
 project's own package dirs untouched; `lean-cache use --clean` rebuilds the
 overlay from scratch.
 
+A repo need not be a single Lake project. If the path given to `use`/`refresh`
+(or `seed-build`/`publish-build`/`clean`) is not itself a Lake project —
+missing a `lakefile.toml`/`lakefile.lean` of its own, whether or not it
+happens to carry a `lean-toolchain` pin — and, for `use`, no version was given
+either, each command instead looks for Lake projects **beneath** that path (a
+directory holding a `lakefile.toml`/`lakefile.lean` plus a `lean-toolchain`,
+`.lake` and `.git` pruned from the walk) and applies itself to each one found.
+A directory that IS a Lake project keeps today's exact single-project
+behavior; the sweep only kicks in for a directory that isn't one, e.g. a repo
+root holding several independent Lake projects (`examples/`, `homework/hw00/`,
+…) with no lakefile of its own — even if that root does carry a
+`lean-toolchain` pin (say, so bare `lean` resolves *some* toolchain outside
+any project). If the sweep finds nothing beneath a path that at least has its
+own `lean-toolchain`, the command falls back to treating that path as the
+target, same as before this existed. `lean-cache use` at a monorepo root
+overlays every project it finds; the git hooks (below) call `lean-cache
+refresh` with the repo root regardless of which subproject changed, so this is
+what makes them work correctly without per-project hook wiring.
+
 `use` also installs git hooks (`post-checkout` and `reference-transaction`) that
 repoint the overlay automatically whenever HEAD moves to a commit pinning a
 different toolchain — including via `git reset --hard` and `git cherry-pick`.
@@ -130,6 +149,10 @@ and runs a bare `lake build`, aborting the push if the build fails. This catches
 the "pushed non-compiling code that targeted checks falsely reported green" case.
 A full `lake build` can take minutes — that latency is the intended cost. Set
 `SKIP_LEAN_PUSH_GATE=1` to bypass it (e.g. right after a known-clean build).
+Unlike `use`/`refresh`, the gate is **not** multi-project aware: it only fires
+when the repo root itself is a Lake project (`$root/lakefile.toml` or
+`.lean`). A repo of several Lake projects with none at its root is not gated
+at all — see [Known limitations](DESIGN.md#known-limitations--open-points).
 
 The gate skips the rebuild when the warm-build store already holds this exact
 commit+toolchain published from a clean tree — that build already attests the

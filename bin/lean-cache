@@ -139,17 +139,27 @@ Usage: $PROG <command> [args]
                         call it bails with re-run instructions rather than start
                         the multi-minute install.
                         Also installs the overlay git hooks.
+                        If <path> is not itself a Lake project (missing a
+                        lakefile.toml/lakefile.lean of its own, whether or not
+                        it has a lean-toolchain pin) and no version is given,
+                        every Lake project found beneath it is overlaid instead
+                        — e.g. a repo of several Lake projects with none at its
+                        root.
   refresh [path]        Re-overlay only if the live overlay's toolchain differs
                         from the project's lean-toolchain (a cheap no-op
-                        otherwise). This is what the git hooks call.
+                        otherwise). This is what the git hooks call. Same
+                        multi-project fallback as \`use\` when <path> isn't
+                        itself a Lake project.
   seed-build [path]     Seed .lake/build from a stored warm build when HEAD
                         exactly matches a stored (commit, toolchain) build,
                         replacing any existing build. A no-op when none is
                         stored. Called automatically by \`use\` / \`refresh\` /
-                        the post-checkout hook.
+                        the post-checkout hook. Same multi-project fallback.
   publish-build [path]  Build the project to completion and store its warm
                         .lake/build for the current (commit, toolchain), so
-                        future fresh worktrees can be seeded from it.
+                        future fresh worktrees can be seeded from it. Same
+                        multi-project fallback — publishes every discovered
+                        project in turn, each a full build.
   build [--wait] [path] [args]
                         Run \`lake build [args]\` under the shared build policy —
                         the same path bare \`lake build\` takes via the installed
@@ -164,7 +174,9 @@ Usage: $PROG <command> [args]
   clean [path]          Remove the worktree's project build (.lake/build) to
                         reset it to a cold state, e.g. before a reused worktree
                         is handed to a new tenant. Leaves the package overlay
-                        (.lake/packages) in place. A no-op off a Lake project.
+                        (.lake/packages) in place. A no-op off a Lake project —
+                        except a directory with Lake projects beneath it, which
+                        cleans each of those instead.
   prune-builds [--keep-days N]
                         Rotate the warm-build store: keep the newest build per
                         (repo, toolchain) indefinitely, drop any other older than
@@ -1165,6 +1177,54 @@ cmd_set_default() {
   log "default toolchain set to $TOOLCHAIN (bare lean/lake outside a project now use it)"
 }
 
+# True when $1 is itself a Lake project: a lakefile plus a lean-toolchain to
+# resolve a version from. This is the strict definition used only to *find*
+# projects under a non-project directory; the single-project commands below
+# keep their own long-standing (looser, lean-toolchain-only) checks so a
+# directory that IS a project — by whichever check that command already used —
+# is unaffected.
+is_lake_project() {
+  [[ -f "$1/lean-toolchain" ]] && { [[ -f "$1/lakefile.toml" ]] || [[ -f "$1/lakefile.lean" ]]; }
+}
+
+# Lake projects at or below $1 (excluding $1 itself, which the caller has
+# already determined is not one): a lakefile.toml/lakefile.lean paired with a
+# lean-toolchain in the same directory. Prunes .lake and .git (never a project
+# root, and .lake in particular holds a project's own dependency checkouts, so
+# not pruning it would find every dependency as a spurious "project") and
+# depth-limits the walk so a large monorepo scan stays cheap. One absolute path
+# per line, deduplicated.
+find_lake_projects() { # arg: dir
+  local f d
+  find "$1" -mindepth 1 -maxdepth 6 \( -name .lake -o -name .git \) -prune -o \
+       -type f \( -name lakefile.toml -o -name lakefile.lean \) -print 2>/dev/null \
+    | while IFS= read -r f; do dirname "$f"; done \
+    | sort -u \
+    | while IFS= read -r d; do is_lake_project "$d" && printf '%s\n' "$d"; done
+}
+
+# Run cmd_fn (one of cmd_use/cmd_refresh/cmd_seed_build/cmd_clean/
+# cmd_publish_build) over every Lake project found below dir, for the case
+# where dir is not itself a Lake project (e.g. a monorepo root with several
+# lakefiles below it and none at the root). Each invocation runs in a subshell
+# so one project's `die` aborts only that project, not the rest of the sweep.
+# Returns 1 (nothing dispatched) when no subproject is found, so the caller
+# falls back to its own single-project not-a-project behaviour unchanged.
+# Exit codes: 0 all dispatched projects succeeded; 2 no subproject was found
+# (the caller's cue to fall back); anything else is a real failure from one or
+# more dispatched projects, propagated so it isn't mistaken for "found none".
+run_on_subprojects() { # args: dir cmd_fn
+  local dir="$1" fn="$2" p found=0 rc=0 one
+  while IFS= read -r p; do
+    found=1
+    log "$fn: $p"
+    ( "$fn" "$p" ); one=$?
+    [[ "$one" -eq 0 ]] || { rc="$one"; log "$fn failed for $p (exit $one)"; }
+  done < <(find_lake_projects "$dir")
+  [[ "$found" -eq 1 ]] || return 2
+  return "$rc"
+}
+
 # Build an overlay: .lake/packages is a real directory holding one symlink per
 # shared package, leaving the project free to add its own extra packages
 # alongside (lake writes those as real dirs). This keeps the shared cache
@@ -1196,8 +1256,22 @@ cmd_use() {
   proj="$(cd "$proj" && pwd)" || die "no such directory"
 
   if [[ -z "$version" ]]; then
-    [[ -f "$proj/lean-toolchain" ]] \
-      || die "no version given and no $proj/lean-toolchain to derive it from"
+    if ! is_lake_project "$proj"; then
+      # $proj isn't a project itself (no lakefile of its own — whether or not
+      # it happens to carry a lean-toolchain pin) — a monorepo root, say. Look
+      # for Lake projects beneath it and overlay each with its own version
+      # instead. A version given explicitly skips this: it names one direct
+      # target, not a sweep.
+      local sub_rc=0
+      run_on_subprojects "$proj" cmd_use || sub_rc=$?
+      [[ "$sub_rc" -eq 2 ]] || return "$sub_rc"
+      # No Lake project found beneath $proj either. If $proj at least has a
+      # lean-toolchain of its own (just no lakefile), fall through to the
+      # long-standing single-target behavior below rather than treat a
+      # childless directory as an error case that didn't used to be one.
+      [[ -f "$proj/lean-toolchain" ]] \
+        || die "no version given and no $proj/lean-toolchain to derive it from (and no Lake project found beneath $proj)"
+    fi
     version="$(cat "$proj/lean-toolchain")"
   fi
   normalize_version "$version"
@@ -1327,13 +1401,24 @@ overlay_broken() { # arg: proj
 # Re-overlay the project only when its live overlay is stale — i.e. points at a
 # different toolchain than the one its lean-toolchain now pins (or has no overlay
 # yet). On a match this is a one-symlink-read no-op, which is what makes it safe
-# to call from a high-frequency hook. A non-Lean project is silently skipped.
+# to call from a high-frequency hook. A non-Lean project is silently skipped —
+# unless it's a directory (a monorepo root, say) with Lake projects beneath it,
+# each of which is refreshed in turn.
 cmd_refresh() {
   [[ $# -le 1 ]] || usage
   export LEAN_CACHE_NO_HOOK=1
   local proj="${1:-.}"
   proj="$(cd "$proj" 2>/dev/null && pwd)" || return 0
-  [[ -f "$proj/lean-toolchain" ]] || return 0
+  if ! is_lake_project "$proj"; then
+    local sub_rc=0
+    run_on_subprojects "$proj" cmd_refresh || sub_rc=$?
+    [[ "$sub_rc" -eq 2 ]] || return "$sub_rc"
+    # No Lake project found beneath $proj. A lean-toolchain pin at $proj
+    # itself (just no lakefile there) still falls through to the
+    # long-standing single-target behavior below; with neither, there is
+    # nothing to refresh.
+    [[ -f "$proj/lean-toolchain" ]] || return 0
+  fi
   normalize_version "$(cat "$proj/lean-toolchain")"
   # Never provision from the hook path: refreshing an overlay to a version that
   # isn't installed is a no-op, not a trigger for a multi-minute build inside a
@@ -1367,7 +1452,12 @@ cmd_seed_build() {
   [[ $# -le 1 ]] || usage
   local proj="${1:-.}"
   proj="$(cd "$proj" 2>/dev/null && pwd)" || return 0
-  [[ -f "$proj/lean-toolchain" ]] || return 0
+  if ! is_lake_project "$proj"; then
+    local sub_rc=0
+    run_on_subprojects "$proj" cmd_seed_build || sub_rc=$?
+    [[ "$sub_rc" -eq 2 ]] || return "$sub_rc"
+    [[ -f "$proj/lean-toolchain" ]] || return 0
+  fi
   local commit; commit="$(git -C "$proj" rev-parse HEAD 2>/dev/null)" || return 0
   [[ -n "$commit" ]] || return 0
   normalize_version "$(cat "$proj/lean-toolchain")"
@@ -1408,7 +1498,12 @@ cmd_clean() {
   [[ $# -le 1 ]] || usage
   local proj="${1:-.}"
   proj="$(cd "$proj" 2>/dev/null && pwd)" || return 0
-  [[ -f "$proj/lakefile.toml" || -f "$proj/lakefile.lean" || -f "$proj/lean-toolchain" ]] || return 0
+  if ! is_lake_project "$proj"; then
+    local sub_rc=0
+    run_on_subprojects "$proj" cmd_clean || sub_rc=$?
+    [[ "$sub_rc" -eq 2 ]] || return "$sub_rc"
+    [[ -f "$proj/lakefile.toml" || -f "$proj/lakefile.lean" || -f "$proj/lean-toolchain" ]] || return 0
+  fi
   [[ -e "$proj/.lake/build" ]] || return 0
   rm -rf "$proj/.lake/build"
   log "removed $proj/.lake/build"
@@ -1426,7 +1521,16 @@ cmd_publish_build() {
   export LEAN_CACHE_FORCE_WAIT=1
   local proj="${1:-.}"
   proj="$(cd "$proj" 2>/dev/null && pwd)" || die "no such directory: ${1:-.}"
-  [[ -f "$proj/lean-toolchain" ]] || die "no $proj/lean-toolchain"
+  if ! is_lake_project "$proj"; then
+    # Not a project itself: publish every Lake project found beneath it (e.g.
+    # a monorepo root), building each in turn. This can take a while — it's
+    # one full `lake build` per discovered project.
+    local sub_rc=0
+    run_on_subprojects "$proj" cmd_publish_build || sub_rc=$?
+    [[ "$sub_rc" -eq 2 ]] || return "$sub_rc"
+    [[ -f "$proj/lean-toolchain" ]] \
+      || die "no $proj/lean-toolchain (and no Lake project found beneath $proj)"
+  fi
   local commit; commit="$(git -C "$proj" rev-parse HEAD 2>/dev/null)" \
     || die "$proj is not a git repository"
   [[ -n "$commit" ]] || die "no HEAD commit in $proj"
@@ -1593,8 +1697,12 @@ install_one_hook() {
 #                           published for reuse.
 # post-checkout / reference-transaction defer to `lean-cache refresh`, whose
 # staleness check keeps the high-frequency reference-transaction path a cheap
-# no-op. pre-push only runs when the push changes a *.lean file; post-commit is a
-# no-op on a commit that touches no *.lean.
+# no-op. They deliberately don't pre-check `$root/lean-toolchain` themselves
+# (unlike pre-push/post-commit below) — `refresh` does that check itself, and
+# falling through to it is what lets `refresh` find and overlay Lake projects
+# below a root that pins no toolchain of its own (a repo of several Lake
+# projects with none at the root). pre-push only runs when the push changes a
+# *.lean file; post-commit is a no-op on a commit that touches no *.lean.
 install_hooks() {
   local proj="$1" gitdir
   gitdir="$(git -C "$proj" rev-parse --git-common-dir 2>/dev/null)" || return 0
@@ -1610,7 +1718,6 @@ install_hooks() {
 [[ -n \"\${LEAN_CACHE_NO_HOOK:-}\" ]] && exit 0
 [[ \"\$3\" == 1 ]] || exit 0
 root=\"\$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0
-[[ -f \"\$root/lean-toolchain\" ]] || exit 0
 \"\${LEAN_CACHE_BIN:-$HOOK_BIN}\" refresh \"\$root\" >/dev/null 2>&1 || true"
 
   install_one_hook "$gitdir/hooks/reference-transaction" "#!/usr/bin/env bash
@@ -1626,7 +1733,6 @@ while read -r _old _new ref; do
 done
 [[ \"\$state\" == committed && \"\$relevant\" -eq 1 ]] || exit 0
 root=\"\$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0
-[[ -f \"\$root/lean-toolchain\" ]] || exit 0
 \"\${LEAN_CACHE_BIN:-$HOOK_BIN}\" refresh \"\$root\" >/dev/null 2>&1 || true"
 
   install_one_hook "$gitdir/hooks/pre-push" "#!/usr/bin/env bash

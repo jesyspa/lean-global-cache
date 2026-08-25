@@ -138,6 +138,66 @@ shared cache precisely to avoid cross-project conflicts.
 - A package name the project provides as its own *real* directory is treated as
   an intentional override/extra and left untouched.
 
+### Repos with several Lake projects
+
+The CLI assumed one Lake project per invocation path, and specifically decided
+whether a path *was* one by checking only for `$proj/lean-toolchain` —
+`lakefile.toml`/`lakefile.lean` presence never entered into it. That broke on
+a repo laid out as several independent Lake projects (`examples/`,
+`homework/hw00/`, `homework/hw01/`, each its own project) below a root that
+itself carries a `lean-toolchain` pin (e.g. so bare `lean`/editor tooling at
+the root resolves *some* toolchain) but no lakefile of its own: the old check
+saw the root's `lean-toolchain` and treated the root itself as the project to
+overlay, so `use`/`refresh` operated on the root — deriving a version from its
+pin, overlaying (or checking staleness of) `$root/.lake/packages` — while
+never looking at the real projects below it, which kept no overlay at all.
+Opening one of those in an editor made Lake clone mathlib and its whole
+closure from the network instead of reading the shared cache (hundreds of MB,
+once observed at 666 MB for a single subproject). A root with *no*
+`lean-toolchain` at all failed even more visibly: `refresh` returned early as
+a no-op before touching anything.
+
+The fix: `is_lake_project()` — `lakefile.toml`/`lakefile.lean` **and**
+`lean-toolchain` in the same directory — replaces the lean-toolchain-only
+check as the gate for whether `use` (with no version given), `refresh`,
+`seed-build`, `clean`, and `publish-build` treat a path as a direct target.
+When a path fails that check — whether because it has no `lean-toolchain` at
+all, or because it has one but no lakefile of its own — `find_lake_projects`
+looks *beneath* it for directories that ARE Lake projects by the strict
+check, depth-limited (`-maxdepth 6`) and pruning `.lake` (a project's own
+dependency checkouts, which would otherwise surface as spurious nested
+"projects") and `.git`. `run_on_subprojects` then re-invokes the same command
+on each one found, in a subshell per project so one project's `die` aborts
+only that project's sweep entry, not the others. If the sweep finds nothing
+below the path either, each command falls back to its original
+lean-toolchain-only behavior on the path itself (rather than a hard
+not-a-project error/no-op it didn't use to have) — so a directory carrying
+only a `lean-toolchain` and no children still behaves exactly as before. A
+path that already satisfies `is_lake_project` skips the sweep entirely: this
+is additive, reached only on the path that used to be (incompletely) treated
+as "not a project." `use` also skips the sweep whenever a version is given
+explicitly, since a version names one direct target, not "apply this version
+everywhere below."
+
+Separately, the post-checkout/reference-transaction hook bodies carried their
+own `[[ -f "$root/lean-toolchain" ]] || exit 0` fast-path guard *before* even
+calling `lean-cache refresh` — a narrower issue than the one above, since it
+only silences a root with no `lean-toolchain` pin of its own at all (not the
+pinned-root-no-lakefile shape the courses-admin repo actually has, where the
+guard passed and `refresh` ran, just against the wrong target). That guard is
+removed too, so a genuinely pin-less root also reaches `refresh`'s own
+discovery rather than being skipped a layer earlier. Existing installed hooks
+pick this up on their next `use`/`refresh` regeneration, same as any other
+hook-body fix.
+
+Cost: a path that fails `is_lake_project` now pays one `find` (bounded,
+`.lake`/`.git`-pruned) per `refresh` invocation — including from the
+high-frequency `reference-transaction` hook — instead of the previous
+zero-cost early exit (or, for the pinned-root-no-lakefile shape, instead of
+operating directly and uselessly on the root). A path that already satisfies
+`is_lake_project` is unaffected: that check still short-circuits before any
+discovery runs.
+
 ### Wiring elan to the shared toolchain
 
 `lean-cache` runs its own `lean`/`lake` against the shared `ELAN_HOME`
@@ -663,7 +723,11 @@ Standard hostbot deploy-handler repo. `deploy.sh` (as `OWNER`):
 
 `test.sh` runs first in an isolated worktree: bash syntax + shellcheck, version
 resolution unit tests, validation-rejects-junk tests, the overlay/hooks
-scenarios, the build-seeding + push-gate scenarios, the warm/cold build-policy
+scenarios, the multi-project discovery scenarios (a non-project root sweeps
+the Lake projects beneath it for `use`/`refresh`/`seed-build`/`clean`, a
+project path is unaffected, an explicit version skips the sweep, a root with
+no Lake projects beneath it falls back to today's not-a-project behavior), the
+build-seeding + push-gate scenarios, the warm/cold build-policy
 scenarios (warm runs unslotted, cold serializes, foreground bails, background /
 force-wait / slot-held build to completion), the `slots` scenarios (a held lock
 probes as held without the probe itself holding it, a released one probes free
@@ -683,6 +747,19 @@ step.
 
 ## Known limitations / open points
 
+- **Pre-push gate and commit-hint are not multi-project aware.** `use`,
+  `refresh`, `seed-build`, `publish-build`, and `clean` all fall back to
+  sweeping the Lake projects beneath a non-project path (see "Repos with
+  several Lake projects" above), but `pre-push`/`pre-push-gate` and
+  `post-commit`/`commit-hint` still check only the repo root
+  (`$root/lakefile.toml`/`.lean`, `$root/lean-toolchain`) and no-op entirely
+  when it isn't a project. A push to a repo of several Lake projects with none
+  at the root is therefore never build-gated, and a commit touching such a
+  project's `*.lean` prints no publish reminder. Extending the gate to build
+  (and skip-check, and publish) every touched subproject on a push is a larger
+  change — it turns one gate build into up to N, needs its own per-project
+  changed-file computation — and is left for when it's actually needed rather
+  than spidered in behind the overlay fix.
 - **Shared cache is the mathlib closure.** `install` provisions mathlib and its
   transitive dependencies. Packages beyond that closure are handled per-project
   by the consumer overlay (above), not added to the shared cache — so they

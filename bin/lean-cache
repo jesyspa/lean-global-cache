@@ -1215,11 +1215,14 @@ find_lake_projects() { # arg: dir
 # more dispatched projects, propagated so it isn't mistaken for "found none".
 run_on_subprojects() { # args: dir cmd_fn
   local dir="$1" fn="$2" p found=0 rc=0 one
+  # cmd_seed_build -> seed-build, matching the CLI subcommand name (not the
+  # internal function name) in what gets logged.
+  local verb="${fn#cmd_}"; verb="${verb//_/-}"
   while IFS= read -r p; do
     found=1
-    log "$fn: $p"
+    log "$verb: $p"
     ( "$fn" "$p" ); one=$?
-    [[ "$one" -eq 0 ]] || { rc="$one"; log "$fn failed for $p (exit $one)"; }
+    [[ "$one" -eq 0 ]] || { rc="$one"; log "$verb failed for $p (exit $one)"; }
   done < <(find_lake_projects "$dir")
   [[ "$found" -eq 1 ]] || return 2
   return "$rc"

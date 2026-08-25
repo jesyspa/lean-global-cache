@@ -218,6 +218,33 @@ compares by `realpath`, so a symlinked `~/.elan` reads as correctly wired and a
 genuine shadow is flagged. A single-user cache the caller owns (`ELAN_HOME ==
 ~/.elan`) needs no wiring and is skipped.
 
+`wire_elan`'s repoint is unconditional on whatever `ROOT` currently resolves
+to for the invoking process — that is deliberate: it is what lets `~/.elan`
+follow a reconfigured `ROOT` (a host migration, a multi-user config change)
+without the caller having to notice and fix it by hand, and `ROOT` itself is
+already meant to be overridable per-invocation via `LEAN_CACHE_ROOT` (env var
+is the *highest*-precedence config source — see Configuration). Once, `test.sh`
+ran real `"$CLI" use` calls under a throwaway `LEAN_CACHE_ROOT` without also
+isolating `HOME`, and `wire_elan` did exactly what it's for: repointed the
+invoking (real) user's `~/.elan` at the throwaway cache's elan dir. `mktemp -d`
+cleaning that dir up on exit then left `~/.elan` dangling — every bare
+`lean`/`lake` broken until the next real `use` — with nothing surfaced,
+because the test redirects the CLI's stderr (where `wire_elan` does log the
+repoint) to `/dev/null`. The fix is hermeticity, not distrust: `test.sh` now
+exports a throwaway `HOME` before the first `use` call in its hermetic
+section (previously only the elan-wiring section's own cases scoped their own
+`HOME`; every other section's `use` calls did not), so `~/.elan` is never in
+the blast radius of a `LEAN_CACHE_ROOT` the test suite controls.
+`wire_elan` itself was deliberately left alone: it has no way to distinguish
+a test's throwaway `ROOT` from a legitimate reconfiguration, because from
+its perspective the environment *is* the configuration surface — same as
+every other `LEAN_CACHE_*` override the CLI honors. Making it second-guess
+`ROOT` would either break the legitimate reconfiguration case it exists for,
+or require guessing at what a "real" cache directory looks like, which is
+exactly the kind of heuristic that fails silently on the next unanticipated
+layout. Nothing in `use`'s own contract is unsafe here; the unsafety was
+entirely in a caller (`test.sh`) exercising it against real process state.
+
 Inside a project the `lean-toolchain` file selects the toolchain, so wiring is
 all a consumer needs. *Outside* any project, bare `lean`/`lake` fall back to
 elan's default toolchain, which a fresh shared `ELAN_HOME` does not set — so they

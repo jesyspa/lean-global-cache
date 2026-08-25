@@ -102,6 +102,14 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export LEAN_CACHE_ROOT="$TMP/cache"
 export LEAN_CACHE_BIN="$CLI"
+# `use` wires the invoking user's real $HOME/.elan at $ELAN_HOME (see
+# wire_elan) — a global, per-user, hard-to-notice mutation, unlike the
+# project-scoped .lake/packages overlay. Redirecting HOME here, before any
+# `use` call and before the elan-wiring section below populates a real
+# $LEAN_CACHE_ROOT/elan, keeps every `"$CLI" use` invocation in this suite off
+# the real ~/.elan even where a case doesn't scope its own HOME override.
+export HOME="$TMP/home"
+mkdir -p "$HOME"
 for slug in v4-30-0 v4-31-0; do
   mkdir -p "$TMP/cache/lakes/$slug/packages/mathlib" \
            "$TMP/cache/lakes/$slug/packages/batteries"

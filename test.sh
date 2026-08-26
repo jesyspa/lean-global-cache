@@ -1124,10 +1124,14 @@ check "failed build publishes a store entry"    "yes" "$(haspub "$c7")"
 check "failed build stamps tree_clean=0"        "tree_clean=0" "$(grep '^tree_clean=' "$m7" 2>/dev/null)"
 
 # seed-build seeds a non-green entry like any other (honest olean/trace pairs).
-NG="$TMP/ng"; gitc "$P" worktree add -q "$NG" "$c7" 2>/dev/null
-"$CLI" seed-build "$NG" >/dev/null 2>&1
-check "seed-build seeds a non-green entry"      "OLE10" \
-  "$(cat "$NG/.lake/build/lib/lean/Proj/A.olean" 2>/dev/null)"
+# A linked worktree is the only honest way to get a second checkout of $c7, and
+# `git worktree add` is the single most expensive call in the suite.
+if slow "seed-build seeds a non-green entry"; then
+  NG="$TMP/ng"; gitc "$P" worktree add -q "$NG" "$c7" 2>/dev/null
+  "$CLI" seed-build "$NG" >/dev/null 2>&1
+  check "seed-build seeds a non-green entry"      "OLE10" \
+    "$(cat "$NG/.lake/build/lib/lean/Proj/A.olean" 2>/dev/null)"
+fi
 
 # The gate must NOT skip on a non-green (tree_clean=0) store entry.
 : > "$TMP/g.log"
@@ -1713,7 +1717,11 @@ check "fix-perms of an uninstalled version fails"    "1" "$rc"
 # ------------------------------------------------------------------ runner ---
 # Groups are hermetic, so they run concurrently; their output is buffered and
 # replayed in declaration order so a parallel run reads like a serial one.
-SUITES=(static overlay_reset overlay_pick overlay_file overlay_hooks overlay_uninst multiproj hookmono pinnedroot elanwire elancmds install slots seed gate gateextra_e gateextra_f gateextra_g pubpush gateskip greenguard store hostslot policy shim selfheal events verify)
+SUITES=(static overlay_reset overlay_pick overlay_file overlay_hooks overlay_uninst multiproj hookmono pinnedroot elanwire elancmds install slots seed gate gateextra_e gateextra_g pubpush gateskip greenguard store hostslot policy shim selfheal events verify)
+# Deferred to the nightly tier: end-to-end round-trips whose core behaviour a
+# fast-tier group already covers, and which the deploy gate should not pay for.
+NIGHTLY_SUITES=(gateextra_f)
+if [[ "$RUN_SLOW" == 1 ]]; then SUITES+=("${NIGHTLY_SUITES[@]}"); fi
 OUT="$(mktemp -d)"; trap 'rm -rf "$OUT"' EXIT
 # Groups are dominated by process spawning and short git calls rather than by
 # sustained CPU, so running them all at once beats capping at core count.
@@ -1737,7 +1745,9 @@ for g in "${SUITES[@]}"; do
 done
 
 echo
-skipped="$(cat "$OUT"/*.log | grep -c 'skip (nightly):' || true)"
-[[ "$skipped" -gt 0 ]] && echo "$skipped case(s) deferred to the nightly tier (BOTS_RUN_SLOW=1 runs them)"
+if [[ "$RUN_SLOW" != 1 ]]; then
+  skipped="$(cat "$OUT"/*.log | grep -c 'skip (nightly):' || true)"
+  echo "nightly tier not run: ${#NIGHTLY_SUITES[@]} group(s), $skipped case(s) — BOTS_RUN_SLOW=1 runs them"
+fi
 if [[ "$fail" -eq 0 ]]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; fi
 exit "$fail"

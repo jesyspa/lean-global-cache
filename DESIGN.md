@@ -748,25 +748,17 @@ Standard hostbot deploy-handler repo. `deploy.sh` (as `OWNER`):
    (idempotent). The manifest is a **floor**: ad-hoc installs are never
    auto-removed, and pruning is manual via `uninstall`.
 
-`test.sh` runs first in an isolated worktree: bash syntax + shellcheck, version
-resolution unit tests, validation-rejects-junk tests, the overlay/hooks
-scenarios, the multi-project discovery scenarios (a non-project root sweeps
-the Lake projects beneath it for `use`/`refresh`/`seed-build`/`clean`, a
-project path is unaffected, an explicit version skips the sweep, a root with
-no Lake projects beneath it falls back to today's not-a-project behavior), the
-build-seeding + push-gate scenarios, the warm/cold build-policy
-scenarios (warm runs unslotted, cold serializes, foreground bails, background /
-force-wait / slot-held build to completion), the `slots` scenarios (a held lock
-probes as held without the probe itself holding it, a released one probes free
-again), the opportunistic-prune-on-use scenarios (an absent or stale stamp
-prunes and refreshes the stamp, a fresh stamp skips), the `lake` shim scenarios
-(non-build passthrough, build delegation, no self-recursion), the event-log
-scenarios (events written with the right fields across a use/seed/publish/gate
-flow, an unwritable log dir does not break the command, and `stats` summarizes a
-synthetic log), and the `verify` scenarios (a clean pass, then one violation
-per check planted at a time against a hand-built cache tree with a stub
-`elan`) — all with a stub `lake`. It does not touch the real cache or the
-network.
+`test.sh` runs first in an isolated worktree, against a stub `lake` and a stub
+`elan`: version resolution and validation, config resolution and its parity with
+`lib/config.sh`, the overlay/hooks scenarios, multi-project discovery, build
+seeding and the push gate, the warm/cold build policy, `slots`, the
+opportunistic prune on `use`, the `lake` shim, store rotation and retention, the
+event log and `stats`, `verify` and `fix-perms`. It touches neither the real
+cache nor the network.
+
+The suite is split into hermetic groups run in parallel, and into a push tier
+(what this deploy gate pays for) and a nightly tier. See `docs/testing.md` for
+both, and for how to add a case to either.
 
 `publish-build` / `seed-build` are not part of `deploy.sh`: they are per-user,
 per-project operations a bot runs in its own worktrees, not a host-level deploy

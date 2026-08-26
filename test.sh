@@ -1309,8 +1309,6 @@ echo "== transparent build policy (hermetic) =="
 # `lean-cache build`. A warm/incremental build runs immediately; a cold/full one
 # serializes and, in a bounded foreground call, bails instead of being killed.
 
-new_policy_projects
-
 # (a) Warm build runs immediately with no slot, even in a foreground call.
 : > "$TMP/pol.log"
 out="$(PATH="$STUB:$PATH" CLAUDE_BASH_MODE=foreground LAKE_LOG="$TMP/pol.log" "$CLI" build "$WP" 2>&1)"; rc=$?

@@ -51,6 +51,10 @@ OWNER="${LEAN_CACHE_OWNER:-${OWNER:-$(id -un)}}"
 GROUP="${LEAN_CACHE_GROUP:-${GROUP:-$(id -gn)}}"
 ROOT="${LEAN_CACHE_ROOT:-${ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/lean-global-cache}}"
 
+# The calling user, resolved once and reused everywhere a function would
+# otherwise re-run `id -un` (log_event, require_owner, register_safe_dirs, ...).
+ME="$(id -un)"
+
 SELF="$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 BIN="${LEAN_CACHE_BIN:-${BIN:-$SELF}}"
 
@@ -108,13 +112,19 @@ log()  { echo "==> $*" >&2; }
 # tab or newline — so the line stays one field-per-value.
 log_event() { # args: event [key=value ...]
   local event="$1"; shift || return 0
-  local ts user; ts="$(date +%s 2>/dev/null)" || return 0
-  user="$(id -un 2>/dev/null)" || return 0
-  local line="$ts"$'\t'"$user"$'\t'"$event" kv
+  local line="$EPOCHSECONDS"$'\t'"$ME"$'\t'"$event" kv
   for kv in "$@"; do line+=$'\t'"$kv"; done
   [[ -d "$LOG_DIR" ]] || mkdir -p "$LOG_DIR" 2>/dev/null || return 0
-  printf '%s\n' "$line" >> "$LOG_DIR/events.$user.log" 2>/dev/null || true
+  printf '%s\n' "$line" >> "$LOG_DIR/events.$ME.log" 2>/dev/null || true
   return 0
+}
+
+# Count non-empty lines in $1 without a printf|grep -c fork.
+count_nonempty_lines() {
+  local -a lines=(); mapfile -t lines <<<"$1"
+  local n=0 l
+  for l in "${lines[@]}"; do [[ -n "$l" ]] && n=$((n + 1)); done
+  printf '%s' "$n"
 }
 
 usage() {
@@ -255,10 +265,21 @@ packages_for() { echo "$LAKES/$1/packages"; } # arg: slug
 MV_HAS_EXCHANGE=""
 mv_has_exchange() {
   if [[ -z "$MV_HAS_EXCHANGE" ]]; then
-    if mv --help 2>/dev/null | grep -q -- '--exchange'; then MV_HAS_EXCHANGE=yes
+    local help; help="$(mv --help 2>/dev/null)"
+    if [[ "$help" == *'--exchange'* ]]; then MV_HAS_EXCHANGE=yes
     else MV_HAS_EXCHANGE=no; fi
   fi
   [[ "$MV_HAS_EXCHANGE" == yes ]]
+}
+
+# True if elan's toolchain list contains $1 as an exact entry, ignoring
+# elan's " (default)" suffix on the current default.
+toolchain_installed() { # arg: toolchain
+  local line
+  while IFS= read -r line; do
+    [[ "${line% (default)}" == "$1" ]] && return 0
+  done < <(elan toolchain list 2>/dev/null)
+  return 1
 }
 
 # Stable identity for the repo a worktree belongs to. All worktrees of one repo
@@ -271,9 +292,9 @@ repo_identity() {
   [[ "$gitdir" = /* ]] || gitdir="$(cd "$proj" && cd "$gitdir" && pwd)"
   gitdir="$(realpath "$gitdir" 2>/dev/null || echo "$gitdir")"
   local base hash
-  base="$(basename "$(dirname "$gitdir")")"
+  base="${gitdir%/*}"; base="${base##*/}"
   [[ -n "$base" && "$base" != "." && "$base" != "/" ]] || base="repo"
-  hash="$(printf '%s' "$gitdir" | sha1sum | cut -c1-12)"
+  hash="$(printf '%s' "$gitdir" | sha1sum)"; hash="${hash:0:12}"
   printf '%s-%s' "$base" "$hash"
 }
 
@@ -306,7 +327,7 @@ seed_tree() { # args: src dst
   local src="$1" dst="$2" f rel
   [[ -d "$src" ]] || return 0
   while IFS= read -r -d '' f; do
-    rel="${f#"$src"}"; mkdir -p "$dst$(dirname "$rel")"
+    rel="${f#"$src"}"; mkdir -p "$dst${rel%/*}"
     if [[ "$f" == *.olean ]]; then
       ln -f "$f" "$dst$rel" 2>/dev/null || { cp -p "$f" "$dst$rel"; chmod u+w "$dst$rel"; }
     else
@@ -520,7 +541,7 @@ stored_warm_build_matches() { # arg: proj
   [[ -f "$proj/lean-toolchain" ]] || return 1
   commit="$(git -C "$proj" rev-parse HEAD 2>/dev/null)" || return 1
   [[ -n "$commit" ]] || return 1
-  slug="$( { normalize_version "$(cat "$proj/lean-toolchain")" && printf '%s' "$SLUG"; } 2>/dev/null )" || slug=""
+  slug="$( { normalize_version "$(<"$proj/lean-toolchain")" && printf '%s' "$SLUG"; } 2>/dev/null )" || slug=""
   [[ -n "$slug" ]] || return 1
   store="$(build_store_for "$proj" "$commit" "$slug")" || return 1
   [[ -d "$store/lib" ]]
@@ -606,7 +627,7 @@ run_build_policied() { # args: proj who [lake build args...]
 
 # Re-exec the current invocation as the cache owner. Used by mutating commands.
 require_owner() {
-  if [[ "$(id -un)" != "$OWNER" ]]; then
+  if [[ "$ME" != "$OWNER" ]]; then
     [[ -x "$INSTALLED_SELF" ]] \
       || die "must run as $OWNER and $INSTALLED_SELF is not installed"
     log "re-executing as $OWNER via sudo"
@@ -656,10 +677,13 @@ ignore_filemode() { # arg: packages dir
 # A no-op for OWNER (who owns the tree) and when the entry is already present.
 register_safe_dirs() {
   local glob="$LAKES/*" have
-  [[ "$(id -un)" == "$OWNER" ]] && return 0
+  [[ "$ME" == "$OWNER" ]] && return 0
   command -v git >/dev/null 2>&1 || return 0
   have="$(git config --global --get-all safe.directory 2>/dev/null || true)"
-  grep -qxF "$glob" <<<"$have" && return 0
+  local line
+  while IFS= read -r line; do
+    [[ "$line" == "$glob" ]] && return 0
+  done <<<"$have"
   git config --global --add safe.directory "$glob" 2>/dev/null || true
 }
 
@@ -722,14 +746,14 @@ cmd_resolve() {
 # (wiring that only affects interactive/editor use) does not.
 cmd_check_env() {
   [[ $# -eq 0 ]] || usage
-  local fails=0 warns=0 me; me="$(id -un)"
+  local fails=0 warns=0
   pass() { echo "  ok    $*"; }
   warn() { echo "  warn  $*"; warns=$((warns + 1)); }
   fail() { echo "  FAIL  $*"; fails=$((fails + 1)); }
 
   echo "config      ${CONFIG_FILE:-<none — built-in defaults>}"
   echo "cache root  $ROOT"
-  echo "owner       $OWNER   (you are $me)"
+  echo "owner       $OWNER   (you are $ME)"
 
   if [[ -d "$LAKES" && -r "$LAKES" ]]; then pass "cache readable"
   elif [[ -e "$LAKES" ]]; then fail "cache $LAKES is not readable"
@@ -756,14 +780,14 @@ cmd_check_env() {
 
   # Consumer git-trust: without it Lake mistakes the OWNER-owned dep repos for a
   # changed URL and re-clones. `use` registers these; the OWNER needs nothing.
-  if [[ "$me" != "$OWNER" ]]; then
+  if [[ "$ME" != "$OWNER" ]]; then
     local anyrepo; anyrepo="$(find "$LAKES" -maxdepth 4 -name .git -printf '%h\n' -quit 2>/dev/null || true)"
     if [[ -z "$anyrepo" ]]; then :
     elif git -C "$anyrepo" rev-parse --git-dir >/dev/null 2>&1; then pass "cache repos are git-trusted (no re-clone)"
     else warn "cache repos not git-trusted; run 'lean-cache use' in a project, or: git config --global --add safe.directory \"$LAKES/*\""; fi
   fi
 
-  if grep -q 'LEAN_CACHE_LAKE_SHIM' "$(dirname "$BIN")/lake" 2>/dev/null; then
+  if grep -q 'LEAN_CACHE_LAKE_SHIM' "${BIN%/*}/lake" 2>/dev/null; then
     echo "lake shim   installed"
   else
     echo "lake shim   off (bare 'lake build' is unpoliced; use 'lean-cache build' for the slot policy)"
@@ -796,7 +820,7 @@ cmd_verify() {
     local d slug mlbuild first_olean
     for d in "$LAKES"/*/; do
       [[ -d "${d}packages" ]] || continue
-      slug="$(basename "$d")"; slugs+=("$slug")
+      slug="${d%/}"; slug="${slug##*/}"; slugs+=("$slug")
       mlbuild="${d}packages/mathlib/.lake/build"
       first_olean="$(find "$mlbuild" -name '*.olean' -print -quit 2>/dev/null || true)"
       if [[ -n "$first_olean" ]]; then pass "$slug: mathlib oleans present"
@@ -860,7 +884,7 @@ cmd_verify() {
   # 6. Stale scratch: leftovers from an install interrupted mid-flight
   # (cmd_install's own .build.<slug>.* and .packages.incoming/old.* dirs). A
   # fresh one may be an in-flight install, so only flag entries over a day old.
-  local now p mtime age; now="$(date +%s)"
+  local now p mtime age; now="$EPOCHSECONDS"
   for p in "$LAKES"/.build.* "$LAKES"/*/.packages.incoming.* "$LAKES"/*/.packages.old.*; do
     [[ -e "$p" ]] || continue
     mtime="$(stat -c '%Y' "$p" 2>/dev/null || echo "$now")"
@@ -887,12 +911,13 @@ cmd_link() {
 
 cmd_list() {
   [[ -d "$LAKES" ]] || { echo "(no versions installed)"; return 0; }
-  local found=0 d slug
+  local found=0 d slug size
   for d in "$LAKES"/*/; do
     [[ -d "${d}packages" ]] || continue
-    slug="$(basename "$d")"
+    slug="${d%/}"; slug="${slug##*/}"
     found=1
-    printf '%s\t%s\n' "$(du -sh "${d}packages" 2>/dev/null | cut -f1)" "$slug"
+    size="$(du -sh "${d}packages" 2>/dev/null)"
+    printf '%s\t%s\n' "${size%%$'\t'*}" "$slug"
   done
   [[ "$found" -eq 1 ]] || echo "(no versions installed)"
 }
@@ -907,7 +932,7 @@ cmd_fix_filemode() {
   local d slug found=0
   for d in "$LAKES"/*/; do
     [[ -d "${d}packages" ]] || continue
-    slug="$(basename "$d")"; found=1
+    slug="${d%/}"; slug="${slug##*/}"; found=1
     log "untracking file-mode in $slug"
     ignore_filemode "${d}packages"
   done
@@ -938,7 +963,7 @@ cmd_fix_perms() {
   local d slug found=0
   for d in "$LAKES"/*/; do
     [[ -d "${d}packages" ]] || continue
-    slug="$(basename "$d")"; found=1
+    slug="${d%/}"; slug="${slug##*/}"; found=1
     log "normalizing permissions in $slug"
     normalize_perms "${d%/}"
   done
@@ -954,7 +979,7 @@ _install_exit() {
   local rc=$?
   rm -rf "${build:-}"
   local ok=1; [[ "$rc" -eq 0 ]] || ok=0
-  log_event install slug="${INSTALL_SLUG:-}" secs="$(( $(date +%s) - ${INSTALL_T0:-0} ))" \
+  log_event install slug="${INSTALL_SLUG:-}" secs="$(( EPOCHSECONDS - ${INSTALL_T0:-0} ))" \
     ok="$ok" forced="${INSTALL_FORCED:-0}"
 }
 
@@ -986,7 +1011,7 @@ cmd_install() {
   # in global scope (after cmd_install returns), where a local would be invisible
   # — the same reason `build` below is global. The trap logs the install event on
   # every exit path, so a failure (any `die`) records ok=0 as well.
-  INSTALL_SLUG="$SLUG"; INSTALL_FORCED="$force"; INSTALL_T0="$(date +%s)"
+  INSTALL_SLUG="$SLUG"; INSTALL_FORCED="$force"; INSTALL_T0="$EPOCHSECONDS"
 
   # Serialize installs of the same version.
   mkdir -p "$LAKES"
@@ -1014,7 +1039,7 @@ cmd_install() {
   # elan suffixes the default toolchain with " (default)", so strip that before
   # the exact match or an installed default would be "missing" and re-installed.
   log "ensuring toolchain $TOOLCHAIN"
-  if elan toolchain list 2>/dev/null | sed 's/ (default)$//' | grep -qxF "$TOOLCHAIN"; then
+  if toolchain_installed "$TOOLCHAIN"; then
     log "toolchain $TOOLCHAIN already present"
   else
     elan toolchain install "$TOOLCHAIN"
@@ -1137,9 +1162,9 @@ cmd_uninstall() {
   # stripped-suffix lookup would hide which case we're in, and uninstalling the
   # default toolchain breaks elan for every other toolchain too.
   local tc_list; tc_list="$(elan toolchain list 2>/dev/null || true)"
-  if printf '%s\n' "$tc_list" | grep -qxF "$TOOLCHAIN (default)"; then
+  if [[ $'\n'"$tc_list"$'\n' == *$'\n'"$TOOLCHAIN (default)"$'\n'* ]]; then
     log "toolchain $TOOLCHAIN is elan's default — skipping removal (uninstalling it would break elan); switch it first with '$PROG set-default-toolchain <other>' if you really want it gone"
-  elif printf '%s\n' "$tc_list" | grep -qxF "$TOOLCHAIN"; then
+  elif [[ $'\n'"$tc_list"$'\n' == *$'\n'"$TOOLCHAIN"$'\n'* ]]; then
     log "removing toolchain $TOOLCHAIN"
     elan toolchain uninstall "$TOOLCHAIN"
     removed=1
@@ -1170,7 +1195,7 @@ cmd_set_default() {
   # elan suffixes the current default with " (default)", so strip it before the
   # exact match (mirrors cmd_install), else an already-default toolchain reads as
   # missing.
-  if ! elan toolchain list 2>/dev/null | sed 's/ (default)$//' | grep -qxF "$TOOLCHAIN"; then
+  if ! toolchain_installed "$TOOLCHAIN"; then
     die "$TCVER is not installed; run: $PROG install $TCVER"
   fi
   elan default "$TOOLCHAIN"
@@ -1198,7 +1223,7 @@ find_lake_projects() { # arg: dir
   local f d
   find "$1" -mindepth 1 -maxdepth 6 \( -name .lake -o -name .git \) -prune -o \
        -type f \( -name lakefile.toml -o -name lakefile.lean \) -print 2>/dev/null \
-    | while IFS= read -r f; do dirname "$f"; done \
+    | while IFS= read -r f; do printf '%s\n' "${f%/*}"; done \
     | sort -u \
     | while IFS= read -r d; do is_lake_project "$d" && printf '%s\n' "$d"; done
 }
@@ -1275,7 +1300,7 @@ cmd_use() {
       [[ -f "$proj/lean-toolchain" ]] \
         || die "no version given and no $proj/lean-toolchain to derive it from (and no Lake project found beneath $proj)"
     fi
-    version="$(cat "$proj/lean-toolchain")"
+    version="$(<"$proj/lean-toolchain")"
   fi
   normalize_version "$version"
   local shared; shared="$(packages_for "$SLUG")"
@@ -1335,7 +1360,7 @@ cmd_use() {
   # real directory of that name (an intentional override or extra).
   local pkg name linked=0
   for pkg in "$shared"/*/; do
-    name="$(basename "$pkg")"
+    name="${pkg%/}"; name="${name##*/}"
     [[ -e "$pkgdir/$name" && ! -L "$pkgdir/$name" ]] && continue
     ln -sfn "${pkg%/}" "$pkgdir/$name"
     linked=$((linked + 1))
@@ -1363,7 +1388,7 @@ cmd_use() {
   if [[ -d "$BUILDS" ]]; then
     local prune_stamp="$BUILDS/.last-prune" prune_stamp_age
     prune_stamp_age="$(stat -c %Y "$prune_stamp" 2>/dev/null || echo 0)"
-    if [[ $(( $(date +%s) - prune_stamp_age )) -ge 86400 ]]; then
+    if [[ $(( EPOCHSECONDS - prune_stamp_age )) -ge 86400 ]]; then
       cmd_prune_builds || true
       touch "$prune_stamp" 2>/dev/null || true
     fi
@@ -1422,7 +1447,7 @@ cmd_refresh() {
     # nothing to refresh.
     [[ -f "$proj/lean-toolchain" ]] || return 0
   fi
-  normalize_version "$(cat "$proj/lean-toolchain")"
+  normalize_version "$(<"$proj/lean-toolchain")"
   # Never provision from the hook path: refreshing an overlay to a version that
   # isn't installed is a no-op, not a trigger for a multi-minute build inside a
   # git hook. Direct `use` (not refresh) is what auto-installs.
@@ -1463,7 +1488,7 @@ cmd_seed_build() {
   fi
   local commit; commit="$(git -C "$proj" rev-parse HEAD 2>/dev/null)" || return 0
   [[ -n "$commit" ]] || return 0
-  normalize_version "$(cat "$proj/lean-toolchain")"
+  normalize_version "$(<"$proj/lean-toolchain")"
 
   local store; store="$(build_store_for "$proj" "$commit" "$SLUG")" || return 0
   if [[ ! -d "$store/lib" ]]; then            # no warm build stored for this exact (commit, slug)
@@ -1475,8 +1500,10 @@ cmd_seed_build() {
   # writable — otherwise a hardlinked artifact could be mutated underneath a
   # worktree. On any doubt, skip seeding rather than risk a poisoned link.
   local owner; owner="$(stat -c '%U' "$store" 2>/dev/null)"
-  [[ "$owner" == "$(id -un)" ]] || { log "build store $store not owned by $(id -un); skipping seed"; return 0; }
-  if find "$store" \( -perm -0020 -o -perm -0002 \) -print -quit 2>/dev/null | grep -q .; then
+  [[ "$owner" == "$ME" ]] || { log "build store $store not owned by $ME; skipping seed"; return 0; }
+  local writable_path
+  writable_path="$(find "$store" \( -perm -0020 -o -perm -0002 \) -print -quit 2>/dev/null)"
+  if [[ -n "$writable_path" ]]; then
     log "build store $store has group/other-writable files; skipping seed"; return 0
   fi
 
@@ -1537,7 +1564,7 @@ cmd_publish_build() {
   local commit; commit="$(git -C "$proj" rev-parse HEAD 2>/dev/null)" \
     || die "$proj is not a git repository"
   [[ -n "$commit" ]] || die "no HEAD commit in $proj"
-  normalize_version "$(cat "$proj/lean-toolchain")"
+  normalize_version "$(<"$proj/lean-toolchain")"
 
   # Publish only at a commit boundary: the working tree must match committed
   # HEAD, so every stored build is an honest snapshot keyed to real committed
@@ -1545,7 +1572,7 @@ cmd_publish_build() {
   tree_clean_for_build "$proj" \
     || die "refusing to publish a dirty tree; commit your changes first"
 
-  local pub_t0; pub_t0="$(date +%s)"
+  local pub_t0; pub_t0="$EPOCHSECONDS"
   log "building $proj before publishing (this can take minutes)"
   acquire_build_slot "$PROG publish-build"
   # A failed build is still publishable: its .lake/build holds honest olean/trace
@@ -1568,26 +1595,28 @@ cmd_publish_build() {
   # failed rebuild at a commit already known green must not stale the entry or
   # switch off the gate's skip. Leave the stored green build in place, and never
   # fail the caller (a push must not be affected).
-  if [[ "$green" -eq 0 ]] && grep -qx 'tree_clean=1' "$store/.seed-manifest" 2>/dev/null; then
-    log_event publish repo="$(repo_identity "$proj")" commit="${commit:0:12}" slug="$SLUG" green="$green" secs=$(( $(date +%s) - pub_t0 ))
+  if [[ "$green" -eq 0 ]] && build_is_green "$store"; then
+    log_event publish repo="$(repo_identity "$proj")" commit="${commit:0:12}" slug="$SLUG" green="$green" secs=$(( EPOCHSECONDS - pub_t0 ))
     log "keeping stored green build for $TCVER @ ${commit:0:12}; not overwriting with a non-green build"
     return 0
   fi
 
-  mkdir -p "$(dirname "$store")"
+  mkdir -p "${store%/*}"
   local incoming="${store}.incoming.$$"
   rm -rf "$incoming"; mkdir -p "$incoming"
   cp -a "$proj/.lake/build/lib" "$incoming/lib"
   [[ -d "$proj/.lake/build/ir" ]] && cp -a "$proj/.lake/build/ir" "$incoming/ir"
+  local -a oleans=()
+  mapfile -t oleans < <(find "$incoming/lib" -name '*.olean' 2>/dev/null)
   printf 'repo=%s\ncommit=%s\ntoolchain=%s\nslug=%s\noleans=%s\npublished_by=%s\npublished_at=%s\ntree_clean=%s\n' \
     "$(repo_identity "$proj")" "$commit" "$TOOLCHAIN" "$SLUG" \
-    "$(find "$incoming/lib" -name '*.olean' 2>/dev/null | wc -l)" "$(id -un)" "$(date +%s)" "$green" \
+    "${#oleans[@]}" "$ME" "$EPOCHSECONDS" "$green" \
     > "$incoming/.seed-manifest"
   normalize_build_store "$incoming"
 
   rm -rf "$store"
   mv "$incoming" "$store"
-  log_event publish repo="$(repo_identity "$proj")" commit="${commit:0:12}" slug="$SLUG" green="$green" secs=$(( $(date +%s) - pub_t0 ))
+  log_event publish repo="$(repo_identity "$proj")" commit="${commit:0:12}" slug="$SLUG" green="$green" secs=$(( EPOCHSECONDS - pub_t0 ))
   log "published $([[ "$green" -eq 1 ]] && echo green || echo non-green) build for $TCVER @ ${commit:0:12} -> $store"
 
   # Rotate this repo's store: the build just published is now "latest" and is
@@ -1605,7 +1634,11 @@ build_published_at() {
 }
 
 # True if a stored build dir holds a green (lake-exited-0) build.
-build_is_green() { grep -qx 'tree_clean=1' "$1/.seed-manifest" 2>/dev/null; }
+build_is_green() { # arg: build store dir
+  local content
+  content="$(<"$1/.seed-manifest")" 2>/dev/null || return 1
+  [[ $'\n'"$content"$'\n' == *$'\n'"tree_clean=1"$'\n'* ]]
+}
 
 # Rotate one repo's store dir ($BUILDS/<repo>): keep the newest build per slug
 # (toolchain) AND the newest green build per slug indefinitely; remove any other
@@ -1615,14 +1648,14 @@ build_is_green() { grep -qx 'tree_clean=1' "$1/.seed-manifest" 2>/dev/null; }
 prune_builds_under() {
   local repo="$1" keep_days="$2"
   [[ -d "$repo" ]] || return 0
-  local now cutoff; now="$(date +%s)"; cutoff=$(( now - keep_days * 86400 ))
+  local now cutoff; now="$EPOCHSECONDS"; cutoff=$(( now - keep_days * 86400 ))
   local -A latest=() latest_green=()
   local d slug ts
   # Pass 1: newest publish time per slug, and newest green publish time per slug.
   while IFS= read -r -d '' d; do
     case "$d" in *.incoming.*) continue ;; esac
     [[ -e "$d/.seed-manifest" || -d "$d/lib" ]] || continue
-    slug="$(basename "$d")"; ts="$(build_published_at "$d")"
+    slug="${d##*/}"; ts="$(build_published_at "$d")"
     [[ -z "${latest[$slug]:-}" || "$ts" -gt "${latest[$slug]}" ]] && latest[$slug]="$ts"
     if build_is_green "$d"; then
       [[ -z "${latest_green[$slug]:-}" || "$ts" -gt "${latest_green[$slug]}" ]] && latest_green[$slug]="$ts"
@@ -1633,11 +1666,12 @@ prune_builds_under() {
   while IFS= read -r -d '' d; do
     case "$d" in *.incoming.*) continue ;; esac
     [[ -e "$d/.seed-manifest" || -d "$d/lib" ]] || continue
-    slug="$(basename "$d")"; ts="$(build_published_at "$d")"
+    slug="${d##*/}"; ts="$(build_published_at "$d")"
     [[ "$ts" -eq "${latest[$slug]:-0}" ]] && continue   # newest per slug: keep
     [[ "$ts" -eq "${latest_green[$slug]:-0}" ]] && build_is_green "$d" && continue  # newest green per slug: keep
     [[ "$ts" -lt "$cutoff" ]] || continue               # within window: keep
-    log "pruning stale build $(basename "$(dirname "$d")")/$slug (~$(( (now - ts) / 86400 ))d old)"
+    local repo_base="${d%/*}"; repo_base="${repo_base##*/}"
+    log "pruning stale build $repo_base/$slug (~$(( (now - ts) / 86400 ))d old)"
     rm -rf "$d"
   done < <(find "$repo" -mindepth 2 -maxdepth 2 -type d -print0 2>/dev/null)
   # Drop commit dirs left empty by pruning.
@@ -1671,8 +1705,9 @@ HOOK_SENTINEL="lean-cache-managed-hook"
 # a pre-sentinel legacy post-checkout hook (recognized by its body) that we
 # should upgrade in place.
 hook_is_ours() {
-  grep -qF "$HOOK_SENTINEL" "$1" 2>/dev/null && return 0
-  grep -qF "Re-establish the .lake/packages overlay" "$1" 2>/dev/null
+  local content
+  content="$(<"$1")" 2>/dev/null || return 1
+  [[ "$content" == *"$HOOK_SENTINEL"* || "$content" == *"Re-establish the .lake/packages overlay"* ]]
 }
 
 # Write our version of a single hook unless a foreign hook already occupies the
@@ -1824,11 +1859,11 @@ cmd_pre_push_gate() {
   # Set LEAN_CACHE_NO_GATE_SKIP=1 to force the rebuild.
   if [[ -z "${LEAN_CACHE_NO_GATE_SKIP:-}" && -f "$root/lean-toolchain" ]]; then
     local slug store
-    slug="$( { normalize_version "$(cat "$root/lean-toolchain")" && printf '%s' "$SLUG"; } 2>/dev/null )" || slug=""
+    slug="$( { normalize_version "$(<"$root/lean-toolchain")" && printf '%s' "$SLUG"; } 2>/dev/null )" || slug=""
     if [[ -n "$slug" ]] && store="$(build_store_for "$root" "$head" "$slug")" \
        && [[ -d "$store/lib" ]] \
-       && [[ "$(stat -c '%U' "$store" 2>/dev/null)" == "$(id -un)" ]] \
-       && grep -qx 'tree_clean=1' "$store/.seed-manifest" 2>/dev/null; then
+       && [[ "$(stat -c '%U' "$store" 2>/dev/null)" == "$ME" ]] \
+       && build_is_green "$store"; then
       echo "lean push gate: green build already stored for HEAD (${head:0:12}, $slug) — skipping the gate build" >&2
       log_event gate outcome=skip repo="$(repo_identity "$root")" commit="${head:0:12}" secs=0
       exit 0
@@ -1840,7 +1875,7 @@ cmd_pre_push_gate() {
     if [[ -n "$f" && -f "$root/$f" ]]; then touch "$root/$f"; fi
   done <<< "$changed"
   command -v lake >/dev/null 2>&1 || { echo 'lean push gate: lake not found in PATH (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; exit 1; }
-  local n; n="$(printf '%s\n' "$changed" | grep -c . || true)"
+  local n; n="$(count_nonempty_lines "$changed")"
   if [[ "$undecided" -eq 1 && "$n" -eq 0 ]]; then
     echo "lean push gate: cannot compute the changed .lean set (remote tip not fetched); running full 'lake build' (may take minutes)..." >&2
   else
@@ -1853,11 +1888,11 @@ cmd_pre_push_gate() {
   # checkout, so Lake sees a bogus URL mismatch and tries to re-clone the
   # (read-only, cache-symlinked) package. run_lake_build scrubs the injected
   # vars so the gate build matches a plain interactive lake build.
-  gate_t0="$(date +%s)"
+  gate_t0="$EPOCHSECONDS"
   acquire_build_slot "lean push gate"
   run_lake_build "$root" "lean push gate" \
-    || { echo 'lean push gate: lake build FAILED — push aborted (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; log_event gate outcome=fail repo="$(repo_identity "$root")" commit="${head:0:12}" secs=$(( $(date +%s) - gate_t0 )); exit 1; }
-  log_event gate outcome=ok repo="$(repo_identity "$root")" commit="${head:0:12}" secs=$(( $(date +%s) - gate_t0 ))
+    || { echo 'lean push gate: lake build FAILED — push aborted (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; log_event gate outcome=fail repo="$(repo_identity "$root")" commit="${head:0:12}" secs=$(( EPOCHSECONDS - gate_t0 )); exit 1; }
+  log_event gate outcome=ok repo="$(repo_identity "$root")" commit="${head:0:12}" secs=$(( EPOCHSECONDS - gate_t0 ))
   echo 'lean push gate: build OK — allowing push' >&2
   # The full build just passed, so .lake/build is a complete warm build for this
   # exact commit — capture it for reuse now. publish-build's own `lake build` is
@@ -1928,7 +1963,7 @@ cmd_commit_hint() {
   [[ -n "$root" ]] || root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
   local changed n
   changed="$(git -C "$root" diff-tree --no-commit-id --name-only -r --root HEAD -- '*.lean' 2>/dev/null)" || return 0
-  n="$(printf '%s\n' "$changed" | grep -c . || true)"
+  n="$(count_nonempty_lines "$changed")"
   [[ "$n" -gt 0 ]] || return 0
   echo "lean-cache: committed changes to $n .lean file(s); run 'lean-cache publish-build' to store the warm build for reuse (a clean push publishes it automatically)." >&2
 }
@@ -1955,7 +1990,7 @@ cmd_stats() {
   [[ "$since" =~ ^[0-9]+$ ]] || die "--since must be a non-negative integer"
 
   [[ -d "$LOG_DIR" ]] || { echo "no event log at $LOG_DIR (nothing logged yet)"; return 0; }
-  local now cutoff; now="$(date +%s)"; cutoff=$(( now - since * 86400 ))
+  local now cutoff; now="$EPOCHSECONDS"; cutoff=$(( now - since * 86400 ))
 
   local files=() f
   for f in "$LOG_DIR"/events.*.log; do

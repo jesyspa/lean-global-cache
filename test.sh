@@ -634,9 +634,12 @@ chmod +x "$ISTUB/lake"
 
 # (a) Contend the only slot with zero wait: install must still complete AND
 # announce it degraded to unserialized — proving it tried to take a slot.
-flock "$TMP/lean-cache-build-slot.0.lock" sleep 60 &
-ilocker=$!
-until ! flock -n "$TMP/lean-cache-build-slot.0.lock" true 2>/dev/null; do sleep 0.1; done
+# Every contended-slot case here holds the lock on a dedicated fd of this shell.
+# A backgrounded `flock … sleep N` would tie the hold to a timeout the probe can
+# outlive under load, and releasing it means chasing flock(1)'s forked child. The
+# CLI probes from its own process, so it sees the lock as held either way.
+exec 200>"$TMP/lean-cache-build-slot.0.lock"
+flock -x 200
 : > "$TMP/i.log"
 out="$(PATH="$ISTUB:$PATH" LEAN_CACHE_BUILD_LOCK_DIR="$TMP" \
        LEAN_CACHE_BUILD_SLOTS=1 LEAN_CACHE_BUILD_WAIT=0 \
@@ -657,9 +660,7 @@ out="$(PATH="$ISTUB:$PATH" LEAN_CACHE_BUILD_LOCK_DIR="$TMP" LEAN_CACHE_BUILD_SLO
 check "slot-held install completes"                "0" "$rc"
 check "slot-held install acquires no new slot"     "no" \
   "$(printf '%s' "$out" | grep -q 'build slot' && echo yes || echo no)"
-# flock(1) forks: kill the child holding the lock, then the wrapper.
-kill $(ps -o pid= --ppid "$ilocker" 2>/dev/null) 2>/dev/null || true
-kill "$ilocker" 2>/dev/null || true; wait "$ilocker" 2>/dev/null || true
+flock -u 200; exec 200>&-
 
 # (c) A --force rebuild swaps the freshly built tree into an already-populated
 # $pkgs and leaves no scratch dirs behind — via mv --exchange (coreutils >=9.5)
@@ -733,10 +734,9 @@ check "slots reports slot 0 free"            "yes" \
 check "slots reports slot 1 free"            "yes" \
   "$(printf '%s' "$out" | grep -qE '^  slot 1: free' && echo yes || echo no)"
 
-# Hold slot 0 from a background subshell, then assert the probe sees it held.
-flock "$SLOTS_DIR/lean-cache-build-slot.0.lock" sleep 20 &
-slocker=$!
-until ! flock -n "$SLOTS_DIR/lean-cache-build-slot.0.lock" true 2>/dev/null; do sleep 0.1; done
+# Hold slot 0 on a dedicated fd of this shell, then assert the probe sees it held.
+exec 200>"$SLOTS_DIR/lean-cache-build-slot.0.lock"
+flock -x 200
 out="$(slots_cli)"; rc=$?
 check "slots exits 0 even with a held slot"  "0" "$rc"
 check "slots sees the held slot"             "yes" \
@@ -749,11 +749,7 @@ check "slots leaves the other slot free"     "yes" \
 out2="$(slots_cli)"
 check "slots probe doesn't disturb the real holder's lock" "yes" \
   "$(printf '%s' "$out2" | grep -qE '^  slot 0: held' && echo yes || echo no)"
-# flock(1) forks: kill the child actually holding the lock (killing only the
-# wrapper leaves an orphaned sleep pinning the slot), then the wrapper itself.
-# Plain kill by pid — pkill is unreliable here (shimmed on some hosts).
-kill $(ps -o pid= --ppid "$slocker" 2>/dev/null) 2>/dev/null || true
-kill "$slocker" 2>/dev/null || true; wait "$slocker" 2>/dev/null || true
+flock -u 200; exec 200>&-
 
 out="$(slots_cli)"
 check "slots sees the slot free again after release" "yes" \
@@ -1273,18 +1269,13 @@ printf '.lake/\n' > "$CB/.gitignore"; printf 'def cb := 1\n' > "$CB/Proj/CB.lean
 gitc "$CB" add -A; gitc "$CB" commit -qm init
 
 # All slots busy + zero wait: degrade to an unserialized build with a note.
-flock "$TMP/lean-cache-build-slot.0.lock" sleep 20 &
-locker=$!
-until ! flock -n "$TMP/lean-cache-build-slot.0.lock" true 2>/dev/null; do sleep 0.1; done
+exec 200>"$TMP/lean-cache-build-slot.0.lock"
+flock -x 200
 out="$(PATH="$STUB:$PATH" LEAN_CACHE_FORCE_WAIT=1 LEAN_CACHE_BUILD_SLOTS=1 LEAN_CACHE_BUILD_WAIT=0 "$CLI" build "$CB" 2>&1)"; rc=$?
 check "contended slot degrades, build still runs" "0" "$rc"
 check "contended slot says so"                  "yes" \
   "$(printf '%s' "$out" | grep -q 'proceeding unserialized' && echo yes || echo no)"
-# flock(1) forks: kill the child actually holding the lock (killing only the
-# wrapper leaves an orphaned sleep pinning the slot), then the wrapper itself.
-# Plain kill by pid — pkill is unreliable here (shimmed on some hosts).
-kill $(ps -o pid= --ppid "$locker" 2>/dev/null) 2>/dev/null || true
-kill "$locker" 2>/dev/null || true; wait "$locker" 2>/dev/null || true
+flock -u 200; exec 200>&-
 
 # LEAN_CACHE_BUILD_SLOTS=0 disables serialization entirely (no slot chatter).
 out="$(PATH="$STUB:$PATH" LEAN_CACHE_FORCE_WAIT=1 LEAN_CACHE_BUILD_SLOTS=0 "$CLI" build "$CB" 2>&1)"; rc=$?

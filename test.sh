@@ -142,12 +142,14 @@ for f in "$CLI" "$REPO_DIR/bin/lake-shim" "$REPO_DIR/deploy.sh" "$REPO_DIR/test.
   bash -n "$f" && note "ok: $f"
 done
 
-if command -v shellcheck >/dev/null 2>&1; then
-  echo "== shellcheck =="
-  shellcheck -S warning "$CLI" "$REPO_DIR/bin/lake-shim" "$REPO_DIR/deploy.sh" "$REPO_DIR/test.sh" \
-    "$REPO_DIR/lib/config.sh" "$REPO_DIR"/admin/*.sh && note "ok: shellcheck clean"
-else
-  echo "== shellcheck (skipped, not installed) =="
+if slow "shellcheck"; then
+  if command -v shellcheck >/dev/null 2>&1; then
+    echo "== shellcheck =="
+    shellcheck -S warning "$CLI" "$REPO_DIR/bin/lake-shim" "$REPO_DIR/deploy.sh" "$REPO_DIR/test.sh" \
+      "$REPO_DIR/lib/config.sh" "$REPO_DIR"/admin/*.sh && note "ok: shellcheck clean"
+  else
+    echo "== shellcheck (skipped, not installed) =="
+  fi
 fi
 
 echo "== version resolution =="

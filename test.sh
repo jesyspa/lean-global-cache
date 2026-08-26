@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # test.sh — runs in an isolated worktree before deploy. Self-contained, fast,
 # no network, no cache mutation. Exit non-zero to abort the deploy.
+#
+# The suite is split into groups (run_group below). A group is hermetic: its own
+# cache root, build store, HOME and build-slot lock dir, created by new_cache, so
+# groups can run concurrently. Each group's output is buffered and replayed in
+# declaration order, so a parallel run reads like a serial one. TEST_JOBS=1
+# forces one group at a time when a failure needs untangling.
+#
+# Two tiers, as in the rest of the fleet: the deploy gate runs the fast tier;
+# a nightly runner sets BOTS_RUN_SLOW=1 for full coverage. See docs/testing.md.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,13 +21,119 @@ CLI="$REPO_DIR/bin/lean-cache"
 # make every unannotated build in this suite mean something different depending
 # on who ran it. Clear them once here; the cases that care set both explicitly.
 unset CLAUDE_BASH_MODE CLAUDECODE
+
+RUN_SLOW="${BOTS_RUN_SLOW:-0}"
 fail=0
 note() { echo "  $*"; }
 check() { # check <description> <expected> <actual>
   if [[ "$2" == "$3" ]]; then note "ok: $1"
   else note "FAIL: $1 — expected '$2', got '$3'"; fail=1; fi
 }
+# Guard for a case whose end-to-end round-trip through the real CLI costs more
+# than the deploy gate should pay for it. `slow <what> || { ... }` skips the body
+# unless BOTS_RUN_SLOW=1.
+slow() {
+  [[ "$RUN_SLOW" == 1 ]] && return 0
+  note "skip (nightly): $1"; return 1
+}
 
+# ---------------------------------------------------------------- fixtures ---
+gitc() { git -C "$1" -c user.email=t@t -c user.name=t "${@:2}"; }
+# Same, with the lean-cache-managed hooks disabled. For fixture plumbing whose
+# hook side effects are not what the case asserts: every commit/checkout in a
+# `use`d repo otherwise re-enters the CLI, which dwarfs the git call itself.
+gitq() { git -C "$1" -c core.hooksPath=/dev/null -c user.email=t@t -c user.name=t "${@:2}"; }
+pin() { printf 'leanprover/lean4:%s\n' "$1" > "$2/lean-toolchain"; }
+live_slug() { # slug the project's overlay currently points its mathlib at
+  local t; t="$(readlink "$1/.lake/packages/mathlib" 2>/dev/null || true)"
+  t="${t%/packages/mathlib}"; basename "$t"
+}
+has_dir() { [[ -d "$1" ]] && echo yes || echo no; }
+exists()  { [[ -d "$1" ]] && echo yes || echo no; }
+inode()   { stat -c '%i' "$1" 2>/dev/null; }
+mode()    { stat -c '%a' "$1" 2>/dev/null; }
+
+# A group's hermetic world. LEAN_CACHE_ROOT redirects the layout, LEAN_CACHE_BIN
+# makes the installed hooks call this CLI, and HOME is redirected because `use`
+# wires the invoking user's real $HOME/.elan at $ELAN_HOME (see wire_elan) — a
+# global, per-user, hard-to-notice mutation. The build-slot lock dir defaults to
+# /tmp, shared with real host builds and with every other group, so pin it here
+# too.
+new_cache() {
+  TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+  export LEAN_CACHE_ROOT="$TMP/cache" LEAN_CACHE_BIN="$CLI" HOME="$TMP/home" \
+         LEAN_CACHE_BUILDS="$TMP/builds" \
+         LEAN_CACHE_BUILD_LOCK_DIR="$TMP"
+  mkdir -p "$HOME"
+  local slug
+  for slug in v4-30-0 v4-31-0; do
+    mkdir -p "$TMP/cache/lakes/$slug/packages/mathlib" \
+             "$TMP/cache/lakes/$slug/packages/batteries"
+  done
+}
+
+# No real Lean anywhere in this suite: a stub `lake` stands in for the build, so
+# publish/seed, the push gate and the build policy run without the toolchain or
+# the network. It records the call and the git-relevant env; LAKE_RC decides
+# pass/fail.
+write_lake_stub() { # write_lake_stub <dir>  (sets nothing; caller uses $1/lake)
+  mkdir -p "$1"
+  cat > "$1/lake" <<'LK'
+#!/usr/bin/env bash
+echo "lake $*" >> "${LAKE_LOG:-/dev/null}"
+echo "GIT_DIR=${GIT_DIR-<unset>} GIT_WORK_TREE=${GIT_WORK_TREE-<unset>}" >> "${LAKE_ENV_LOG:-/dev/null}"
+exit "${LAKE_RC:-0}"
+LK
+  chmod +x "$1/lake"
+}
+
+# A committed Lake project: lakefile, toolchain pin, .gitignore and one module.
+new_lake_project() { # new_lake_project <path> <version> <module> <decl>
+  mkdir -p "$1/Proj"
+  pin "$2" "$1"; printf 'name="p"\n' > "$1/lakefile.toml"
+  printf '.lake/\n' > "$1/.gitignore"          # as any real Lake project has
+  printf '%s\n' "$4" > "$1/Proj/$3.lean"
+  gitq "$1" init -q; gitq "$1" add -A; gitq "$1" commit -qm init
+}
+
+# A gate fixture: a `use`d project with hooks installed, a bare origin, and its
+# first commit already on the remote. The baseline push goes through gitq so the
+# gate itself never runs during setup.
+new_gate_project() { # new_gate_project <path> <stub-dir>
+  new_lake_project "$1" v4.30.0 A 'def a := 1'
+  "$CLI" use "$1" >/dev/null 2>&1
+  git init -q --bare -b main "$1.remote.git"
+  gitq "$1" remote add origin "$1.remote.git"
+  gitq "$1" push -q origin HEAD:main >/dev/null 2>&1
+}
+
+# True if the warm-build store holds a build published for commit $1.
+haspub() { grep -Rls "^commit=$1$" "$LEAN_CACHE_BUILDS" 2>/dev/null | grep -q . && echo yes || echo no; }
+
+# Fabricate a store entry with a controlled publish time, for the keep/drop
+# policy checks.
+mkbuild() { # mkbuild <repodir> <commit> <slug> <age_days>
+  local d="$1/$2/$3"; mkdir -p "$d/lib"
+  printf 'OLE' > "$d/lib/x.olean"
+  printf 'commit=%s\nslug=%s\npublished_at=%s\n' "$2" "$3" "$(( $(date +%s) - $4 * 86400 ))" \
+    > "$d/.seed-manifest"
+}
+
+# The build-policy fixtures: a cold project (committed, no .lake/build, no
+# stored warm build) and a warm one carrying a prior build.
+new_policy_projects() {
+  CP="$TMP/cold"; new_lake_project "$CP" v4.30.0 C 'def c := 1'
+  WP="$TMP/warm"; new_lake_project "$WP" v4.30.0 W 'def w := 1'
+  mkdir -p "$WP/.lake/build/lib/lean/Proj"
+  printf 'OLE' > "$WP/.lake/build/lib/lean/Proj/W.olean"
+}
+
+# Value of <key> from the LAST line of event <ev> in log <file> (empty if none).
+ev_field() { awk -F'\t' -v ev="$2" -v key="$3" \
+  '$3==ev{for(i=4;i<=NF;i++){p=index($i,"=");if(substr($i,1,p-1)==key)val=substr($i,p+1)}} END{print val}' "$1"; }
+
+# ------------------------------------------------------------------ groups ---
+group_static() {
 echo "== bash syntax =="
 for f in "$CLI" "$REPO_DIR/bin/lake-shim" "$REPO_DIR/deploy.sh" "$REPO_DIR/test.sh" \
          "$REPO_DIR/lib/config.sh" "$REPO_DIR"/admin/*.sh \
@@ -93,38 +208,13 @@ check "config discovery block matches" \
   "$(config_discovery "$CLI")" "$(config_discovery "$REPO_DIR/lib/config.sh")"
 check "OWNER/GROUP/ROOT resolution matches" \
   "$(config_resolution "$CLI")" "$(config_resolution "$REPO_DIR/lib/config.sh")"
-
-echo "== overlay staleness & hooks (hermetic) =="
-# Everything here runs against a throwaway cache and throwaway git repos, so it
-# touches neither the real /opt/bots/lean tree nor the network. LEAN_CACHE_ROOT
-# redirects the layout; LEAN_CACHE_BIN makes the installed hooks call this CLI.
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
-export LEAN_CACHE_ROOT="$TMP/cache"
-export LEAN_CACHE_BIN="$CLI"
-# `use` wires the invoking user's real $HOME/.elan at $ELAN_HOME (see
-# wire_elan) — a global, per-user, hard-to-notice mutation, unlike the
-# project-scoped .lake/packages overlay. Redirecting HOME here, before any
-# `use` call and before the elan-wiring section below populates a real
-# $LEAN_CACHE_ROOT/elan, keeps every `"$CLI" use` invocation in this suite off
-# the real ~/.elan even where a case doesn't scope its own HOME override.
-export HOME="$TMP/home"
-mkdir -p "$HOME"
-for slug in v4-30-0 v4-31-0; do
-  mkdir -p "$TMP/cache/lakes/$slug/packages/mathlib" \
-           "$TMP/cache/lakes/$slug/packages/batteries"
-done
-
-gitc()      { git -C "$1" -c user.email=t@t -c user.name=t "${@:2}"; }
-live_slug() { # slug the project's overlay currently points its mathlib at
-  local t; t="$(readlink "$1/.lake/packages/mathlib" 2>/dev/null || true)"
-  t="${t%/packages/mathlib}"; basename "$t"
 }
-pin() { printf 'leanprover/lean4:%s\n' "$1" > "$2/lean-toolchain"; }
 
-# Scenario: `git reset --hard` to a commit pinning a different toolchain. This
-# is the case post-checkout never sees; the reference-transaction hook must.
-A="$TMP/reset"; mkdir -p "$A"; gitc "$A" init -q
+group_overlay_reset() {
+new_cache
+echo "== overlay staleness: reset --hard (hermetic) =="
+
+A="$TMP/reset"; mkdir -p "$A"; gitq "$A" init -q
 pin v4.30.0 "$A"; gitc "$A" add -A; gitc "$A" commit -qm a30
 pin v4.31.0 "$A"; gitc "$A" add -A; gitc "$A" commit -qm b31
 b31="$(gitc "$A" rev-parse HEAD)"
@@ -133,9 +223,14 @@ gitc "$A" checkout -q HEAD~1
 check "use overlays current toolchain"        "v4-30-0" "$(live_slug "$A")"
 gitc "$A" reset --hard -q "$b31"
 check "reset --hard repoints overlay"         "v4-31-0" "$(live_slug "$A")"
+}
+
+group_overlay_pick() {
+new_cache
+echo "== overlay staleness: cherry-pick, and refresh as a no-op (hermetic) =="
 
 # Scenario: `git cherry-pick` of a commit that bumps the toolchain.
-B="$TMP/pick"; mkdir -p "$B"; gitc "$B" init -q
+B="$TMP/pick"; mkdir -p "$B"; gitq "$B" init -q
 pin v4.30.0 "$B"; gitc "$B" add -A; gitc "$B" commit -qm base
 base="$(gitc "$B" rev-parse HEAD)"
 gitc "$B" checkout -q -b other
@@ -147,10 +242,22 @@ check "use overlays base toolchain"           "v4-30-0" "$(live_slug "$B")"
 gitc "$B" cherry-pick "$pick" >/dev/null 2>&1
 check "cherry-pick repoints overlay"          "v4-31-0" "$(live_slug "$B")"
 
+# Scenario: refresh is a safe no-op off a Lean project and when already fresh.
+rc=0; "$CLI" refresh "$TMP" >/dev/null 2>&1 || rc=$?
+check "refresh on non-Lean dir exits 0"       "0" "$rc"
+rc=0; "$CLI" refresh "$B" >/dev/null 2>&1 || rc=$?
+check "refresh when fresh exits 0"            "0" "$rc"
+check "refresh when fresh changes nothing"    "v4-31-0" "$(live_slug "$B")"
+}
+
+group_overlay_file() {
+new_cache
+echo "== overlay staleness: branch vs file checkout (hermetic) =="
+
 # Scenario: post-checkout fires on a branch checkout (git flag $3=1) but not on a
 # file checkout ($3=0, HEAD unchanged) — restoring a file must not trigger a
 # refresh that could touch .lake/build.
-D="$TMP/filecheckout"; mkdir -p "$D"; gitc "$D" init -q
+D="$TMP/filecheckout"; mkdir -p "$D"; gitq "$D" init -q
 pin v4.30.0 "$D"; printf 'x\n' > "$D/f.txt"; gitc "$D" add -A; gitc "$D" commit -qm a30
 base_branch="$(gitc "$D" rev-parse --abbrev-ref HEAD)"
 gitc "$D" checkout -q -b bump
@@ -165,9 +272,14 @@ ln -sfn "$TMP/cache/lakes/v4-30-0/packages/mathlib" "$D/.lake/packages/mathlib"
 printf 'y\n' > "$D/f.txt"
 gitc "$D" checkout -q -- f.txt                   # file checkout (flag=0): no refresh
 check "file checkout does not refresh overlay" "v4-30-0" "$(live_slug "$D")"
+}
+
+group_overlay_hooks() {
+new_cache
+echo "== hook installation (hermetic) =="
 
 # Scenario: hooks are installed, sentinel-marked, and idempotent.
-C="$TMP/hooks"; mkdir -p "$C"; gitc "$C" init -q
+C="$TMP/hooks"; mkdir -p "$C"; gitq "$C" init -q
 pin v4.30.0 "$C"; gitc "$C" add -A; gitc "$C" commit -qm a
 "$CLI" use "$C" >/dev/null 2>&1
 H="$C/.git/hooks"
@@ -190,18 +302,16 @@ foreign="$(cat "$H/reference-transaction")"
 "$CLI" use "$C" >/dev/null 2>&1
 check "legacy hook upgraded in place"         "yes" "$(has_sentinel "$H/post-checkout")"
 check "foreign hook left untouched"           "$foreign" "$(cat "$H/reference-transaction")"
+}
 
-# Scenario: refresh is a safe no-op off a Lean project and when already fresh.
-rc=0; "$CLI" refresh "$TMP" >/dev/null 2>&1 || rc=$?
-check "refresh on non-Lean dir exits 0"       "0" "$rc"
-rc=0; "$CLI" refresh "$B" >/dev/null 2>&1 || rc=$?
-check "refresh when fresh exits 0"            "0" "$rc"
-check "refresh when fresh changes nothing"    "v4-31-0" "$(live_slug "$B")"
+group_overlay_uninst() {
+new_cache
+echo "== use/refresh of an uninstalled version (hermetic) =="
 
 # Scenario: a project pinning an UN-installed version. `use` auto-installs by
 # default, but with auto-install off it must hard-fail; `refresh` (the hook
 # path) must stay a silent no-op rather than kick off an install on checkout.
-U="$TMP/uninstalled"; mkdir -p "$U"; gitc "$U" init -q
+U="$TMP/uninstalled"; mkdir -p "$U"; gitq "$U" init -q
 pin v4.99.0 "$U"; gitc "$U" add -A; gitc "$U" commit -qm u
 rc=0; LEAN_CACHE_AUTO_INSTALL=0 "$CLI" use "$U" >/dev/null 2>&1 || rc=$?
 check "use of uninstalled ver hard-fails (opt-out)" "1" "$rc"
@@ -220,6 +330,10 @@ check "foreground use bail names the install command"    "yes" \
 check "foreground use bail installed nothing"            "" "$(live_slug "$U")"
 # (force-wait and slot-held override the bail — exercised with stubs in the
 # install section, where the auto-install can run offline.)
+}
+
+group_multiproj() {
+new_cache
 
 echo "== multi-project discovery (hermetic) =="
 # A directory given to use/refresh/seed-build/clean/publish-build that is NOT
@@ -228,7 +342,7 @@ echo "== multi-project discovery (hermetic) =="
 # unaffected — covered by the existing tests above; this section only
 # exercises the sweep.
 
-MR="$TMP/monorepo"; mkdir -p "$MR/proj-a" "$MR/sub/proj-b"; gitc "$MR" init -q
+MR="$TMP/monorepo"; mkdir -p "$MR/proj-a" "$MR/sub/proj-b"; gitq "$MR" init -q
 : > "$MR/proj-a/lakefile.toml"; pin v4.30.0 "$MR/proj-a"
 : > "$MR/sub/proj-b/lakefile.toml"; pin v4.31.0 "$MR/sub/proj-b"
 gitc "$MR" add -A; gitc "$MR" commit -qm root
@@ -257,7 +371,7 @@ check ".lake dependency is not discovered as a project" "no" \
 
 # A root with no Lake projects beneath it at all falls back to today's
 # not-a-project behavior: use dies, refresh is a silent no-op.
-EMPTY="$TMP/emptyroot"; mkdir -p "$EMPTY"; gitc "$EMPTY" init -q
+EMPTY="$TMP/emptyroot"; mkdir -p "$EMPTY"; gitq "$EMPTY" init -q
 : > "$EMPTY/README.md"; gitc "$EMPTY" add -A; gitc "$EMPTY" commit -qm empty
 rc=0; "$CLI" use "$EMPTY" >/dev/null 2>&1 || rc=$?
 check "use on a root with no Lake projects dies"         "1" "$rc"
@@ -275,13 +389,18 @@ mkdir -p "$MR/proj-a/.lake/build" "$MR/sub/proj-b/.lake/build"
 "$CLI" clean "$MR" >/dev/null 2>&1
 check "clean removes proj-a's build" "no" "$([[ -e "$MR/proj-a/.lake/build" ]] && echo yes || echo no)"
 check "clean removes proj-b's build" "no" "$([[ -e "$MR/sub/proj-b/.lake/build" ]] && echo yes || echo no)"
+}
+
+group_hookmono() {
+new_cache
+echo "== multi-project discovery through the hook path (hermetic) =="
 
 # Hook-path regression: the post-checkout hook must NOT bail out just because
 # the repo root carries no lean-toolchain of its own — it has to fall through
 # into refresh's own discovery. Installed by running `use` on one subproject
 # of a fresh monorepo (root has no lean-toolchain); hooks land at the repo's
 # shared .git/hooks, not a per-subproject one.
-HR="$TMP/hookmono"; mkdir -p "$HR/proj-x"; gitc "$HR" init -q
+HR="$TMP/hookmono"; mkdir -p "$HR/proj-x"; gitq "$HR" init -q
 : > "$HR/proj-x/lakefile.toml"; pin v4.30.0 "$HR/proj-x"
 gitc "$HR" add -A; gitc "$HR" commit -qm root
 "$CLI" use "$HR/proj-x" >/dev/null 2>&1
@@ -293,6 +412,11 @@ check "hooks installed at the repo's shared .git/hooks" "yes" \
 pin v4.31.0 "$HR/proj-x"
 ( cd "$HR" && "$gitdir/hooks/post-checkout" unused unused 1 >/dev/null 2>&1 )
 check "post-checkout hook re-overlays via subproject discovery" "v4-31-0" "$(live_slug "$HR/proj-x")"
+}
+
+group_pinnedroot() {
+new_cache
+echo "== multi-project discovery below a toolchain-pinned root (hermetic) =="
 
 # Regression: a root that DOES carry its own lean-toolchain pin (so a
 # toolchain-only "is this a project" check would wrongly treat it as one) but
@@ -301,7 +425,7 @@ check "post-checkout hook re-overlays via subproject discovery" "v4-31-0" "$(liv
 # courses--fp--2026--admin shape (a root lean-toolchain, no root lakefile,
 # real Lake projects below it) — the case the discovery gate must key off
 # is_lake_project (lakefile + lean-toolchain), not lean-toolchain alone.
-PR="$TMP/pinnedroot"; mkdir -p "$PR/examples" "$PR/homework/hw00"; gitc "$PR" init -q
+PR="$TMP/pinnedroot"; mkdir -p "$PR/examples" "$PR/homework/hw00"; gitq "$PR" init -q
 pin v4.30.0 "$PR"                                     # root pin, no lakefile at root
 : > "$PR/examples/lakefile.toml"; pin v4.30.0 "$PR/examples"
 : > "$PR/homework/hw00/lakefile.toml"; pin v4.31.0 "$PR/homework/hw00"
@@ -321,6 +445,10 @@ gitdir2="$(git -C "$PR" rev-parse --git-common-dir)"
 pin v4.30.0 "$PR/homework/hw00"
 ( cd "$PR" && "$gitdir2/hooks/post-checkout" unused unused 1 >/dev/null 2>&1 )
 check "hook repoints a subproject beneath a toolchain-pinned root" "v4-30-0" "$(live_slug "$PR/homework/hw00")"
+}
+
+group_elanwire() {
+new_cache
 
 echo "== elan wiring (hermetic) =="
 # `use` points ~/.elan at the shared ELAN_HOME ($LEAN_CACHE_ROOT/elan) so bare
@@ -328,7 +456,7 @@ echo "== elan wiring (hermetic) =="
 # elan is present (then it warns and leaves it). HOME is redirected per case, so
 # this never touches the developer's real ~/.elan.
 mkdir -p "$TMP/cache/elan/bin"; : > "$TMP/cache/elan/bin/lean"
-EP="$TMP/elanwire"; mkdir -p "$EP"; gitc "$EP" init -q
+EP="$TMP/elanwire"; mkdir -p "$EP"; gitq "$EP" init -q
 pin v4.30.0 "$EP"; gitc "$EP" add -A; gitc "$EP" commit -qm e
 elink()    { readlink "$1/.elan" 2>/dev/null || true; }
 realdir()  { [[ -d "$1" && ! -L "$1" ]] && echo yes || echo no; }
@@ -348,6 +476,10 @@ check "use repoints a wrong ~/.elan link"     "$TMP/cache/elan" "$(elink "$EW")"
 ER="$TMP/eh-real"; mkdir -p "$ER/.elan/bin"; : > "$ER/.elan/bin/lean"
 HOME="$ER" "$CLI" use "$EP" >/dev/null 2>&1
 check "use preserves a real ~/.elan"          "yes" "$(realdir "$ER/.elan")"
+}
+
+group_elancmds() {
+new_cache
 
 echo "== fix-filemode (hermetic) =="
 # The cache normalizes permissions, which flips the exec bit on tracked files;
@@ -450,6 +582,12 @@ rc=0; out="$(PATH="$ELANSTUB:$PATH" ELAN_STATE_FILE="$ELAN_STATE" "$CLI" set-def
 check "set-default of uninstalled ver fails"   "1" "$rc"
 check "set-default names the install remedy"   "yes" \
   "$(printf '%s' "$out" | grep -qi 'not installed' && echo yes || echo no)"
+}
+
+group_install() {
+new_cache
+# install calls require_owner; pin OWNER to the caller so it runs without sudo.
+export LEAN_CACHE_OWNER="$(id -un)"
 
 echo "== install: build slot (hermetic) =="
 # cmd_install's replay build (lake build Mathlib …) is a cold build and must take
@@ -524,7 +662,7 @@ check "force rebuild left no scratch dirs"        "0" \
 # provisions nothing; force-wait overrides the bail and installs to completion.
 # HOME/BUILDS are redirected so wire_elan and seeding never touch the real home.
 mkdir -p "$TMP/ihome"
-UFG="$TMP/usefg"; mkdir -p "$UFG"; gitc "$UFG" init -q
+UFG="$TMP/usefg"; mkdir -p "$UFG"; gitq "$UFG" init -q
 pin v4.57.0 "$UFG"; printf 'name="p"\n' > "$UFG/lakefile.toml"
 gitc "$UFG" add -A; gitc "$UFG" commit -qm init
 rc=0; PATH="$ISTUB:$PATH" LEAN_CACHE_BUILD_LOCK_DIR="$TMP" LEAN_CACHE_BUILDS="$TMP/ibuilds" \
@@ -542,7 +680,7 @@ check "force-wait foreground use provisioned the version"  "yes" \
 # The same three env states as the build policy, on this second call site: an
 # unstamped call under CLAUDECODE is a bounded foreground call and bails; with
 # neither variable set there is no guillotine, so it installs.
-UCC="$TMP/usecc"; mkdir -p "$UCC"; gitc "$UCC" init -q
+UCC="$TMP/usecc"; mkdir -p "$UCC"; gitq "$UCC" init -q
 pin v4.58.0 "$UCC"; printf 'name="p"\n' > "$UCC/lakefile.toml"
 gitc "$UCC" add -A; gitc "$UCC" commit -qm init
 rc=0; env -u CLAUDE_BASH_MODE CLAUDECODE=1 PATH="$ISTUB:$PATH" \
@@ -557,6 +695,10 @@ rc=0; env -u CLAUDE_BASH_MODE -u CLAUDECODE PATH="$ISTUB:$PATH" \
 check "use outside the harness installs"                   "0" "$rc"
 check "use outside the harness provisioned the version"    "yes" \
   "$(has_dir "$TMP/cache/lakes/v4-58-0/packages")"
+}
+
+group_slots() {
+new_cache
 
 echo "== slots (hermetic) =="
 # `slots` is read-only: probe each lock file with a non-blocking flock and
@@ -629,31 +771,15 @@ out="$(LEAN_CACHE_BUILD_LOCK_DIR="$SLOTS_DIR" LEAN_CACHE_BUILD_SLOTS=0 "$CLI" sl
 check "SLOTS=0 reports serialization disabled" "yes" \
   "$(printf '%s' "$out" | grep -q 'disabled' && echo yes || echo no)"
 check "SLOTS=0 slots exits 0"                   "0" "$rc"
+}
+
+group_seed() {
+new_cache
+STUB="$TMP/stub"; write_lake_stub "$STUB"
 
 echo "== build seeding & push gate (hermetic) =="
-# No real Lean here: a stub `lake` stands in for the build so publish/seed and
-# the push gate can be exercised without the toolchain or the network. The store
-# is redirected to a throwaway dir via LEAN_CACHE_BUILDS.
-export LEAN_CACHE_BUILDS="$TMP/builds"
-export LEAN_CACHE_BUILD_LOCK_DIR="$TMP"   # never contend with real host builds
-STUB="$TMP/stub"; mkdir -p "$STUB"
-cat > "$STUB/lake" <<'LK'
-#!/usr/bin/env bash
-# Stub: record the call and the git-relevant env; succeed unless LAKE_RC says so.
-echo "lake $*" >> "${LAKE_LOG:-/dev/null}"
-echo "GIT_DIR=${GIT_DIR-<unset>} GIT_WORK_TREE=${GIT_WORK_TREE-<unset>}" >> "${LAKE_ENV_LOG:-/dev/null}"
-exit "${LAKE_RC:-0}"
-LK
-chmod +x "$STUB/lake"
-inode() { stat -c '%i' "$1" 2>/dev/null; }
-mode()  { stat -c '%a' "$1" 2>/dev/null; }
-
 # A fake project with a pre-staged "warm build" tree.
-P="$TMP/proj"; mkdir -p "$P/Proj"; gitc "$P" init -q
-pin v4.30.0 "$P"; printf 'name="p"\n' > "$P/lakefile.toml"
-printf '.lake/\n' > "$P/.gitignore"          # as any real Lake project has
-printf 'def a := 1\n' > "$P/Proj/A.lean"
-gitc "$P" add -A; gitc "$P" commit -qm init
+P="$TMP/proj"; new_lake_project "$P" v4.30.0 A 'def a := 1'
 pcommit="$(gitc "$P" rev-parse HEAD)"
 mkdir -p "$P/.lake/build/lib/lean/Proj" "$P/.lake/build/ir/Proj"
 printf 'OLEAN-A'  > "$P/.lake/build/lib/lean/Proj/A.olean"
@@ -696,7 +822,7 @@ check "re-seed dropped the orphan olean"       "no" \
   "$([[ -e "$Q/.lake/build/lib/lean/Proj/Z.olean" ]] && echo yes || echo no)"
 
 # Safety: on a commit mismatch, seed NOTHING (never approximate a stale build).
-R="$TMP/r"; mkdir -p "$R/Proj"; gitc "$R" init -q
+R="$TMP/r"; mkdir -p "$R/Proj"; gitq "$R" init -q
 pin v4.30.0 "$R"; printf 'name="p"\n' > "$R/lakefile.toml"
 printf 'def a := 2\n' > "$R/Proj/A.lean"     # different content -> different commit
 gitc "$R" add -A; gitc "$R" commit -qm other
@@ -738,6 +864,13 @@ check "clean removed .lake/build"              "no" \
 check "clean left the package overlay"         "$ovl_before" "$(live_slug "$P")"
 rc=0; "$CLI" clean "$TMP" >/dev/null 2>&1 || rc=$?   # non-Lake dir
 check "clean on non-Lake dir exits 0"          "0" "$rc"
+}
+
+group_gate() {
+new_cache
+STUB="$TMP/stub"; write_lake_stub "$STUB"
+echo "== push gate (hermetic) =="
+P="$TMP/proj"; new_lake_project "$P" v4.30.0 A 'def a := 1'
 
 # Push gate: stub lake decides pass/fail; a bare remote receives the push. These
 # cases isolate the gate itself, so suppress the on-push warm-build publish (a
@@ -749,24 +882,22 @@ check "pre-push hook installed"               "yes" \
 check "pre-push hook delegates to pre-push-gate" "yes" \
   "$(grep -ql 'pre-push-gate' "$P/.git/hooks/pre-push" && echo yes || echo no)"
 git init -q --bare -b main "$TMP/remote.git"
-gitc "$P" remote add origin "$TMP/remote.git"
+gitq "$P" remote add origin "$TMP/remote.git"
 
-# Establish the baseline on the remote (the first push carries A.lean, so the
-# gate runs the build once here). NO_GATE_SKIP: the publish-build test above
-# stored a green build for this very commit, which would legitimately skip the
-# gate — the skip has its own section below; here we exercise the build path.
+# Establish the baseline on the remote: the first push carries A.lean, so the
+# gate runs the build once here.
 : > "$TMP/g.log"
-PATH="$STUB:$PATH" LEAN_CACHE_NO_GATE_SKIP=1 LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
+PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
 check "gate: initial push (new .lean) runs lake" "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
 
 # (a) An incremental push whose diff has no *.lean must not invoke lake.
-printf 'hi\n' > "$P/README.md"; gitc "$P" add -A; gitc "$P" commit -qm doc
+printf 'hi\n' > "$P/README.md"; gitq "$P" add -A; gitq "$P" commit -qm doc
 : > "$TMP/g.log"
 PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
 check "gate: doc-only push skips lake"         "0" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
 
 # (b) A push that changes *.lean and fails to build is rejected.
-printf 'def a := 3\n' > "$P/Proj/A.lean"; gitc "$P" add -A; gitc "$P" commit -qm edit
+printf 'def a := 3\n' > "$P/Proj/A.lean"; gitq "$P" add -A; gitq "$P" commit -qm edit
 remote_before="$(gitc "$P" ls-remote origin refs/heads/main | cut -f1)"
 : > "$TMP/g.log"
 PATH="$STUB:$PATH" LAKE_RC=1 LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
@@ -795,34 +926,48 @@ PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" LAKE_ENV_LOG="$TMP/genv.log" \
 check "gate (linked worktree): lake ran"          "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
 check "gate scrubs GIT_DIR for lake build"        "0" "$(grep -c 'GIT_DIR=[^<]' "$TMP/genv.log" 2>/dev/null)"
 check "gate scrubs GIT_WORK_TREE for lake build"  "0" "$(grep -c 'GIT_WORK_TREE=[^<]' "$TMP/genv.log" 2>/dev/null)"
+}
+
+group_gateextra_e() {
+new_cache
+STUB="$TMP/stub"; write_lake_stub "$STUB"
+echo "== push gate: first push of a new branch (hermetic) =="
+export LEAN_CACHE_NO_PUBLISH_ON_PUSH=1
 
 # (e) First push of a multi-commit new branch gates on the WHOLE new history,
 # not just the tip commit: commit 1 adds a .lean, the tip is doc-only, and the
 # gate must still build (the .lean is new to the remote).
-E="$TMP/newrepo"; mkdir -p "$E"; gitc "$E" init -q
+E="$TMP/newrepo"; mkdir -p "$E"; gitq "$E" init -q
 pin v4.30.0 "$E"; printf 'name="p"\n' > "$E/lakefile.toml"
 printf 'def e := 1\n' > "$E/E.lean"
-gitc "$E" add -A; gitc "$E" commit -qm lean-change
-printf 'doc\n' > "$E/README.md"; gitc "$E" add -A; gitc "$E" commit -qm doc-tip
-git init -q --bare -b main "$TMP/eremote.git"; gitc "$E" remote add origin "$TMP/eremote.git"
+gitq "$E" add -A; gitq "$E" commit -qm lean-change
+printf 'doc\n' > "$E/README.md"; gitq "$E" add -A; gitq "$E" commit -qm doc-tip
+git init -q --bare -b main "$TMP/eremote.git"; gitq "$E" remote add origin "$TMP/eremote.git"
 "$CLI" use "$E" >/dev/null 2>&1
 : > "$TMP/g.log"
 PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$E" push -q origin HEAD:main >/dev/null 2>&1 || true
 check "gate: new-branch push gates non-tip .lean commits" "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
+}
+
+group_gateextra_f() {
+new_cache
+STUB="$TMP/stub"; write_lake_stub "$STUB"
+echo "== push gate: force-pushes past an unfetched remote (hermetic) =="
+export LEAN_CACHE_NO_PUBLISH_ON_PUSH=1
 
 # (f) Force-push when the remote moved and was never fetched: the remote tip's
 # object is absent locally, so the roid..loid diff cannot run. The gate must
 # fall back to the remote-tracking range (not die silently) and still build.
 git init -q --bare -b main "$TMP/fremote.git"
-F="$TMP/fpush"; mkdir -p "$F"; gitc "$F" init -q
+F="$TMP/fpush"; mkdir -p "$F"; gitq "$F" init -q
 pin v4.30.0 "$F"; printf 'name="p"\n' > "$F/lakefile.toml"
-printf 'def f := 1\n' > "$F/F.lean"; gitc "$F" add -A; gitc "$F" commit -qm init
-gitc "$F" remote add origin "$TMP/fremote.git"
+printf 'def f := 1\n' > "$F/F.lean"; gitq "$F" add -A; gitq "$F" commit -qm init
+gitq "$F" remote add origin "$TMP/fremote.git"
 "$CLI" use "$F" >/dev/null 2>&1
 PATH="$STUB:$PATH" gitc "$F" push -q origin HEAD:main >/dev/null 2>&1
 F2="$TMP/fpush2"; git clone -q "$TMP/fremote.git" "$F2"
-printf 'def g := 2\n' > "$F2/G.lean"; gitc "$F2" add -A; gitc "$F2" commit -qm other
-gitc "$F2" push -q origin HEAD:main >/dev/null 2>&1     # remote advances
+printf 'def g := 2\n' > "$F2/G.lean"; gitq "$F2" add -A; gitq "$F2" commit -qm other
+gitq "$F2" push -q origin HEAD:main >/dev/null 2>&1     # remote advances
 printf 'def f := 3\n' > "$F/F.lean"; gitc "$F" add -A; gitc "$F" commit -qm mine
 : > "$TMP/g.log"
 out="$(PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$F" push --force origin HEAD:main 2>&1)"; rc=$?
@@ -837,20 +982,27 @@ gitc "$F" fetch -q origin
 gitc "$F" reset --hard -q "HEAD~1" >/dev/null 2>&1
 # advance the remote once more so its tip is again unknown to F (F's own
 # force-push moved the remote, so this one must force too)
-printf 'def g := 3\n' > "$F2/G.lean"; gitc "$F2" add -A; gitc "$F2" commit -qm more
-gitc "$F2" push -q --force origin HEAD:main >/dev/null 2>&1
+printf 'def g := 3\n' > "$F2/G.lean"; gitq "$F2" add -A; gitq "$F2" commit -qm more
+gitq "$F2" push -q --force origin HEAD:main >/dev/null 2>&1
 : > "$TMP/g.log"
 out="$(PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$F" push --force origin HEAD:main 2>&1)"; rc=$?
 check "gate: undecidable rollback push builds conservatively" "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
 check "gate: undecidable rollback push goes through" "0" "$rc"
+}
+
+group_gateextra_g() {
+new_cache
+STUB="$TMP/stub"; write_lake_stub "$STUB"
+echo "== push gate: pushing a ref that is not HEAD (hermetic) =="
+export LEAN_CACHE_NO_PUBLISH_ON_PUSH=1
 
 # (g) Pushing a ref whose tip is NOT the checked-out HEAD: the gate can only
 # build the current worktree, so it must warn and pass the ref ungated instead
 # of green-lighting it on the strength of the wrong tree.
-G="$TMP/gpush"; mkdir -p "$G"; gitc "$G" init -q
+G="$TMP/gpush"; mkdir -p "$G"; gitq "$G" init -q
 pin v4.30.0 "$G"; printf 'name="p"\n' > "$G/lakefile.toml"
-printf 'def h := 1\n' > "$G/H.lean"; gitc "$G" add -A; gitc "$G" commit -qm init
-git init -q --bare -b main "$TMP/gremote.git"; gitc "$G" remote add origin "$TMP/gremote.git"
+printf 'def h := 1\n' > "$G/H.lean"; gitq "$G" add -A; gitq "$G" commit -qm init
+git init -q --bare -b main "$TMP/gremote.git"; gitq "$G" remote add origin "$TMP/gremote.git"
 "$CLI" use "$G" >/dev/null 2>&1
 PATH="$STUB:$PATH" gitc "$G" push -q origin HEAD:main >/dev/null 2>&1
 gitc "$G" switch -qc feature 2>/dev/null || gitc "$G" checkout -qb feature
@@ -862,17 +1014,20 @@ check "gate: non-HEAD ref push does not run lake"  "0" "$(grep -c '^lake' "$TMP/
 check "gate: non-HEAD ref push warns it is ungated" "yes" \
   "$(printf '%s' "$out" | grep -q 'NOT gated' && echo yes || echo no)"
 check "gate: non-HEAD ref push goes through"        "0" "$rc"
+}
+
+group_pubpush() {
+new_cache
+STUB="$TMP/stub"; write_lake_stub "$STUB"
+P="$TMP/proj"; new_gate_project "$P"
 
 echo "== publish-on-push & commit reminder (hermetic) =="
-unset LEAN_CACHE_NO_PUBLISH_ON_PUSH   # re-enable the on-push publish under test
-# True if the warm-build store holds a build published for commit $1.
-haspub() { grep -Rls "^commit=$1$" "$LEAN_CACHE_BUILDS" 2>/dev/null | grep -q . && echo yes || echo no; }
 
 # commit-hint: reminds on a *.lean commit, silent when no *.lean changed.
-printf 'def a := 4\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm edit2
+printf 'def a := 4\n' > "$P/Proj/A.lean"; gitq "$P" add Proj/A.lean; gitq "$P" commit -qm edit2
 check "commit-hint reminds on .lean commit"       "yes" \
   "$("$CLI" commit-hint "$P" 2>&1 | grep -q 'publish-build' && echo yes || echo no)"
-printf 'y\n' >> "$P/README.md"; gitc "$P" add README.md; gitc "$P" commit -qm doc3
+printf 'y\n' >> "$P/README.md"; gitq "$P" add README.md; gitq "$P" commit -qm doc3
 check "commit-hint silent on non-.lean commit"    "" "$("$CLI" commit-hint "$P" 2>&1)"
 rc=0; "$CLI" commit-hint "$P" >/dev/null 2>&1 || rc=$?
 check "commit-hint exits 0 on non-.lean commit"   "0" "$rc"
@@ -885,7 +1040,7 @@ check "post-commit hook delegates to commit-hint" "yes" \
 
 # (a) A clean *.lean push captures the warm build for the pushed HEAD. The stub
 # lake does not produce artifacts, so stage a build tree the gate can publish.
-printf 'def a := 5\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm edit3
+printf 'def a := 5\n' > "$P/Proj/A.lean"; gitq "$P" add Proj/A.lean; gitq "$P" commit -qm edit3
 c_ok="$(gitc "$P" rev-parse HEAD)"
 rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE5' > "$P/.lake/build/lib/lean/Proj/A.olean"
 : > "$TMP/g.log"
@@ -893,7 +1048,7 @@ PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/de
 check "clean push publishes the warm build"       "yes" "$(haspub "$c_ok")"
 
 # (b) LEAN_CACHE_NO_PUBLISH_ON_PUSH suppresses the capture.
-printf 'def a := 6\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm edit4
+printf 'def a := 6\n' > "$P/Proj/A.lean"; gitq "$P" add Proj/A.lean; gitq "$P" commit -qm edit4
 c_skip="$(gitc "$P" rev-parse HEAD)"
 rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE6' > "$P/.lake/build/lib/lean/Proj/A.olean"
 : > "$TMP/g.log"
@@ -902,17 +1057,23 @@ PATH="$STUB:$PATH" LEAN_CACHE_NO_PUBLISH_ON_PUSH=1 LAKE_LOG="$TMP/g.log" \
 check "NO_PUBLISH_ON_PUSH skips the capture"      "no" "$(haspub "$c_skip")"
 
 # (c) A failing gate build aborts the push before any publish.
-printf 'def a := 7\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm bad
+printf 'def a := 7\n' > "$P/Proj/A.lean"; gitq "$P" add Proj/A.lean; gitq "$P" commit -qm bad
 c_bad="$(gitc "$P" rev-parse HEAD)"
 rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE7' > "$P/.lake/build/lib/lean/Proj/A.olean"
 : > "$TMP/g.log"
 PATH="$STUB:$PATH" LAKE_RC=1 LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
 check "failed gate build publishes nothing"       "no" "$(haspub "$c_bad")"
+}
+
+group_gateskip() {
+new_cache
+STUB="$TMP/stub"; write_lake_stub "$STUB"
+P="$TMP/proj"; new_gate_project "$P"
 
 echo "== gate skip on stored green build (hermetic) =="
 # A green publish attests the commit: the gate must skip its rebuild when the
 # store already holds that (commit, toolchain) with tree_clean=1.
-printf 'def a := 8\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm edit5
+printf 'def a := 8\n' > "$P/Proj/A.lean"; gitq "$P" add Proj/A.lean; gitq "$P" commit -qm edit5
 c5="$(gitc "$P" rev-parse HEAD)"
 rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE8' > "$P/.lake/build/lib/lean/Proj/A.olean"
 PATH="$STUB:$PATH" "$CLI" publish-build "$P" >/dev/null 2>&1
@@ -927,17 +1088,24 @@ check "skipped-gate push goes through"          "$c5" \
   "$(gitc "$P" ls-remote origin refs/heads/main | cut -f1)"
 
 # LEAN_CACHE_NO_GATE_SKIP forces the rebuild even with a stored green build.
-printf 'def a := 9\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm edit6
+printf 'def a := 9\n' > "$P/Proj/A.lean"; gitq "$P" add Proj/A.lean; gitq "$P" commit -qm edit6
 rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE9' > "$P/.lake/build/lib/lean/Proj/A.olean"
 PATH="$STUB:$PATH" "$CLI" publish-build "$P" >/dev/null 2>&1
 : > "$TMP/g.log"
 PATH="$STUB:$PATH" LEAN_CACHE_NO_GATE_SKIP=1 LEAN_CACHE_NO_PUBLISH_ON_PUSH=1 \
   LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
 check "NO_GATE_SKIP forces the gate build"      "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
+}
+
+group_greenguard() {
+new_cache
+STUB="$TMP/stub"; write_lake_stub "$STUB"
+P="$TMP/proj"; new_gate_project "$P"
+echo "== publish honesty: dirty trees, non-green builds, green entries (hermetic) =="
 
 # A dirty-tree publish is refused outright: every stored build must be an honest
 # snapshot of committed sources.
-printf 'def a := 10\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm edit7
+printf 'def a := 10\n' > "$P/Proj/A.lean"; gitq "$P" add Proj/A.lean; gitq "$P" commit -qm edit7
 c7="$(gitc "$P" rev-parse HEAD)"
 printf 'def stray := 0\n' > "$P/Stray.lean"                 # untracked source -> dirty tree
 rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE10' > "$P/.lake/build/lib/lean/Proj/A.olean"
@@ -972,7 +1140,7 @@ check "no skip message on a non-green store"    "no" \
 # A stored green build is never overwritten by a later non-green publish at the
 # same commit: an interrupted/OOM'd rebuild must not stale the entry or switch
 # off the gate skip.
-printf 'def a := 20\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm green-guard
+printf 'def a := 20\n' > "$P/Proj/A.lean"; gitq "$P" add Proj/A.lean; gitq "$P" commit -qm green-guard
 c8="$(gitc "$P" rev-parse HEAD)"
 rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'GREEN8' > "$P/.lake/build/lib/lean/Proj/A.olean"
 PATH="$STUB:$PATH" "$CLI" publish-build "$P" >/dev/null 2>&1          # green publish
@@ -984,6 +1152,10 @@ check "failed publish over green entry succeeds" "0" "$rc"
 check "green entry survives a failed re-publish" "tree_clean=1" "$(grep '^tree_clean=' "$m8" 2>/dev/null)"
 check "green entry keeps its green olean"       "GREEN8" \
   "$(cat "$(dirname "$m8")/lib/lean/Proj/A.olean" 2>/dev/null)"
+}
+
+group_store() {
+new_cache
 
 echo "== store retention protects green attestations (hermetic) =="
 # Retention keeps the newest build per slug (warmth) AND the newest green build
@@ -1002,6 +1174,57 @@ mkentry "$RB/cZ/s" 3000 0     # non-green WIP, newest
 check "retention keeps the newest green entry"   "yes" "$([[ -d "$RB/cX/s" ]] && echo yes || echo no)"
 check "retention keeps the newest entry"         "yes" "$([[ -d "$RB/cZ/s" ]] && echo yes || echo no)"
 check "retention drops middle non-green WIP"     "no"  "$([[ -d "$RB/cY/s" ]] && echo yes || echo no)"
+
+echo "== build-store rotation (hermetic) =="
+# Fabricate builds with controlled publish times and check the keep/drop policy.
+RB="$LEAN_CACHE_BUILDS/rot-repo"
+mkbuild "$RB" newcommit v9-9-9 0    # newest for v9-9-9      -> keep
+mkbuild "$RB" midcommit v9-9-9 3    # non-latest, within 7d  -> keep
+mkbuild "$RB" oldcommit v9-9-9 10   # non-latest, older 7d   -> prune
+mkbuild "$RB" loneold   v8-8-8 30   # only build for v8-8-8  -> newest -> keep
+"$CLI" prune-builds --keep-days 7 >/dev/null 2>&1
+check "rotation keeps newest per toolchain"      "yes" "$(exists "$RB/newcommit/v9-9-9")"
+check "rotation keeps non-latest within window"  "yes" "$(exists "$RB/midcommit/v9-9-9")"
+check "rotation drops non-latest past window"    "no"  "$(exists "$RB/oldcommit/v9-9-9")"
+check "rotation keeps lone latest even if old"   "yes" "$(exists "$RB/loneold/v8-8-8")"
+check "rotation removes emptied commit dir"      "no"  "$(exists "$RB/oldcommit")"
+
+echo "== opportunistic prune on use (hermetic) =="
+# `use` rotates the whole build store at most once a day, guarded by a stamp
+# file, so a store that stops being published to doesn't accumulate stale
+# builds forever without a cron'd prune-builds. `use` runs against a plain
+# project; no stub lake is involved.
+PU="$TMP/pruneproj"; new_lake_project "$PU" v4.31.0 A 'def a := 1'
+UP="$LEAN_CACHE_BUILDS/use-prune-repo"
+mkbuild "$UP" upnew v9-9-9 0     # newest -> keep
+mkbuild "$UP" upold v9-9-9 10    # non-latest, past the 7-day window -> prune
+prune_stamp="$LEAN_CACHE_BUILDS/.last-prune"
+rm -f "$prune_stamp"
+
+"$CLI" use "$PU" >/dev/null 2>&1
+check "use with no stamp prunes the store"         "no"  "$(exists "$UP/upold/v9-9-9")"
+check "use with no stamp creates the stamp"        "yes" "$([[ -f "$prune_stamp" ]] && echo yes || echo no)"
+
+# A fresh stamp (just written above): a newly-eligible stale build is left alone.
+mkbuild "$UP" upnew2 v8-8-8 0
+mkbuild "$UP" upold2 v8-8-8 10
+"$CLI" use "$PU" >/dev/null 2>&1
+check "use with a fresh stamp skips pruning"       "yes" "$(exists "$UP/upold2/v8-8-8")"
+
+# An old stamp (>1 day) triggers another prune, and refreshes the stamp.
+touch -d "@$(( $(date +%s) - 90000 ))" "$prune_stamp"
+"$CLI" use "$PU" >/dev/null 2>&1
+check "use with a stale stamp prunes again"        "no"  "$(exists "$UP/upold2/v8-8-8")"
+check "use with a stale stamp refreshes the stamp" "yes" \
+  "$([[ -n "$(find "$prune_stamp" -mtime -1 2>/dev/null)" ]] && echo yes || echo no)"
+}
+
+group_hostslot() {
+new_cache
+STUB="$TMP/stub"; write_lake_stub "$STUB"
+P="$TMP/proj"; new_gate_project "$P"
+# The wrapper cases below are about warm builds, so stage one.
+mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE' > "$P/.lake/build/lib/lean/Proj/A.olean"
 
 echo "== host build slots & lean-cache build (hermetic) =="
 # The wrapper runs lake build (with passthrough args) in the project.
@@ -1052,7 +1275,7 @@ check "SLOTS=0 emits no slot messages"          "no" \
 # The gate's publish re-exec rides the gate's own slot (no self-deadlock, no
 # waiting): with a single slot and publish-on-push enabled, the push completes
 # with two lake runs (gate + publish's no-op) and never waits for a slot.
-printf 'def a := 11\n' > "$P/Proj/A.lean"; gitc "$P" add Proj/A.lean; gitc "$P" commit -qm edit8
+printf 'def a := 11\n' > "$P/Proj/A.lean"; gitq "$P" add Proj/A.lean; gitq "$P" commit -qm edit8
 rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE11' > "$P/.lake/build/lib/lean/Proj/A.olean"
 : > "$TMP/g.log"
 out="$(PATH="$STUB:$PATH" LEAN_CACHE_BUILD_SLOTS=1 LEAN_CACHE_BUILD_WAIT=45 \
@@ -1061,24 +1284,19 @@ check "gate+publish share one slot: push succeeds" "0" "$rc"
 check "gate+publish share one slot: both builds ran" "2" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
 check "gate+publish share one slot: no slot wait"  "no" \
   "$(printf '%s' "$out" | grep -q 'waiting for a host build slot' && echo yes || echo no)"
+}
+
+group_policy() {
+new_cache
+STUB="$TMP/stub"; write_lake_stub "$STUB"
+new_policy_projects
 
 echo "== transparent build policy (hermetic) =="
 # The shared warm/cold policy behind both `lake build` (via the shim) and
 # `lean-cache build`. A warm/incremental build runs immediately; a cold/full one
 # serializes and, in a bounded foreground call, bails instead of being killed.
 
-# Cold project: committed, no .lake/build, no stored warm build.
-CP="$TMP/cold"; mkdir -p "$CP/Proj"; gitc "$CP" init -q
-pin v4.30.0 "$CP"; printf 'name="p"\n' > "$CP/lakefile.toml"
-printf '.lake/\n' > "$CP/.gitignore"; printf 'def c := 1\n' > "$CP/Proj/C.lean"
-gitc "$CP" add -A; gitc "$CP" commit -qm init
-
-# Warm project: same, but carrying a prior build (an olean under .lake/build).
-WP="$TMP/warm"; mkdir -p "$WP/Proj"; gitc "$WP" init -q
-pin v4.30.0 "$WP"; printf 'name="p"\n' > "$WP/lakefile.toml"
-printf '.lake/\n' > "$WP/.gitignore"; printf 'def w := 1\n' > "$WP/Proj/W.lean"
-gitc "$WP" add -A; gitc "$WP" commit -qm init
-mkdir -p "$WP/.lake/build/lib/lean/Proj"; printf 'OLE' > "$WP/.lake/build/lib/lean/Proj/W.olean"
+new_policy_projects
 
 # (a) Warm build runs immediately with no slot, even in a foreground call.
 : > "$TMP/pol.log"
@@ -1153,7 +1371,7 @@ check "slot-held build acquires no new slot"     "no" \
 
 # (g) A stored warm build matching HEAD classifies as warm even with an empty
 # .lake/build on disk (a freshly seedable worktree), so it does not bail.
-SP="$TMP/stored"; mkdir -p "$SP/Proj"; gitc "$SP" init -q
+SP="$TMP/stored"; mkdir -p "$SP/Proj"; gitq "$SP" init -q
 pin v4.30.0 "$SP"; printf 'name="p"\n' > "$SP/lakefile.toml"
 printf '.lake/\n' > "$SP/.gitignore"; printf 'def s := 1\n' > "$SP/Proj/S.lean"
 gitc "$SP" add -A; gitc "$SP" commit -qm init
@@ -1164,6 +1382,12 @@ rm -rf "$SP/.lake/build"                 # cold on disk, but a stored build matc
 PATH="$STUB:$PATH" CLAUDE_BASH_MODE=foreground LAKE_LOG="$TMP/pol.log" "$CLI" build "$SP" >/dev/null 2>&1 || rc=$?
 check "stored-warm build classifies as warm (fg)" "1" "$(grep -c '^lake build' "$TMP/pol.log" 2>/dev/null)"
 check "stored-warm build does not bail"          "0" "$rc"
+}
+
+group_shim() {
+new_cache
+STUB="$TMP/stub"; write_lake_stub "$STUB"
+new_policy_projects
 
 echo "== lake shim (hermetic) =="
 # The shim, installed alongside lean-cache, must pass non-build subcommands
@@ -1194,13 +1418,18 @@ check "shim cold foreground build bails, code 75" "75" "$rc"
 check "shim cold bail ran no real build"          "0" "$(grep -c '^lake build' "$TMP/shim.log" 2>/dev/null)"
 check "shim cold bail names 'lake build' to re-run" "yes" \
   "$(printf '%s' "$out" | grep -q 'lake build' && echo yes || echo no)"
+}
+
+group_selfheal() {
+new_cache
+STUB="$TMP/stub"; write_lake_stub "$STUB"
 
 echo "== overlay self-heal on build (hermetic) =="
 # A project whose shared-cache overlay has gone dangling (e.g. its version was
 # uninstalled from underneath it) must be silently repaired by `build` before
 # it runs lake — no manual `lean-cache use` required.
 mkdir -p "$TMP/cache/lakes/v9-2-0/packages/mathlib" "$TMP/cache/lakes/v9-2-0/packages/batteries"
-OV="$TMP/selfheal"; mkdir -p "$OV/Proj"; gitc "$OV" init -q
+OV="$TMP/selfheal"; mkdir -p "$OV/Proj"; gitq "$OV" init -q
 pin v9.2.0 "$OV"; printf 'name="p"\n' > "$OV/lakefile.toml"
 printf '.lake/\n' > "$OV/.gitignore"; printf 'def o := 1\n' > "$OV/Proj/O.lean"
 gitc "$OV" add -A; gitc "$OV" commit -qm init
@@ -1239,7 +1468,7 @@ check "dangling overlay: build/lib olean intact"   "OLEAN-O" "$(cat "$OV/.lake/b
 # (c) A project with no shared-cache overlay at all (never `use`d) is left
 # alone: build must not force one into existence off a bare mathlib-missing
 # check — the hooks are what provision a fresh checkout.
-NV="$TMP/nooverlay"; mkdir -p "$NV/Proj"; gitc "$NV" init -q
+NV="$TMP/nooverlay"; mkdir -p "$NV/Proj"; gitq "$NV" init -q
 pin v9.2.0 "$NV"; printf 'name="p"\n' > "$NV/lakefile.toml"
 printf '.lake/\n' > "$NV/.gitignore"; printf 'def n := 1\n' > "$NV/Proj/N.lean"
 gitc "$NV" add -A; gitc "$NV" commit -qm init
@@ -1249,56 +1478,11 @@ check "no overlay yet: build does not force one"  "no" \
   "$([[ -e "$NV/.lake/packages" ]] && echo yes || echo no)"
 check "no overlay yet: build still ran lake"      "1" "$(grep -c '^lake build' "$TMP/b.log" 2>/dev/null)"
 check "no overlay yet: build exits 0"             "0" "$rc"
-
-echo "== build-store rotation (hermetic) =="
-# Fabricate builds with controlled publish times and check the keep/drop policy.
-mkbuild() { # mkbuild <repodir> <commit> <slug> <age_days>
-  local d="$1/$2/$3"; mkdir -p "$d/lib"
-  printf 'OLE' > "$d/lib/x.olean"
-  printf 'commit=%s\nslug=%s\npublished_at=%s\n' "$2" "$3" "$(( $(date +%s) - $4 * 86400 ))" \
-    > "$d/.seed-manifest"
 }
-RB="$LEAN_CACHE_BUILDS/rot-repo"
-mkbuild "$RB" newcommit v9-9-9 0    # newest for v9-9-9      -> keep
-mkbuild "$RB" midcommit v9-9-9 3    # non-latest, within 7d  -> keep
-mkbuild "$RB" oldcommit v9-9-9 10   # non-latest, older 7d   -> prune
-mkbuild "$RB" loneold   v8-8-8 30   # only build for v8-8-8  -> newest -> keep
-exists() { [[ -d "$1" ]] && echo yes || echo no; }
-"$CLI" prune-builds --keep-days 7 >/dev/null 2>&1
-check "rotation keeps newest per toolchain"      "yes" "$(exists "$RB/newcommit/v9-9-9")"
-check "rotation keeps non-latest within window"  "yes" "$(exists "$RB/midcommit/v9-9-9")"
-check "rotation drops non-latest past window"    "no"  "$(exists "$RB/oldcommit/v9-9-9")"
-check "rotation keeps lone latest even if old"   "yes" "$(exists "$RB/loneold/v8-8-8")"
-check "rotation removes emptied commit dir"      "no"  "$(exists "$RB/oldcommit")"
 
-echo "== opportunistic prune on use (hermetic) =="
-# `use` rotates the whole build store at most once a day, guarded by a stamp
-# file, so a store that stops being published to doesn't accumulate stale
-# builds forever without a cron'd prune-builds. Reuses mkbuild/exists from the
-# rotation section above; $B (pinned v4.31.0, already `use`d earlier) is a
-# project `use` can run against without any stub lake.
-UP="$LEAN_CACHE_BUILDS/use-prune-repo"
-mkbuild "$UP" upnew v9-9-9 0     # newest -> keep
-mkbuild "$UP" upold v9-9-9 10    # non-latest, past the 7-day window -> prune
-prune_stamp="$LEAN_CACHE_BUILDS/.last-prune"
-rm -f "$prune_stamp"
-
-"$CLI" use "$B" >/dev/null 2>&1
-check "use with no stamp prunes the store"         "no"  "$(exists "$UP/upold/v9-9-9")"
-check "use with no stamp creates the stamp"        "yes" "$([[ -f "$prune_stamp" ]] && echo yes || echo no)"
-
-# A fresh stamp (just written above): a newly-eligible stale build is left alone.
-mkbuild "$UP" upnew2 v8-8-8 0
-mkbuild "$UP" upold2 v8-8-8 10
-"$CLI" use "$B" >/dev/null 2>&1
-check "use with a fresh stamp skips pruning"       "yes" "$(exists "$UP/upold2/v8-8-8")"
-
-# An old stamp (>1 day) triggers another prune, and refreshes the stamp.
-touch -d "@$(( $(date +%s) - 90000 ))" "$prune_stamp"
-"$CLI" use "$B" >/dev/null 2>&1
-check "use with a stale stamp prunes again"        "no"  "$(exists "$UP/upold2/v8-8-8")"
-check "use with a stale stamp refreshes the stamp" "yes" \
-  "$([[ -n "$(find "$prune_stamp" -mtime -1 2>/dev/null)" ]] && echo yes || echo no)"
+group_events() {
+new_cache
+STUB="$TMP/stub"; write_lake_stub "$STUB"
 
 echo "== event log & stats (hermetic) =="
 # Redirect the event log to a throwaway dir and drive a use/seed/publish/gate
@@ -1308,15 +1492,12 @@ echo "== event log & stats (hermetic) =="
 export LEAN_CACHE_LOG_DIR="$TMP/eventlog"
 export LEAN_CACHE_NO_PUBLISH_ON_PUSH=1     # keep the gate's own event isolated
 evlog="$LEAN_CACHE_LOG_DIR/events.$(id -un).log"
-# Value of <key> from the LAST line of event <ev> (empty if none).
-ev_field() { awk -F'\t' -v ev="$2" -v key="$3" \
-  '$3==ev{for(i=4;i<=NF;i++){p=index($i,"=");if(substr($i,1,p-1)==key)val=substr($i,p+1)}} END{print val}' "$1"; }
 
-EV="$TMP/evproj"; mkdir -p "$EV/Proj"; gitc "$EV" init -q
+EV="$TMP/evproj"; mkdir -p "$EV/Proj"; gitq "$EV" init -q
 pin v4.30.0 "$EV"; printf 'name="e"\n' > "$EV/lakefile.toml"
 printf '.lake/\n' > "$EV/.gitignore"
 printf 'def a := 1\n' > "$EV/Proj/A.lean"
-gitc "$EV" add -A; gitc "$EV" commit -qm init
+gitq "$EV" add -A; gitq "$EV" commit -qm init
 evcommit="$(gitc "$EV" rev-parse HEAD)"
 
 # use: logs a use event (auto_install=0; v4-30-0 exists in the throwaway cache)
@@ -1346,7 +1527,7 @@ check "gate skip logged (stored green build)"  "skip" "$(ev_field "$evlog" gate 
 check "gate skip records secs=0"               "0" "$(ev_field "$evlog" gate secs)"
 
 # gate build: a new commit with no stored build, gate skip forced off -> ok.
-printf 'def b := 2\n' > "$EV/Proj/B.lean"; gitc "$EV" add -A; gitc "$EV" commit -qm addb
+printf 'def b := 2\n' > "$EV/Proj/B.lean"; gitq "$EV" add -A; gitq "$EV" commit -qm addb
 PATH="$STUB:$PATH" LEAN_CACHE_NO_GATE_SKIP=1 gitc "$EV" push -q origin HEAD:main >/dev/null 2>&1 || true
 check "gate ok logged on a built push"         "ok" "$(ev_field "$evlog" gate outcome)"
 
@@ -1381,11 +1562,20 @@ check "stats: gate outcomes"       "yes" "$(seen "$sout" 'gate +2 engaged: 1 ok,
 # show up, rather than vanishing.
 check "stats: known-but-unspecialized event counted" "yes" "$(seen "$sout" '^  verify +1$')"
 check "stats: wholly-unknown event counted"          "yes" "$(seen "$sout" '^  frobnicate +1$')"
+}
+
+group_verify() {
+new_cache
+# verify compares every path against OWNER, which the host config pins to the
+# cache owner. Pin it to the caller so the hermetic tree reads as owned.
+export LEAN_CACHE_OWNER="$(id -un)"
+export LEAN_CACHE_LOG_DIR="$TMP/eventlog"
+evlog="$LEAN_CACHE_LOG_DIR/events.$(id -un).log"
 
 echo "== verify (hermetic) =="
 # A fresh cache tree with one installed version, planted with one violation per
-# check at a time. LEAN_CACHE_LOG_DIR is still $TMP/eventlog from the event-log
-# section above, so verify's own event lands in the same log we already probe.
+# check at a time. verify logs an event of its own, which the last two cases
+# read back out of this group's event log.
 VROOT="$TMP/vcache"
 mkdir -p "$VROOT/lakes/v9-1-0/packages/mathlib/.lake/build" \
          "$VROOT/lakes/v9-1-0/packages/batteries" "$VROOT/elan/bin"
@@ -1518,7 +1708,36 @@ check "fix-perms <version> cleaned the named version" "no" \
   "$(find "$VROOT/lakes/v9-1-0" -perm -0020 -print -quit | grep -q . && echo yes || echo no)"
 rc=0; LEAN_CACHE_OWNER="$(id -un)" LEAN_CACHE_ROOT="$VROOT" "$CLI" fix-perms v9.9.9 >/dev/null 2>&1 || rc=$?
 check "fix-perms of an uninstalled version fails"    "1" "$rc"
+}
+
+# ------------------------------------------------------------------ runner ---
+# Groups are hermetic, so they run concurrently; their output is buffered and
+# replayed in declaration order so a parallel run reads like a serial one.
+SUITES=(static overlay_reset overlay_pick overlay_file overlay_hooks overlay_uninst multiproj hookmono pinnedroot elanwire elancmds install slots seed gate gateextra_e gateextra_f gateextra_g pubpush gateskip greenguard store hostslot policy shim selfheal events verify)
+OUT="$(mktemp -d)"; trap 'rm -rf "$OUT"' EXIT
+# Groups are dominated by process spawning and short git calls rather than by
+# sustained CPU, so running them all at once beats capping at core count.
+JOBS="${TEST_JOBS:-${#SUITES[@]}}"
+
+run_group() { # run_group <name> — buffer the group's output, record its status
+  local g="$1" rc=0
+  ( group_"$g"; exit "$fail" ) > "$OUT/$g.log" 2>&1 || rc=$?
+  printf '%s' "$rc" > "$OUT/$g.rc"
+}
+
+for g in "${SUITES[@]}"; do
+  while (( $(jobs -rp | wc -l) >= JOBS )); do wait -n || true; done
+  run_group "$g" &
+done
+wait
+
+for g in "${SUITES[@]}"; do
+  cat "$OUT/$g.log"
+  [[ "$(cat "$OUT/$g.rc")" == 0 ]] || fail=1
+done
 
 echo
+skipped="$(cat "$OUT"/*.log | grep -c 'skip (nightly):' || true)"
+[[ "$skipped" -gt 0 ]] && echo "$skipped case(s) deferred to the nightly tier (BOTS_RUN_SLOW=1 runs them)"
 if [[ "$fail" -eq 0 ]]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; fi
 exit "$fail"

@@ -302,6 +302,22 @@ foreign="$(cat "$H/reference-transaction")"
 "$CLI" use "$C" >/dev/null 2>&1
 check "legacy hook upgraded in place"         "yes" "$(has_sentinel "$H/post-checkout")"
 check "foreign hook left untouched"           "$foreign" "$(cat "$H/reference-transaction")"
+
+# Scenario: a repo whose four hook slots are ALL foreign. install_hooks writes
+# nothing, and both use and refresh must still succeed and overlay the project —
+# refresh reaches cmd_use on a path where errexit is live, so an install_hooks
+# that reports "wrote no hooks" as a failure aborts the refresh.
+AF="$TMP/allforeign"; new_lake_project "$AF" v4.30.0 A 'def a := 1'
+for h in post-checkout reference-transaction pre-push post-commit; do
+  printf '#!/bin/sh\nexit 0\n' > "$AF/.git/hooks/$h"
+done
+rc=0; "$CLI" use "$AF" >/dev/null 2>&1 || rc=$?
+check "use exits 0 with every hook slot foreign"     "0" "$rc"
+check "use still overlays with every hook slot foreign" "v4-30-0" "$(live_slug "$AF")"
+pin v4.31.0 "$AF"
+rc=0; "$CLI" refresh "$AF" >/dev/null 2>&1 || rc=$?
+check "refresh exits 0 with every hook slot foreign"  "0" "$rc"
+check "refresh still repoints with every hook slot foreign" "v4-31-0" "$(live_slug "$AF")"
 }
 
 group_overlay_uninst() {

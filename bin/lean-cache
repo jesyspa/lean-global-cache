@@ -286,8 +286,21 @@ toolchain_installed() { # arg: toolchain
 # share a common git dir, so its realpath identifies the repo on this host; we
 # slugify it as "<workdir-basename>-<short-hash>" so two repos that happen to
 # share a basename never collide on one key.
+#
+# Sets $_RI rather than printing, and memoizes per $proj: callers like
+# cmd_seed_build/cmd_publish_build/cmd_pre_push_gate each need this several
+# times per invocation (for the store path and again for log_event), and a
+# `$(...)` capture would run this in a subshell, discarding the memoized entry
+# before the caller ever sees it.
+declare -A _REPO_IDENTITY_CACHE=()
 repo_identity() {
-  local proj="$1" gitdir
+  local proj="$1"
+  if [[ -n "${_REPO_IDENTITY_CACHE[$proj]+x}" ]]; then
+    _RI="${_REPO_IDENTITY_CACHE[$proj]}"
+    return 0
+  fi
+  _RI=""
+  local gitdir
   gitdir="$(git -C "$proj" rev-parse --git-common-dir 2>/dev/null)" || return 1
   [[ "$gitdir" = /* ]] || gitdir="$(cd "$proj" && cd "$gitdir" && pwd)"
   gitdir="$(realpath "$gitdir" 2>/dev/null || echo "$gitdir")"
@@ -295,14 +308,15 @@ repo_identity() {
   base="${gitdir%/*}"; base="${base##*/}"
   [[ -n "$base" && "$base" != "." && "$base" != "/" ]] || base="repo"
   hash="$(printf '%s' "$gitdir" | sha1sum)"; hash="${hash:0:12}"
-  printf '%s-%s' "$base" "$hash"
+  _RI="$base-$hash"
+  _REPO_IDENTITY_CACHE[$proj]="$_RI"
 }
 
-# Store dir for a (proj, commit, slug). Echoes the path; nonzero if the repo has
-# no identity (not a git repo).
+# Store dir for a (proj, commit, slug). Sets $_BSF rather than printing (see
+# repo_identity); nonzero if the repo has no identity.
 build_store_for() { # args: proj commit slug
-  local rid; rid="$(repo_identity "$1")" || return 1
-  printf '%s/%s/%s/%s' "$BUILDS" "$rid" "$2" "$3"
+  repo_identity "$1" || { _BSF=""; return 1; }
+  _BSF="$BUILDS/$_RI/$2/$3"
 }
 
 # Normalize a build-store tree to single-writer read-only: dirs traversable,
@@ -543,7 +557,8 @@ stored_warm_build_matches() { # arg: proj
   [[ -n "$commit" ]] || return 1
   slug="$( { normalize_version "$(<"$proj/lean-toolchain")" && printf '%s' "$SLUG"; } 2>/dev/null )" || slug=""
   [[ -n "$slug" ]] || return 1
-  store="$(build_store_for "$proj" "$commit" "$slug")" || return 1
+  build_store_for "$proj" "$commit" "$slug" || return 1
+  store="$_BSF"
   [[ -d "$store/lib" ]]
 }
 
@@ -1490,9 +1505,10 @@ cmd_seed_build() {
   [[ -n "$commit" ]] || return 0
   normalize_version "$(<"$proj/lean-toolchain")"
 
-  local store; store="$(build_store_for "$proj" "$commit" "$SLUG")" || return 0
+  build_store_for "$proj" "$commit" "$SLUG" || return 0
+  local store="$_BSF"
   if [[ ! -d "$store/lib" ]]; then            # no warm build stored for this exact (commit, slug)
-    log_event seed hit=0 repo="$(repo_identity "$proj")" commit="${commit:0:12}" slug="$SLUG"
+    log_event seed hit=0 repo="$_RI" commit="${commit:0:12}" slug="$SLUG"
     return 0
   fi
 
@@ -1513,7 +1529,7 @@ cmd_seed_build() {
   rm -rf "$proj/.lake/build/lib" "$proj/.lake/build/ir"
   seed_tree "$store/lib" "$proj/.lake/build/lib"
   seed_tree "$store/ir"  "$proj/.lake/build/ir"
-  log_event seed hit=1 repo="$(repo_identity "$proj")" commit="${commit:0:12}" slug="$SLUG"
+  log_event seed hit=1 repo="$_RI" commit="${commit:0:12}" slug="$SLUG"
   log "seeded warm build for $TCVER @ ${commit:0:12} into $proj/.lake/build"
 }
 
@@ -1582,12 +1598,13 @@ cmd_publish_build() {
   if run_lake_build "$proj" "$PROG publish-build"; then green=1; fi
   [[ -d "$proj/.lake/build/lib" ]] || die "$proj has no .lake/build/lib to publish"
 
-  local store; store="$(build_store_for "$proj" "$commit" "$SLUG")"
+  build_store_for "$proj" "$commit" "$SLUG"
+  local store="$_BSF" rid="$_RI"
   mkdir -p "$BUILDS"
   # Brace group, not `exec ... 2>/dev/null`: that would permanently redirect
   # the script's stderr (killing all later log output), and a failed exec
   # redirection exits a non-interactive shell before the || fallback runs.
-  { exec 9>"$BUILDS/.$(repo_identity "$proj")-$commit-$SLUG.lock"; } 2>/dev/null \
+  { exec 9>"$BUILDS/.$rid-$commit-$SLUG.lock"; } 2>/dev/null \
     || exec 9>"$BUILDS/.publish.lock"
   flock -n 9 || die "another publish for this build is in progress"
 
@@ -1596,7 +1613,7 @@ cmd_publish_build() {
   # switch off the gate's skip. Leave the stored green build in place, and never
   # fail the caller (a push must not be affected).
   if [[ "$green" -eq 0 ]] && build_is_green "$store"; then
-    log_event publish repo="$(repo_identity "$proj")" commit="${commit:0:12}" slug="$SLUG" green="$green" secs=$(( EPOCHSECONDS - pub_t0 ))
+    log_event publish repo="$rid" commit="${commit:0:12}" slug="$SLUG" green="$green" secs=$(( EPOCHSECONDS - pub_t0 ))
     log "keeping stored green build for $TCVER @ ${commit:0:12}; not overwriting with a non-green build"
     return 0
   fi
@@ -1609,19 +1626,19 @@ cmd_publish_build() {
   local -a oleans=()
   mapfile -t oleans < <(find "$incoming/lib" -name '*.olean' 2>/dev/null)
   printf 'repo=%s\ncommit=%s\ntoolchain=%s\nslug=%s\noleans=%s\npublished_by=%s\npublished_at=%s\ntree_clean=%s\n' \
-    "$(repo_identity "$proj")" "$commit" "$TOOLCHAIN" "$SLUG" \
+    "$rid" "$commit" "$TOOLCHAIN" "$SLUG" \
     "${#oleans[@]}" "$ME" "$EPOCHSECONDS" "$green" \
     > "$incoming/.seed-manifest"
   normalize_build_store "$incoming"
 
   rm -rf "$store"
   mv "$incoming" "$store"
-  log_event publish repo="$(repo_identity "$proj")" commit="${commit:0:12}" slug="$SLUG" green="$green" secs=$(( EPOCHSECONDS - pub_t0 ))
+  log_event publish repo="$rid" commit="${commit:0:12}" slug="$SLUG" green="$green" secs=$(( EPOCHSECONDS - pub_t0 ))
   log "published $([[ "$green" -eq 1 ]] && echo green || echo non-green) build for $TCVER @ ${commit:0:12} -> $store"
 
   # Rotate this repo's store: the build just published is now "latest" and is
   # kept; older non-latest builds past the window are dropped.
-  prune_builds_under "$BUILDS/$(repo_identity "$proj")" "$BUILD_KEEP_DAYS" || true
+  prune_builds_under "$BUILDS/$rid" "$BUILD_KEEP_DAYS" || true
 }
 
 # Epoch at which a stored build was published: from the manifest's published_at,
@@ -1649,31 +1666,36 @@ prune_builds_under() {
   local repo="$1" keep_days="$2"
   [[ -d "$repo" ]] || return 0
   local now cutoff; now="$EPOCHSECONDS"; cutoff=$(( now - keep_days * 86400 ))
-  local -A latest=() latest_green=()
+  local -A latest=() latest_green=() ts_of=() green_of=()
   local d slug ts
-  # Pass 1: newest publish time per slug, and newest green publish time per slug.
+  # One traversal, candidate dirs kept in order: compute (and cache) each dir's
+  # publish time and green status once, tracking the newest-per-slug and
+  # newest-green-per-slug times as we go — pass 2 below reuses this instead of
+  # re-walking the tree and re-parsing every .seed-manifest a second time.
+  local -a dirs=()
   while IFS= read -r -d '' d; do
     case "$d" in *.incoming.*) continue ;; esac
     [[ -e "$d/.seed-manifest" || -d "$d/lib" ]] || continue
+    dirs+=("$d")
     slug="${d##*/}"; ts="$(build_published_at "$d")"
+    ts_of["$d"]="$ts"
     [[ -z "${latest[$slug]:-}" || "$ts" -gt "${latest[$slug]}" ]] && latest[$slug]="$ts"
     if build_is_green "$d"; then
+      green_of["$d"]=1
       [[ -z "${latest_green[$slug]:-}" || "$ts" -gt "${latest_green[$slug]}" ]] && latest_green[$slug]="$ts"
     fi
   done < <(find "$repo" -mindepth 2 -maxdepth 2 -type d -print0 2>/dev/null)
   # Pass 2: drop builds that are neither newest-per-slug nor newest-green-per-slug
   # and are older than the window.
-  while IFS= read -r -d '' d; do
-    case "$d" in *.incoming.*) continue ;; esac
-    [[ -e "$d/.seed-manifest" || -d "$d/lib" ]] || continue
-    slug="${d##*/}"; ts="$(build_published_at "$d")"
+  for d in "${dirs[@]}"; do
+    slug="${d##*/}"; ts="${ts_of[$d]}"
     [[ "$ts" -eq "${latest[$slug]:-0}" ]] && continue   # newest per slug: keep
-    [[ "$ts" -eq "${latest_green[$slug]:-0}" ]] && build_is_green "$d" && continue  # newest green per slug: keep
+    [[ "$ts" -eq "${latest_green[$slug]:-0}" && -n "${green_of[$d]:-}" ]] && continue  # newest green per slug: keep
     [[ "$ts" -lt "$cutoff" ]] || continue               # within window: keep
     local repo_base="${d%/*}"; repo_base="${repo_base##*/}"
     log "pruning stale build $repo_base/$slug (~$(( (now - ts) / 86400 ))d old)"
     rm -rf "$d"
-  done < <(find "$repo" -mindepth 2 -maxdepth 2 -type d -print0 2>/dev/null)
+  done
   # Drop commit dirs left empty by pruning.
   find "$repo" -mindepth 1 -maxdepth 1 -type d -empty -delete 2>/dev/null || true
 }
@@ -1712,6 +1734,8 @@ hook_is_ours() {
 
 # Write our version of a single hook unless a foreign hook already occupies the
 # slot. Idempotent: regenerating an unchanged hook leaves identical bytes.
+# Doesn't chmod +x itself — install_hooks batches that into one call after all
+# four hooks are written.
 install_one_hook() {
   local hook="$1" body="$2"
   if [[ -e "$hook" ]] && ! hook_is_ours "$hook"; then
@@ -1719,7 +1743,7 @@ install_one_hook() {
     return 0
   fi
   printf '%s\n' "$body" > "$hook"
-  chmod +x "$hook"
+  _HOOKS_WRITTEN+=("$hook")
 }
 
 # Install the project hooks into the (worktree-shared) hooks directory:
@@ -1746,6 +1770,7 @@ install_hooks() {
   gitdir="$(git -C "$proj" rev-parse --git-common-dir 2>/dev/null)" || return 0
   [[ "$gitdir" = /* ]] || gitdir="$proj/$gitdir"
   mkdir -p "$gitdir/hooks"
+  local _HOOKS_WRITTEN=()
 
   install_one_hook "$gitdir/hooks/post-checkout" "#!/usr/bin/env bash
 # $HOOK_SENTINEL: re-establish the .lake/packages overlay after checkout.
@@ -1792,6 +1817,8 @@ exec \"\${LEAN_CACHE_BIN:-$HOOK_BIN}\" pre-push-gate \"\$@\""
 root=\"\$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0
 [[ -f \"\$root/lean-toolchain\" ]] || exit 0
 exec \"\${LEAN_CACHE_BIN:-$HOOK_BIN}\" commit-hint \"\$root\""
+
+  if [[ ${#_HOOKS_WRITTEN[@]} -gt 0 ]]; then chmod +x "${_HOOKS_WRITTEN[@]}"; fi
 }
 
 # The push build gate, invoked by the pre-push hook as `pre-push-gate <remote>`
@@ -1860,12 +1887,12 @@ cmd_pre_push_gate() {
   if [[ -z "${LEAN_CACHE_NO_GATE_SKIP:-}" && -f "$root/lean-toolchain" ]]; then
     local slug store
     slug="$( { normalize_version "$(<"$root/lean-toolchain")" && printf '%s' "$SLUG"; } 2>/dev/null )" || slug=""
-    if [[ -n "$slug" ]] && store="$(build_store_for "$root" "$head" "$slug")" \
+    if [[ -n "$slug" ]] && build_store_for "$root" "$head" "$slug" && store="$_BSF" \
        && [[ -d "$store/lib" ]] \
        && [[ "$(stat -c '%U' "$store" 2>/dev/null)" == "$ME" ]] \
        && build_is_green "$store"; then
       echo "lean push gate: green build already stored for HEAD (${head:0:12}, $slug) — skipping the gate build" >&2
-      log_event gate outcome=skip repo="$(repo_identity "$root")" commit="${head:0:12}" secs=0
+      log_event gate outcome=skip repo="$_RI" commit="${head:0:12}" secs=0
       exit 0
     fi
   fi
@@ -1891,8 +1918,9 @@ cmd_pre_push_gate() {
   gate_t0="$EPOCHSECONDS"
   acquire_build_slot "lean push gate"
   run_lake_build "$root" "lean push gate" \
-    || { echo 'lean push gate: lake build FAILED — push aborted (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; log_event gate outcome=fail repo="$(repo_identity "$root")" commit="${head:0:12}" secs=$(( EPOCHSECONDS - gate_t0 )); exit 1; }
-  log_event gate outcome=ok repo="$(repo_identity "$root")" commit="${head:0:12}" secs=$(( EPOCHSECONDS - gate_t0 ))
+    || { echo 'lean push gate: lake build FAILED — push aborted (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; repo_identity "$root"; log_event gate outcome=fail repo="$_RI" commit="${head:0:12}" secs=$(( EPOCHSECONDS - gate_t0 )); exit 1; }
+  repo_identity "$root"
+  log_event gate outcome=ok repo="$_RI" commit="${head:0:12}" secs=$(( EPOCHSECONDS - gate_t0 ))
   echo 'lean push gate: build OK — allowing push' >&2
   # The full build just passed, so .lake/build is a complete warm build for this
   # exact commit — capture it for reuse now. publish-build's own `lake build` is

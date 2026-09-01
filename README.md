@@ -88,6 +88,13 @@ sessions don't stack several thrashing builds onto the same cores;
 `lean-cache slots` shows which are held. `LEAN_CACHE_BUILD_SLOTS=0` turns
 serialization off.
 
+macOS ships no `flock(1)`, which this serialization needs. There, every
+affected command warns once to stderr and degrades instead of failing: build
+slots run unserialized (same as `LEAN_CACHE_BUILD_SLOTS=0`), `lean-cache
+slots` reports serialization unavailable, and the install/publish mutexes
+that guard the shared cache against concurrent writers are skipped — so on
+such a host, only run one `lean-cache` operation at a time.
+
 A cold build cannot finish inside a bounded foreground Claude Code call, so
 there the policy prints the command to re-run and exits 75 — re-run it
 backgrounded or with a long timeout. `lean-cache build --wait` blocks to

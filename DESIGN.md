@@ -489,6 +489,15 @@ held (fd 8) until the process exits; a child build inherits
 `LEAN_CACHE_BUILD_SLOT_HELD` and rides the parent's slot rather than deadlocking
 on it. `LEAN_CACHE_BUILD_SLOTS=0` disables serialization.
 
+macOS ships no `flock(1)`, which every lock described above is built on
+(`have_flock` checks for it once per process). On such a host the build slot
+degrades the same way as
+`LEAN_CACHE_BUILD_SLOTS=0`: unserialized, with a one-time warning to stderr.
+The install and publish mutexes below degrade too, but they are not just a
+speed concession — they guard the shared cache against concurrent writers —
+so on macOS `lean-cache` prints a warning that concurrent runs are unsafe and
+proceeds unlocked; the operator must run one `lean-cache` operation at a time.
+
 ### Foreground bail on a cold build
 
 A cold/full build takes minutes and cannot finish inside a bounded foreground

@@ -103,6 +103,31 @@ BUILD_BAIL_CODE=75
 die()  { echo "$PROG: $*" >&2; exit 1; }
 log()  { echo "==> $*" >&2; }
 
+# Whether flock(1) is on PATH, checked once per process and cached (macOS
+# ships no flock(1)). Callers that need mutual exclusion degrade instead of
+# failing when it's missing.
+_HAVE_FLOCK=""
+have_flock() {
+  [[ -n "$_HAVE_FLOCK" ]] || if command -v flock >/dev/null 2>&1; then _HAVE_FLOCK=1; else _HAVE_FLOCK=0; fi
+  [[ "$_HAVE_FLOCK" -eq 1 ]]
+}
+
+# One-shot warnings for the flock-missing degradations, so a command that hits
+# the same degraded path more than once (e.g. install's build slot and its own
+# mutex) still warns only once per kind, per process.
+_WARNED_NO_FLOCK_SLOT=0
+_WARNED_NO_FLOCK_MUTEX=0
+warn_no_flock_slot() {
+  [[ "$_WARNED_NO_FLOCK_SLOT" -eq 1 ]] && return 0
+  _WARNED_NO_FLOCK_SLOT=1
+  log "WARNING: flock(1) not found (macOS ships none); running unserialized, same as LEAN_CACHE_BUILD_SLOTS=0"
+}
+warn_no_flock_mutex() { # arg: what the skipped mutex normally guards
+  [[ "$_WARNED_NO_FLOCK_MUTEX" -eq 1 ]] && return 0
+  _WARNED_NO_FLOCK_MUTEX=1
+  log "WARNING: flock(1) not found (macOS ships none); $1 is not locked — concurrent lean-cache runs are UNSAFE on this host. Run one lean-cache operation at a time."
+}
+
 # Append one event to this user's log file. Line format (tab-separated):
 #   epoch<TAB>user<TAB>event<TAB>key=value<TAB>key=value...
 # The whole line is built first and written with a single `>>`. Logging must
@@ -400,7 +425,8 @@ build_slot_config() {
 # rides the parent's slot instead of deadlocking on it. Degrades, never
 # blocks work: if no slot frees up within LEAN_CACHE_BUILD_WAIT seconds (or
 # the lock files are unusable), the build proceeds unserialized with a note.
-# LEAN_CACHE_BUILD_SLOTS=0 disables serialization entirely.
+# LEAN_CACHE_BUILD_SLOTS=0 disables serialization entirely, as does a host
+# with no flock(1) (macOS), after a warning.
 acquire_build_slot() { # arg: message prefix
   [[ -n "${LEAN_CACHE_BUILD_SLOT_HELD:-}" ]] && return 0
   local who="${1:-$PROG}" slots wait base i waited=0
@@ -408,6 +434,10 @@ acquire_build_slot() { # arg: message prefix
   slots="$BUILD_SLOT_COUNT"; base="$BUILD_SLOT_BASE"
   wait="${LEAN_CACHE_BUILD_WAIT:-${BUILD_WAIT:-3600}}"
   [[ "$slots" -gt 0 ]] || return 0
+  if ! have_flock; then
+    warn_no_flock_slot
+    return 0
+  fi
   [[ "$wait" =~ ^[0-9]+$ ]] || wait=3600
   while :; do
     for ((i = 0; i < slots; i++)); do
@@ -469,6 +499,11 @@ cmd_slots() {
   local slots="$BUILD_SLOT_COUNT" base="$BUILD_SLOT_BASE"
   if [[ "$slots" -le 0 ]]; then
     echo "build serialization disabled (LEAN_CACHE_BUILD_SLOTS=0)"
+    return 0
+  fi
+  if ! have_flock; then
+    warn_no_flock_slot
+    echo "build slot serialization unavailable on this host (no flock(1))"
     return 0
   fi
   echo "build slots: $slots configured ($base.N.lock)"
@@ -1048,10 +1083,15 @@ cmd_install() {
   # every exit path, so a failure (any `die`) records ok=0 as well.
   INSTALL_SLUG="$SLUG"; INSTALL_FORCED="$force"; INSTALL_T0="$(date +%s)"
 
-  # Serialize installs of the same version.
+  # Serialize installs of the same version. No flock(1) (macOS): skip the
+  # mutex and proceed — see warn_no_flock_mutex.
   mkdir -p "$LAKES"
-  exec 9>"$LAKES/.$SLUG.lock"
-  flock -n 9 || die "another install of $SLUG is in progress"
+  if have_flock; then
+    exec 9>"$LAKES/.$SLUG.lock"
+    flock -n 9 || die "another install of $SLUG is in progress"
+  else
+    warn_no_flock_mutex "the install lock for $SLUG"
+  fi
 
   # Clear stale build dirs and half-published trees from a previously-interrupted
   # install of this version (safe under the lock — only this slug's scratch dirs
@@ -1621,12 +1661,17 @@ cmd_publish_build() {
   build_store_for "$proj" "$commit" "$SLUG"
   local store="$_BSF" rid="$_RI"
   mkdir -p "$BUILDS"
-  # Brace group, not `exec ... 2>/dev/null`: that would permanently redirect
-  # the script's stderr (killing all later log output), and a failed exec
-  # redirection exits a non-interactive shell before the || fallback runs.
-  { exec 9>"$BUILDS/.$rid-$commit-$SLUG.lock"; } 2>/dev/null \
-    || exec 9>"$BUILDS/.publish.lock"
-  flock -n 9 || die "another publish for this build is in progress"
+  # No flock(1) (macOS): skip the mutex and proceed — see warn_no_flock_mutex.
+  if have_flock; then
+    # Brace group, not `exec ... 2>/dev/null`: that would permanently redirect
+    # the script's stderr (killing all later log output), and a failed exec
+    # redirection exits a non-interactive shell before the || fallback runs.
+    { exec 9>"$BUILDS/.$rid-$commit-$SLUG.lock"; } 2>/dev/null \
+      || exec 9>"$BUILDS/.publish.lock"
+    flock -n 9 || die "another publish for this build is in progress"
+  else
+    warn_no_flock_mutex "the publish lock for $rid @ ${commit:0:12}"
+  fi
 
   # Never turn a stored green attestation into a non-green one: an interrupted or
   # failed rebuild at a commit already known green must not stale the entry or

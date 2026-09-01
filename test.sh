@@ -87,6 +87,30 @@ LK
   chmod +x "$1/lake"
 }
 
+# A copy of $PATH with every `flock` executable hidden, so the have_flock
+# degrade paths (the macOS case: no flock(1) at all) can be exercised on a
+# host that does have it. Any PATH directory holding a flock executable is
+# replaced by a stub directory symlinking everything else in it; directories
+# without one pass through untouched. Requires $TMP (set by new_cache).
+no_flock_path() {
+  local out="" d stub f base
+  local IFS=:
+  for d in $PATH; do
+    if [[ -x "$d/flock" ]]; then
+      stub="$TMP/noflock.$(printf '%s' "$d" | tr -c 'A-Za-z0-9' '_')"
+      mkdir -p "$stub"
+      for f in "$d"/*; do
+        base="$(basename "$f")"
+        [[ "$base" == flock ]] || ln -sf "$f" "$stub/$base" 2>/dev/null
+      done
+      out+="${out:+:}$stub"
+    else
+      out+="${out:+:}$d"
+    fi
+  done
+  printf '%s' "$out"
+}
+
 # A committed Lake project: lakefile, toolchain pin, .gitignore and one module.
 new_lake_project() { # new_lake_project <path> <version> <module> <decl>
   mkdir -p "$1/Proj"
@@ -789,6 +813,65 @@ out="$(LEAN_CACHE_BUILD_LOCK_DIR="$SLOTS_DIR" LEAN_CACHE_BUILD_SLOTS=0 "$CLI" sl
 check "SLOTS=0 reports serialization disabled" "yes" \
   "$(printf '%s' "$out" | grep -q 'disabled' && echo yes || echo no)"
 check "SLOTS=0 slots exits 0"                   "0" "$rc"
+}
+
+group_noflock() {
+new_cache
+echo "== no flock(1) on PATH: degrade with a warning, never fail (hermetic) =="
+NFPATH="$(no_flock_path)"
+
+# cmd_slots: reports serialization unavailable instead of probing locks.
+out="$(PATH="$NFPATH" "$CLI" slots 2>&1)"; rc=$?
+check "slots exits 0 with no flock on PATH"        "0"   "$rc"
+check "slots reports serialization unavailable"    "yes" \
+  "$(printf '%s' "$out" | grep -q 'serialization unavailable' && echo yes || echo no)"
+check "slots warns flock is missing"               "yes" \
+  "$(printf '%s' "$out" | grep -q 'flock(1) not found' && echo yes || echo no)"
+
+# acquire_build_slot: runs the build unserialized, same as SLOTS=0 — a speed
+# note, not a safety warning.
+STUB="$TMP/stub"; write_lake_stub "$STUB"
+CB="$TMP/nfcold"; new_lake_project "$CB" v4.30.0 C 'def c := 1'
+out="$(PATH="$STUB:$NFPATH" LEAN_CACHE_FORCE_WAIT=1 "$CLI" build "$CB" 2>&1)"; rc=$?
+check "build succeeds with no flock on PATH"        "0"   "$rc"
+check "build warns flock missing and runs unserialized" "yes" \
+  "$(printf '%s' "$out" | grep -q 'flock(1) not found' \
+      && printf '%s' "$out" | grep -q 'unserialized' && echo yes || echo no)"
+
+# install: the per-version mutex is skipped — a safety warning, since it
+# normally guards the shared cache against a concurrent writer, not just speed.
+export LEAN_CACHE_OWNER="$(id -un)"
+ISTUB="$TMP/istub"; mkdir -p "$ISTUB"
+cat > "$ISTUB/elan" <<'EL'
+#!/usr/bin/env bash
+exit 0
+EL
+chmod +x "$ISTUB/elan"
+cat > "$ISTUB/lake" <<'LK'
+#!/usr/bin/env bash
+if [[ "$1 $2" == "update mathlib" ]]; then
+  mkdir -p .lake/packages/mathlib/.lake/build/lib
+  printf 'OLE' > .lake/packages/mathlib/.lake/build/lib/M.olean
+fi
+exit 0
+LK
+chmod +x "$ISTUB/lake"
+out="$(PATH="$ISTUB:$NFPATH" "$CLI" install 4.55.0 2>&1)"; rc=$?
+check "install succeeds with no flock on PATH"      "0"   "$rc"
+check "install published the version"               "yes" "$(has_dir "$TMP/cache/lakes/v4-55-0/packages")"
+check "install warns concurrent runs are unsafe"    "yes" \
+  "$(printf '%s' "$out" | grep -qi 'concurrent lean-cache runs are unsafe' && echo yes || echo no)"
+
+# publish-build: the per-build mutex is skipped the same way, and the build is
+# still stored.
+P="$TMP/proj"; new_gate_project "$P"
+rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE' > "$P/.lake/build/lib/lean/Proj/A.olean"
+c="$(gitc "$P" rev-parse HEAD)"
+out="$(PATH="$STUB:$NFPATH" "$CLI" publish-build "$P" 2>&1)"; rc=$?
+check "publish-build succeeds with no flock on PATH"  "0"   "$rc"
+check "publish-build still stores the build"          "yes" "$(haspub "$c")"
+check "publish-build warns concurrent runs are unsafe" "yes" \
+  "$(printf '%s' "$out" | grep -qi 'concurrent lean-cache runs are unsafe' && echo yes || echo no)"
 }
 
 group_seed() {
@@ -1728,7 +1811,7 @@ check "fix-perms of an uninstalled version fails"    "1" "$rc"
 # ------------------------------------------------------------------ runner ---
 # Groups are hermetic, so they run concurrently; their output is buffered and
 # replayed in declaration order so a parallel run reads like a serial one.
-SUITES=(static overlay_reset overlay_pick overlay_file overlay_hooks overlay_uninst multiproj hookmono pinnedroot elanwire elancmds install slots seed gate gateextra_e gateextra_g pubpush gateskip greenguard store hostslot policy shim selfheal events verify)
+SUITES=(static overlay_reset overlay_pick overlay_file overlay_hooks overlay_uninst multiproj hookmono pinnedroot elanwire elancmds install slots noflock seed gate gateextra_e gateextra_g pubpush gateskip greenguard store hostslot policy shim selfheal events verify)
 # Deferred to the nightly tier: end-to-end round-trips whose core behaviour a
 # fast-tier group already covers, and which the deploy gate should not pay for.
 NIGHTLY_SUITES=(gateextra_f)

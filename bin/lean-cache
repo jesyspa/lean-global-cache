@@ -233,11 +233,6 @@ Usage: $PROG <command> [args]
   slots                 Report the state of the host build slots (free/held, and
                         the holder when it can be identified) — answers "why is
                         my build queued". Read-only, no privilege.
-  pre-push-gate <remote>
-                        Run the push build gate (reads the pushed ref list on
-                        stdin). On a clean gate build it also publishes the warm
-                        build (set LEAN_CACHE_NO_PUBLISH_ON_PUSH=1 to skip). This
-                        is what the pre-push git hook calls; not run by hand.
   commit-hint [path]    Print the post-commit reminder that the warm build can be
                         published for reuse. This is what the post-commit git hook
                         calls; not meant to be run by hand.
@@ -263,8 +258,8 @@ Usage: $PROG <command> [args]
                         output like check-env; exits 0 clean or warnings-only,
                         1 on any FAIL.
   stats [--since DAYS]  Summarize the event log over the last DAYS (default 7):
-                        per-event counts, seed hit rate, gate outcomes, build
-                        durations, slot waits. Read-only, no privilege.
+                        per-event counts, seed hit rate, build durations, slot
+                        waits. Read-only, no privilege.
 
 Version accepts: 4.30  4.30.0  v4.30.0  leanprover/lean4:v4.30.0  4.30.0-rc2
 EOF
@@ -325,8 +320,8 @@ toolchain_installed() { # arg: toolchain
 # share a basename never collide on one key.
 #
 # Sets $_RI rather than printing, and memoizes per $proj: callers like
-# cmd_seed_build/cmd_publish_build/cmd_pre_push_gate each need this several
-# times per invocation (for the store path and again for log_event), and a
+# cmd_seed_build/cmd_publish_build each need this several times per invocation
+# (for the store path and again for log_event), and a
 # `$(...)` capture would run this in a subshell, discarding the memoized entry
 # before the caller ever sees it.
 _REPO_IDENTITY_CACHE_KEYS=(); _REPO_IDENTITY_CACHE_VALS=()
@@ -391,7 +386,7 @@ seed_tree() { # args: src dst
 # a fresh checkout of HEAD: no changes to tracked files and no untracked .lean
 # or Lake config files. Untracked files elsewhere (and everything under .lake/)
 # cannot enter the build, so they don't count. Only a clean-tree build attests
-# the *commit* itself — the gate's skip-on-stored-green relies on this.
+# the *commit* itself, which is what a published build's tree_clean records.
 tree_clean_for_build() { # arg: proj
   local line
   while IFS= read -r line; do
@@ -421,7 +416,7 @@ build_slot_config() {
 # /tmp), so at most LEAN_CACHE_BUILD_SLOTS heavy `lake build`s run concurrently
 # host-wide and each gets real parallelism instead of all of them thrashing a
 # few cores. Holds fd 8 until the process exits; exports
-# LEAN_CACHE_BUILD_SLOT_HELD so a child build (the gate's publish re-exec)
+# LEAN_CACHE_BUILD_SLOT_HELD so a child build (a nested toolchain install)
 # rides the parent's slot instead of deadlocking on it. Degrades, never
 # blocks work: if no slot frees up within LEAN_CACHE_BUILD_WAIT seconds (or
 # the lock files are unusable), the build proceeds unserialized with a note.
@@ -563,9 +558,13 @@ real_lake() {
   printf '%s' "$REAL_LAKE"
 }
 
-# Run `lake build` in $1 with git's hook-injected environment scrubbed (see
-# cmd_pre_push_gate for why) and a heartbeat line every 30s, so a session
-# watching a silent non-TTY pipe can tell a minutes-long build is alive.
+# Run `lake build` in $1 with git's hook-injected environment scrubbed and a
+# heartbeat line every 30s, so a session watching a silent non-TTY pipe can tell
+# a minutes-long build is alive. The scrub matters when we run under a git hook
+# in a linked worktree: git exports GIT_DIR/GIT_WORK_TREE there, and a Lake that
+# inherits them resolves each dependency's `git remote get-url` against the
+# superproject, sees a bogus URL mismatch, and tries to re-clone the
+# (read-only, cache-symlinked) package.
 run_lake_build() { # args: root message-prefix [lake build args...]
   local root="$1" who="$2" pid hb rc=0 lake; shift 2
   lake="$(real_lake)"
@@ -1512,6 +1511,7 @@ cmd_refresh() {
   export LEAN_CACHE_NO_HOOK=1
   local proj="${1:-.}"
   proj="$(cd "$proj" 2>/dev/null && pwd)" || return 0
+  retire_pre_push_hook "$proj"
   if ! is_lake_project "$proj"; then
     local sub_rc=0
     run_on_subprojects "$proj" cmd_refresh || sub_rc=$?
@@ -1618,9 +1618,9 @@ cmd_clean() {
 # Build the project and publish its .lake/build for the current (commit, slug),
 # so future fresh worktrees can be seeded from it. Requires a clean tree, so the
 # stored build is an honest snapshot of committed sources; tree_clean=1 in the
-# manifest records that lake exited 0 (a green build the gate may skip on). A
-# non-green build is still published (tree_clean=0) to seed future incremental
-# builds, but never overwrites a stored green build of the same commit.
+# manifest records that lake exited 0 (a green build). A non-green build is still
+# published (tree_clean=0) to seed future incremental builds, but never
+# overwrites a stored green build of the same commit.
 cmd_publish_build() {
   [[ $# -le 1 ]] || usage
   # Publishing must build synchronously; never take the cold-build bail path.
@@ -1674,9 +1674,8 @@ cmd_publish_build() {
   fi
 
   # Never turn a stored green attestation into a non-green one: an interrupted or
-  # failed rebuild at a commit already known green must not stale the entry or
-  # switch off the gate's skip. Leave the stored green build in place, and never
-  # fail the caller (a push must not be affected).
+  # failed rebuild at a commit already known green must not stale the entry.
+  # Leave the stored green build in place, and never fail the caller.
   if [[ "$green" -eq 0 ]] && build_is_green "$store"; then
     log_event publish repo="$rid" commit="${commit:0:12}" slug="$SLUG" green="$green" secs=$(( $(date +%s) - pub_t0 ))
     log "keeping stored green build for $TCVER @ ${commit:0:12}; not overwriting with a non-green build"
@@ -1727,8 +1726,8 @@ build_is_green() { # arg: build store dir
 # Rotate one repo's store dir ($BUILDS/<repo>): keep the newest build per slug
 # (toolchain) AND the newest green build per slug indefinitely; remove any other
 # build published more than keep_days ago. Protecting the newest green build
-# keeps a stream of non-green WIP publishes from washing out the attestation the
-# gate skips on. A build dir is <repo>/<commit>/<slug>.
+# keeps a stream of non-green WIP publishes from washing out the newest
+# attestation that the commit compiles. A build dir is <repo>/<commit>/<slug>.
 prune_builds_under() {
   local repo="$1" keep_days="$2"
   [[ -d "$repo" ]] || return 0
@@ -1818,7 +1817,7 @@ hook_is_ours() {
 # Write our version of a single hook unless a foreign hook already occupies the
 # slot. Idempotent: regenerating an unchanged hook leaves identical bytes.
 # Doesn't chmod +x itself — install_hooks batches that into one call after all
-# four hooks are written.
+# hooks are written.
 install_one_hook() {
   local hook="$1" body="$2"
   if [[ -e "$hook" ]] && ! hook_is_ours "$hook"; then
@@ -1829,6 +1828,29 @@ install_one_hook() {
   _HOOKS_WRITTEN+=("$hook")
 }
 
+# Drop a hook we own from its slot, leaving a foreign hook there untouched.
+remove_one_hook() {
+  local hook="$1"
+  [[ -e "$hook" ]] || return 0
+  hook_is_ours "$hook" && rm -f "$hook"
+  return 0
+}
+
+# lean-cache installs no pre-push hook, and keeps the slot clear of any it owns:
+# nothing of ours may stand between a commit and its push. `refresh` calls this
+# on its cheap path too, so a worktree is cleared by ordinary checkout/commit
+# traffic rather than only by an explicit `use`. Once per process — the recursive
+# sweep over subprojects shares one hooks directory.
+_PRE_PUSH_RETIRED=0
+retire_pre_push_hook() { # arg: proj
+  [[ "$_PRE_PUSH_RETIRED" -eq 1 ]] && return 0
+  _PRE_PUSH_RETIRED=1
+  local gitdir
+  gitdir="$(git -C "$1" rev-parse --git-common-dir 2>/dev/null)" || return 0
+  [[ "$gitdir" = /* ]] || gitdir="$1/$gitdir"
+  remove_one_hook "$gitdir/hooks/pre-push"
+}
+
 # Install the project hooks into the (worktree-shared) hooks directory:
 #   post-checkout         — branch/commit checkout, switch, worktree-add
 #                           (skips a file checkout, which leaves HEAD put)
@@ -1836,18 +1858,15 @@ install_one_hook() {
 #                           `git reset --hard` and `git cherry-pick`; it covers
 #                           rebase/amend too, so no separate post-rewrite hook
 #                           is needed.
-#   pre-push              — gate the push on a clean full `lake build`, then
-#                           publish that warm build for reuse.
 #   post-commit           — remind that a *.lean commit's warm build can be
 #                           published for reuse.
 # post-checkout / reference-transaction defer to `lean-cache refresh`, whose
 # staleness check keeps the high-frequency reference-transaction path a cheap
 # no-op. They deliberately don't pre-check `$root/lean-toolchain` themselves
-# (unlike pre-push/post-commit below) — `refresh` does that check itself, and
-# falling through to it is what lets `refresh` find and overlay Lake projects
-# below a root that pins no toolchain of its own (a repo of several Lake
-# projects with none at the root). pre-push only runs when the push changes a
-# *.lean file; post-commit is a no-op on a commit that touches no *.lean.
+# (unlike post-commit below) — `refresh` does that check itself, and falling
+# through to it is what lets `refresh` find and overlay Lake projects below a
+# root that pins no toolchain of its own (a repo of several Lake projects with
+# none at the root). post-commit is a no-op on a commit that touches no *.lean.
 install_hooks() {
   local proj="$1" gitdir
   gitdir="$(git -C "$proj" rev-parse --git-common-dir 2>/dev/null)" || return 0
@@ -1881,15 +1900,7 @@ done
 root=\"\$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0
 \"\${LEAN_CACHE_BIN:-$HOOK_BIN}\" refresh \"\$root\" >/dev/null 2>&1 || true"
 
-  install_one_hook "$gitdir/hooks/pre-push" "#!/usr/bin/env bash
-# $HOOK_SENTINEL: gate a push on a clean full \`lake build\`. The gate logic
-# lives in \`lean-cache pre-push-gate\` (as post-checkout/reference-transaction
-# delegate to \`refresh\`) so a fix to the gate reaches every worktree without
-# regenerating this hook. Bypass with SKIP_LEAN_PUSH_GATE=1.
-[[ -n \"\${SKIP_LEAN_PUSH_GATE:-}\" ]] && exit 0
-root=\"\$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0
-[[ -f \"\$root/lakefile.toml\" || -f \"\$root/lakefile.lean\" ]] || exit 0
-exec \"\${LEAN_CACHE_BIN:-$HOOK_BIN}\" pre-push-gate \"\$@\""
+  remove_one_hook "$gitdir/hooks/pre-push"
 
   install_one_hook "$gitdir/hooks/post-commit" "#!/usr/bin/env bash
 # $HOOK_SENTINEL: after a commit touching *.lean, remind that its warm build can
@@ -1902,118 +1913,6 @@ root=\"\$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0
 exec \"\${LEAN_CACHE_BIN:-$HOOK_BIN}\" commit-hint \"\$root\""
 
   if [[ ${#_HOOKS_WRITTEN[@]} -gt 0 ]]; then chmod +x "${_HOOKS_WRITTEN[@]}"; fi
-}
-
-# The push build gate, invoked by the pre-push hook as `pre-push-gate <remote>`
-# with the pushed ref list on stdin. Before allowing a push that changes any
-# *.lean, bump the mtime of the changed files (so Lake cannot replay a stale
-# olean and report a false green) and run the bare default `lake build`; abort
-# the push (nonzero exit) if it fails. A full build can take minutes — that
-# latency is the intended cost of the gate.
-#
-# The gate can only build the tree it has: the checked-out worktree. A pushed
-# ref whose tip is not the worktree's HEAD (e.g. `git push origin other` while
-# on main) is therefore NOT gated — the gate warns and lets it pass rather than
-# green-lighting `other` on the strength of a build of `main`.
-cmd_pre_push_gate() {
-  # The gate blocks the push; it must build synchronously to completion and
-  # never take the cold-build bail path.
-  export LEAN_CACHE_FORCE_WAIT=1
-  local remote="${1:-}" root head changed new base parent f tip know
-  local gate=0 undecided=0 ungated="" gate_t0=0
-  root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
-  [[ -f "$root/lakefile.toml" || -f "$root/lakefile.lean" ]] || exit 0
-  head="$(git rev-parse -q --verify HEAD 2>/dev/null || true)"
-  changed=""
-  while read -r lref loid _rref roid; do
-    [[ "$loid" =~ ^0+$ ]] && continue          # ref deletion: nothing to build
-    new=""; know=1
-    if [[ "$roid" =~ ^0+$ ]] || ! new="$(git diff --name-only "$roid" "$loid" -- '*.lean' 2>/dev/null)"; then
-      # No remote tip to diff against: the ref is new on the remote, or the
-      # remote tip's object is absent locally (a force-push after the remote
-      # moved, without fetching). Diff from just below the oldest pushed commit
-      # that no remote-tracking ref already has — or from the empty tree when
-      # the entire history is new to the remote.
-      new=""
-      base="$(git rev-list "$loid" --not --remotes="$remote" 2>/dev/null | tail -1)" || base=""
-      if [[ -n "$base" ]]; then
-        parent="$(git rev-parse -q --verify "$base^" 2>/dev/null || true)"
-        [[ -n "$parent" ]] || parent="$(git hash-object -t tree /dev/null)"
-        new="$(git diff --name-only "$parent" "$loid" -- '*.lean' 2>/dev/null)" || new=""
-      elif [[ ! "$roid" =~ ^0+$ ]]; then
-        # Unknown remote tip and every pushed commit is already on some
-        # remote-tracking ref (e.g. force-pushing a rollback): what the push
-        # changes is undecidable here, so gate it rather than wave it through.
-        know=0
-      fi
-    fi
-    [[ -n "$new" || "$know" -eq 0 ]] || continue
-    tip="$(git rev-parse -q --verify "$loid^{commit}" 2>/dev/null || true)"
-    if [[ -n "$head" && "$tip" == "$head" ]]; then
-      gate=1
-      [[ "$know" -eq 1 ]] || undecided=1
-      changed="$changed$new
-"
-    else
-      ungated="$ungated $lref"
-    fi
-  done
-  [[ -z "$ungated" ]] || echo "lean push gate: WARNING: pushed ref(s)$ungated change .lean but their tip is not the checked-out HEAD; the gate can only build the current worktree, so they are NOT gated. Check the ref out and push from that worktree to gate it." >&2
-  [[ "$gate" -eq 1 ]] || exit 0
-
-  # Skip the rebuild when the store already holds a green build of this exact
-  # (commit, toolchain): that build attests the commit compiles, so gating it
-  # again only repeats minutes of work (the worker-builds / coordinator-verifies
-  # / gate-builds-again triple build). A non-green stored build (tree_clean=0, or
-  # a manifest predating the field) attests nothing and never skips.
-  # Set LEAN_CACHE_NO_GATE_SKIP=1 to force the rebuild.
-  if [[ -z "${LEAN_CACHE_NO_GATE_SKIP:-}" && -f "$root/lean-toolchain" ]]; then
-    local slug store
-    slug="$( { normalize_version "$(<"$root/lean-toolchain")" && printf '%s' "$SLUG"; } 2>/dev/null )" || slug=""
-    if [[ -n "$slug" ]] && build_store_for "$root" "$head" "$slug" && store="$_BSF" \
-       && [[ -d "$store/lib" ]] \
-       && [[ "$(stat -c '%U' "$store" 2>/dev/null)" == "$ME" ]] \
-       && build_is_green "$store"; then
-      echo "lean push gate: green build already stored for HEAD (${head:0:12}, $slug) — skipping the gate build" >&2
-      log_event gate outcome=skip repo="$_RI" commit="${head:0:12}" secs=0
-      exit 0
-    fi
-  fi
-
-  changed="$(printf '%s\n' "$changed" | sort -u | sed '/^$/d')"
-  while IFS= read -r f; do
-    if [[ -n "$f" && -f "$root/$f" ]]; then touch "$root/$f"; fi
-  done <<< "$changed"
-  command -v lake >/dev/null 2>&1 || { echo 'lean push gate: lake not found in PATH (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; exit 1; }
-  local n; n="$(count_nonempty_lines "$changed")"
-  if [[ "$undecided" -eq 1 && "$n" -eq 0 ]]; then
-    echo "lean push gate: cannot compute the changed .lean set (remote tip not fetched); running full 'lake build' (may take minutes)..." >&2
-  else
-    echo "lean push gate: $n changed .lean file(s); running full 'lake build' (may take minutes)..." >&2
-  fi
-  # Build serialized on a host slot, in a clean git environment. git push from
-  # a linked worktree exports GIT_DIR/GIT_WORK_TREE into the hook (and so into
-  # here); if Lake inherits them, each 'git remote get-url' it runs to validate
-  # a dependency resolves against the superproject instead of the package's own
-  # checkout, so Lake sees a bogus URL mismatch and tries to re-clone the
-  # (read-only, cache-symlinked) package. run_lake_build scrubs the injected
-  # vars so the gate build matches a plain interactive lake build.
-  gate_t0="$(date +%s)"
-  acquire_build_slot "lean push gate"
-  run_lake_build "$root" "lean push gate" \
-    || { echo 'lean push gate: lake build FAILED — push aborted (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; repo_identity "$root"; log_event gate outcome=fail repo="$_RI" commit="${head:0:12}" secs=$(( $(date +%s) - gate_t0 )); exit 1; }
-  repo_identity "$root"
-  log_event gate outcome=ok repo="$_RI" commit="${head:0:12}" secs=$(( $(date +%s) - gate_t0 ))
-  echo 'lean push gate: build OK — allowing push' >&2
-  # The full build just passed, so .lake/build is a complete warm build for this
-  # exact commit — capture it for reuse now. publish-build's own `lake build` is
-  # an up-to-date no-op after the gate, so this is near-free. Re-exec in the
-  # scrubbed environment so that no-op build behaves like the gate's, and never
-  # fail the already-allowed push if publishing hits a snag.
-  [[ -n "${LEAN_CACHE_NO_PUBLISH_ON_PUSH:-}" ]] || \
-    ( env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX \
-        -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY -u GIT_QUARANTINE_PATH \
-        "$BIN" publish-build "$root" ) || log "push gate: warm-build publish failed (push still allowed)"
 }
 
 # `lake build` under the shared build policy: an explicit alias for the same path
@@ -2087,7 +1986,7 @@ cmd_config() {
 
 # Summarize the event log: read every readable events.*.log, keep events within
 # the --since window, and print a compact per-event summary (counts, seed hit
-# rate, gate outcomes, install/publish build durations, slot waits), split by
+# rate, install/publish build durations, slot waits), split by
 # user when more than one wrote. Read-only, no privilege — any user can run it.
 cmd_stats() {
   local since=7
@@ -2133,7 +2032,6 @@ cmd_stats() {
       for (i = 4; i <= NF; i++) { p = index($i, "=")
         if (p) kv[substr($i, 1, p-1)] = substr($i, p+1) }
       if (ev == "seed")       { seed_t++; if (kv["hit"] == "1") seed_h++ }
-      else if (ev == "gate")  { gate_t++; go[kv["outcome"]]++ }
       else if (ev == "use")   { use_t++;  if (kv["auto_install"] == "1") use_ai++ }
       else if (ev == "bail")  { bail_t++; bw[kv["where"]]++ }
       else if (ev == "install") {
@@ -2169,8 +2067,6 @@ cmd_stats() {
       if (use_t)  printf "use      %d overlaid, %d triggered an auto-install\n", use_t, use_ai+0
       if (seed_t) printf "seed     %d applicable, %d hit, %d miss (%d%% hit rate)\n", \
                           seed_t, seed_h+0, seed_t-(seed_h+0), (seed_h+0)*100/seed_t
-      if (gate_t) printf "gate     %d engaged: %d ok, %d skip, %d fail\n", \
-                          gate_t, go["ok"]+0, go["skip"]+0, go["fail"]+0
       if (inst_t) {
         printf "install  %d run: %d ok, %d fail", inst_t, inst_ok+0, inst_fail+0
         if (inst_n) printf "  (build secs: median %d, max %d)", median(inst_s, inst_n), inst_max+0
@@ -2221,7 +2117,6 @@ case "$cmd" in
   slots)        cmd_slots         "$@" ;;
   fix-filemode) cmd_fix_filemode  "$@" ;;
   fix-perms)    cmd_fix_perms     "$@" ;;
-  pre-push-gate) cmd_pre_push_gate "$@" ;;
   commit-hint)  cmd_commit_hint   "$@" ;;
   list)      cmd_list      "$@" ;;
   resolve)   cmd_resolve   "$@" ;;

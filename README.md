@@ -51,16 +51,18 @@ needs no per-project wiring. `refresh`, `seed-build`, `publish-build`, and
 
 ### Git hooks
 
-`use` installs three hooks:
+`use` installs these hooks:
 
 - `post-checkout` and `reference-transaction` run `lean-cache refresh`, which
   repoints the overlay when HEAD moves to a commit pinning a different
   toolchain and is a cheap no-op otherwise.
-- `pre-push` runs `lake build` before any push touching a `*.lean` file and
-  aborts the push if it fails. It is skipped when the warm-build store already
-  holds this commit as green, and on success it publishes the build for reuse.
-  `SKIP_LEAN_PUSH_GATE=1` bypasses it. It only fires when the repo root itself
-  is a Lake project.
+- `post-commit` prints a one-line reminder, after a commit touching a `*.lean`
+  file, that the warm build can be published for reuse with
+  `lean-cache publish-build`. `LEAN_CACHE_NO_COMMIT_HINT=1` silences it. It only
+  fires when the repo root itself is a Lake project.
+
+No `pre-push` hook is installed, and `use` and `refresh` remove one that carries
+lean-cache's marker: pushing never waits on a build.
 
 ### Sharing a warm build between worktrees
 

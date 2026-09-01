@@ -35,7 +35,7 @@ what makes them serial again.
 
 ## Fixtures
 
-`new_lake_project`, `new_gate_project` and `new_policy_projects` build the
+`new_lake_project`, `new_hooked_project` and `new_policy_projects` build the
 standard project shapes; `write_lake_stub` writes the stub `lake` that stands in
 for every build. No case runs a real Lean build or touches the network.
 

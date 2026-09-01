@@ -73,8 +73,8 @@ new_cache() {
 }
 
 # No real Lean anywhere in this suite: a stub `lake` stands in for the build, so
-# publish/seed, the push gate and the build policy run without the toolchain or
-# the network. It records the call and the git-relevant env; LAKE_RC decides
+# publish-build, seed and the build policy run without the toolchain or the
+# network. It records the call and the git-relevant env; LAKE_RC decides
 # pass/fail.
 write_lake_stub() { # write_lake_stub <dir>  (sets nothing; caller uses $1/lake)
   mkdir -p "$1"
@@ -120,15 +120,10 @@ new_lake_project() { # new_lake_project <path> <version> <module> <decl>
   gitq "$1" init -q; gitq "$1" add -A; gitq "$1" commit -qm init
 }
 
-# A gate fixture: a `use`d project with hooks installed, a bare origin, and its
-# first commit already on the remote. The baseline push goes through gitq so the
-# gate itself never runs during setup.
-new_gate_project() { # new_gate_project <path> <stub-dir>
+# A hooked-project fixture: a `use`d project with hooks installed.
+new_hooked_project() { # new_hooked_project <path>
   new_lake_project "$1" v4.30.0 A 'def a := 1'
   "$CLI" use "$1" >/dev/null 2>&1
-  git init -q --bare -b main "$1.remote.git"
-  gitq "$1" remote add origin "$1.remote.git"
-  gitq "$1" push -q origin HEAD:main >/dev/null 2>&1
 }
 
 # True if the warm-build store holds a build published for commit $1.
@@ -333,12 +328,38 @@ foreign="$(cat "$H/reference-transaction")"
 check "legacy hook upgraded in place"         "yes" "$(has_sentinel "$H/post-checkout")"
 check "foreign hook left untouched"           "$foreign" "$(cat "$H/reference-transaction")"
 
-# Scenario: a repo whose four hook slots are ALL foreign. install_hooks writes
+# Scenario: `use` clears a lean-cache-managed pre-push hook out of the slot — no
+# hook of ours may stand between a commit and its push.
+printf '#!/usr/bin/env bash\n# lean-cache-managed-hook\necho stale\n' > "$H/pre-push"
+"$CLI" use "$C" >/dev/null 2>&1
+check "use removes its own pre-push hook"     "no" "$([[ -e "$H/pre-push" ]] && echo yes || echo no)"
+
+# Scenario: a foreign pre-push hook (no sentinel) is left untouched.
+printf '#!/bin/sh\necho FOREIGN-PREPUSH\n' > "$H/pre-push"
+foreign_pp="$(cat "$H/pre-push")"
+"$CLI" use "$C" >/dev/null 2>&1
+check "use leaves a foreign pre-push hook untouched" "$foreign_pp" "$(cat "$H/pre-push" 2>/dev/null)"
+rm -f "$H/pre-push"
+
+# Scenario: `refresh` clears the slot too, on the cheap path where the overlay is
+# already current — a worktree is cleared by ordinary checkout traffic, without
+# waiting for an explicit `use`.
+printf '#!/usr/bin/env bash\n# lean-cache-managed-hook\necho stale\n' > "$H/pre-push"
+"$CLI" refresh "$C" >/dev/null 2>&1
+check "refresh removes a managed pre-push hook" "no" \
+  "$([[ -e "$H/pre-push" ]] && echo yes || echo no)"
+printf '#!/bin/sh\necho FOREIGN-PREPUSH\n' > "$H/pre-push"
+"$CLI" refresh "$C" >/dev/null 2>&1
+check "refresh leaves a foreign pre-push hook untouched" "$foreign_pp" \
+  "$(cat "$H/pre-push" 2>/dev/null)"
+rm -f "$H/pre-push"
+
+# Scenario: a repo whose three hook slots are ALL foreign. install_hooks writes
 # nothing, and both use and refresh must still succeed and overlay the project —
 # refresh reaches cmd_use on a path where errexit is live, so an install_hooks
 # that reports "wrote no hooks" as a failure aborts the refresh.
 AF="$TMP/allforeign"; new_lake_project "$AF" v4.30.0 A 'def a := 1'
-for h in post-checkout reference-transaction pre-push post-commit; do
+for h in post-checkout reference-transaction post-commit; do
   printf '#!/bin/sh\nexit 0\n' > "$AF/.git/hooks/$h"
 done
 rc=0; "$CLI" use "$AF" >/dev/null 2>&1 || rc=$?
@@ -864,7 +885,7 @@ check "install warns concurrent runs are unsafe"    "yes" \
 
 # publish-build: the per-build mutex is skipped the same way, and the build is
 # still stored.
-P="$TMP/proj"; new_gate_project "$P"
+P="$TMP/proj"; new_hooked_project "$P"
 rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE' > "$P/.lake/build/lib/lean/Proj/A.olean"
 c="$(gitc "$P" rev-parse HEAD)"
 out="$(PATH="$STUB:$NFPATH" "$CLI" publish-build "$P" 2>&1)"; rc=$?
@@ -878,7 +899,7 @@ group_seed() {
 new_cache
 STUB="$TMP/stub"; write_lake_stub "$STUB"
 
-echo "== build seeding & push gate (hermetic) =="
+echo "== build seeding (hermetic) =="
 # A fake project with a pre-staged "warm build" tree.
 P="$TMP/proj"; new_lake_project "$P" v4.30.0 A 'def a := 1'
 pcommit="$(gitc "$P" rev-parse HEAD)"
@@ -967,162 +988,11 @@ rc=0; "$CLI" clean "$TMP" >/dev/null 2>&1 || rc=$?   # non-Lake dir
 check "clean on non-Lake dir exits 0"          "0" "$rc"
 }
 
-group_gate() {
+group_commithint() {
 new_cache
-STUB="$TMP/stub"; write_lake_stub "$STUB"
-echo "== push gate (hermetic) =="
-P="$TMP/proj"; new_lake_project "$P" v4.30.0 A 'def a := 1'
+P="$TMP/proj"; new_hooked_project "$P"
 
-# Push gate: stub lake decides pass/fail; a bare remote receives the push. These
-# cases isolate the gate itself, so suppress the on-push warm-build publish (a
-# second lake invocation) — it is exercised in its own section below.
-export LEAN_CACHE_NO_PUBLISH_ON_PUSH=1
-"$CLI" use "$P" >/dev/null 2>&1                   # installs hooks (+ re-seeds)
-check "pre-push hook installed"               "yes" \
-  "$(grep -ql lean-cache-managed-hook "$P/.git/hooks/pre-push" && echo yes || echo no)"
-check "pre-push hook delegates to pre-push-gate" "yes" \
-  "$(grep -ql 'pre-push-gate' "$P/.git/hooks/pre-push" && echo yes || echo no)"
-git init -q --bare -b main "$TMP/remote.git"
-gitq "$P" remote add origin "$TMP/remote.git"
-
-# Establish the baseline on the remote: the first push carries A.lean, so the
-# gate runs the build once here.
-: > "$TMP/g.log"
-PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
-check "gate: initial push (new .lean) runs lake" "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
-
-# (a) An incremental push whose diff has no *.lean must not invoke lake.
-printf 'hi\n' > "$P/README.md"; gitq "$P" add -A; gitq "$P" commit -qm doc
-: > "$TMP/g.log"
-PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
-check "gate: doc-only push skips lake"         "0" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
-
-# (b) A push that changes *.lean and fails to build is rejected.
-printf 'def a := 3\n' > "$P/Proj/A.lean"; gitq "$P" add -A; gitq "$P" commit -qm edit
-remote_before="$(gitc "$P" ls-remote origin refs/heads/main | cut -f1)"
-: > "$TMP/g.log"
-PATH="$STUB:$PATH" LAKE_RC=1 LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
-check "gate: failing build invokes lake"       "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
-check "gate: failing build blocks the push"    "$remote_before" \
-  "$(gitc "$P" ls-remote origin refs/heads/main | cut -f1)"
-
-# (c) SKIP_LEAN_PUSH_GATE bypasses the gate entirely.
-: > "$TMP/g.log"
-PATH="$STUB:$PATH" SKIP_LEAN_PUSH_GATE=1 LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
-check "gate: SKIP_LEAN_PUSH_GATE skips lake"    "0" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
-check "gate: SKIP_LEAN_PUSH_GATE lets push through" \
-  "$(gitc "$P" rev-parse HEAD)" "$(gitc "$P" ls-remote origin refs/heads/main | cut -f1)"
-
-# (d) Linked-worktree regression. `git push` from a linked worktree exports
-# GIT_DIR (and friends) into the hook; if the gate lets `lake build` inherit
-# them, every `git remote get-url` Lake runs to validate a dependency resolves
-# against the superproject instead of the package's own checkout — a bogus URL
-# mismatch that makes Lake re-clone a read-only cache-symlinked package. The gate
-# must scrub those vars so its build matches a plain interactive `lake build`.
-W="$TMP/wt"; gitc "$P" worktree add -q -b wt-branch "$W" main 2>/dev/null
-printf 'def b := 1\n' > "$W/Proj/B.lean"; gitc "$W" add -A; gitc "$W" commit -qm wt
-: > "$TMP/g.log"; : > "$TMP/genv.log"
-PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" LAKE_ENV_LOG="$TMP/genv.log" \
-  gitc "$W" push -q origin HEAD:refs/heads/wt-branch >/dev/null 2>&1 || true
-check "gate (linked worktree): lake ran"          "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
-check "gate scrubs GIT_DIR for lake build"        "0" "$(grep -c 'GIT_DIR=[^<]' "$TMP/genv.log" 2>/dev/null)"
-check "gate scrubs GIT_WORK_TREE for lake build"  "0" "$(grep -c 'GIT_WORK_TREE=[^<]' "$TMP/genv.log" 2>/dev/null)"
-}
-
-group_gateextra_e() {
-new_cache
-STUB="$TMP/stub"; write_lake_stub "$STUB"
-echo "== push gate: first push of a new branch (hermetic) =="
-export LEAN_CACHE_NO_PUBLISH_ON_PUSH=1
-
-# (e) First push of a multi-commit new branch gates on the WHOLE new history,
-# not just the tip commit: commit 1 adds a .lean, the tip is doc-only, and the
-# gate must still build (the .lean is new to the remote).
-E="$TMP/newrepo"; mkdir -p "$E"; gitq "$E" init -q
-pin v4.30.0 "$E"; printf 'name="p"\n' > "$E/lakefile.toml"
-printf 'def e := 1\n' > "$E/E.lean"
-gitq "$E" add -A; gitq "$E" commit -qm lean-change
-printf 'doc\n' > "$E/README.md"; gitq "$E" add -A; gitq "$E" commit -qm doc-tip
-git init -q --bare -b main "$TMP/eremote.git"; gitq "$E" remote add origin "$TMP/eremote.git"
-"$CLI" use "$E" >/dev/null 2>&1
-: > "$TMP/g.log"
-PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$E" push -q origin HEAD:main >/dev/null 2>&1 || true
-check "gate: new-branch push gates non-tip .lean commits" "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
-}
-
-group_gateextra_f() {
-new_cache
-STUB="$TMP/stub"; write_lake_stub "$STUB"
-echo "== push gate: force-pushes past an unfetched remote (hermetic) =="
-export LEAN_CACHE_NO_PUBLISH_ON_PUSH=1
-
-# (f) Force-push when the remote moved and was never fetched: the remote tip's
-# object is absent locally, so the roid..loid diff cannot run. The gate must
-# fall back to the remote-tracking range (not die silently) and still build.
-git init -q --bare -b main "$TMP/fremote.git"
-F="$TMP/fpush"; mkdir -p "$F"; gitq "$F" init -q
-pin v4.30.0 "$F"; printf 'name="p"\n' > "$F/lakefile.toml"
-printf 'def f := 1\n' > "$F/F.lean"; gitq "$F" add -A; gitq "$F" commit -qm init
-gitq "$F" remote add origin "$TMP/fremote.git"
-"$CLI" use "$F" >/dev/null 2>&1
-PATH="$STUB:$PATH" gitc "$F" push -q origin HEAD:main >/dev/null 2>&1
-F2="$TMP/fpush2"; git clone -q "$TMP/fremote.git" "$F2"
-printf 'def g := 2\n' > "$F2/G.lean"; gitq "$F2" add -A; gitq "$F2" commit -qm other
-gitq "$F2" push -q origin HEAD:main >/dev/null 2>&1     # remote advances
-printf 'def f := 3\n' > "$F/F.lean"; gitc "$F" add -A; gitc "$F" commit -qm mine
-: > "$TMP/g.log"
-out="$(PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$F" push --force origin HEAD:main 2>&1)"; rc=$?
-check "gate: unfetched force-push still builds"   "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
-check "gate: unfetched force-push goes through"   "0" "$rc"
-check "gate: unfetched force-push announces the gate" "yes" \
-  "$(printf '%s' "$out" | grep -q 'lean push gate' && echo yes || echo no)"
-
-# (f2) Force-push rollback to a commit the remote-tracking refs already have:
-# the changed set is undecidable locally, so the gate builds conservatively.
-gitc "$F" fetch -q origin
-gitc "$F" reset --hard -q "HEAD~1" >/dev/null 2>&1
-# advance the remote once more so its tip is again unknown to F (F's own
-# force-push moved the remote, so this one must force too)
-printf 'def g := 3\n' > "$F2/G.lean"; gitq "$F2" add -A; gitq "$F2" commit -qm more
-gitq "$F2" push -q --force origin HEAD:main >/dev/null 2>&1
-: > "$TMP/g.log"
-out="$(PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$F" push --force origin HEAD:main 2>&1)"; rc=$?
-check "gate: undecidable rollback push builds conservatively" "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
-check "gate: undecidable rollback push goes through" "0" "$rc"
-}
-
-group_gateextra_g() {
-new_cache
-STUB="$TMP/stub"; write_lake_stub "$STUB"
-echo "== push gate: pushing a ref that is not HEAD (hermetic) =="
-export LEAN_CACHE_NO_PUBLISH_ON_PUSH=1
-
-# (g) Pushing a ref whose tip is NOT the checked-out HEAD: the gate can only
-# build the current worktree, so it must warn and pass the ref ungated instead
-# of green-lighting it on the strength of the wrong tree.
-G="$TMP/gpush"; mkdir -p "$G"; gitq "$G" init -q
-pin v4.30.0 "$G"; printf 'name="p"\n' > "$G/lakefile.toml"
-printf 'def h := 1\n' > "$G/H.lean"; gitq "$G" add -A; gitq "$G" commit -qm init
-git init -q --bare -b main "$TMP/gremote.git"; gitq "$G" remote add origin "$TMP/gremote.git"
-"$CLI" use "$G" >/dev/null 2>&1
-PATH="$STUB:$PATH" gitc "$G" push -q origin HEAD:main >/dev/null 2>&1
-gitc "$G" switch -qc feature 2>/dev/null || gitc "$G" checkout -qb feature
-printf 'def broken :=\n' > "$G/H.lean"; gitc "$G" add -A; gitc "$G" commit -qm feat
-gitc "$G" switch -q - 2>/dev/null || gitc "$G" checkout -q "@{-1}"
-: > "$TMP/g.log"
-out="$(PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$G" push origin feature:feature 2>&1)"; rc=$?
-check "gate: non-HEAD ref push does not run lake"  "0" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
-check "gate: non-HEAD ref push warns it is ungated" "yes" \
-  "$(printf '%s' "$out" | grep -q 'NOT gated' && echo yes || echo no)"
-check "gate: non-HEAD ref push goes through"        "0" "$rc"
-}
-
-group_pubpush() {
-new_cache
-STUB="$TMP/stub"; write_lake_stub "$STUB"
-P="$TMP/proj"; new_gate_project "$P"
-
-echo "== publish-on-push & commit reminder (hermetic) =="
+echo "== commit reminder (hermetic) =="
 
 # commit-hint: reminds on a *.lean commit, silent when no *.lean changed.
 printf 'def a := 4\n' > "$P/Proj/A.lean"; gitq "$P" add Proj/A.lean; gitq "$P" commit -qm edit2
@@ -1138,70 +1008,12 @@ check "post-commit hook installed"                "yes" \
   "$(grep -ql lean-cache-managed-hook "$P/.git/hooks/post-commit" && echo yes || echo no)"
 check "post-commit hook delegates to commit-hint" "yes" \
   "$(grep -ql 'commit-hint' "$P/.git/hooks/post-commit" && echo yes || echo no)"
-
-# (a) A clean *.lean push captures the warm build for the pushed HEAD. The stub
-# lake does not produce artifacts, so stage a build tree the gate can publish.
-printf 'def a := 5\n' > "$P/Proj/A.lean"; gitq "$P" add Proj/A.lean; gitq "$P" commit -qm edit3
-c_ok="$(gitc "$P" rev-parse HEAD)"
-rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE5' > "$P/.lake/build/lib/lean/Proj/A.olean"
-: > "$TMP/g.log"
-PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
-check "clean push publishes the warm build"       "yes" "$(haspub "$c_ok")"
-
-# (b) LEAN_CACHE_NO_PUBLISH_ON_PUSH suppresses the capture.
-printf 'def a := 6\n' > "$P/Proj/A.lean"; gitq "$P" add Proj/A.lean; gitq "$P" commit -qm edit4
-c_skip="$(gitc "$P" rev-parse HEAD)"
-rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE6' > "$P/.lake/build/lib/lean/Proj/A.olean"
-: > "$TMP/g.log"
-PATH="$STUB:$PATH" LEAN_CACHE_NO_PUBLISH_ON_PUSH=1 LAKE_LOG="$TMP/g.log" \
-  gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
-check "NO_PUBLISH_ON_PUSH skips the capture"      "no" "$(haspub "$c_skip")"
-
-# (c) A failing gate build aborts the push before any publish.
-printf 'def a := 7\n' > "$P/Proj/A.lean"; gitq "$P" add Proj/A.lean; gitq "$P" commit -qm bad
-c_bad="$(gitc "$P" rev-parse HEAD)"
-rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE7' > "$P/.lake/build/lib/lean/Proj/A.olean"
-: > "$TMP/g.log"
-PATH="$STUB:$PATH" LAKE_RC=1 LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
-check "failed gate build publishes nothing"       "no" "$(haspub "$c_bad")"
-}
-
-group_gateskip() {
-new_cache
-STUB="$TMP/stub"; write_lake_stub "$STUB"
-P="$TMP/proj"; new_gate_project "$P"
-
-echo "== gate skip on stored green build (hermetic) =="
-# A green publish attests the commit: the gate must skip its rebuild when the
-# store already holds that (commit, toolchain) with tree_clean=1.
-printf 'def a := 8\n' > "$P/Proj/A.lean"; gitq "$P" add Proj/A.lean; gitq "$P" commit -qm edit5
-c5="$(gitc "$P" rev-parse HEAD)"
-rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE8' > "$P/.lake/build/lib/lean/Proj/A.olean"
-PATH="$STUB:$PATH" "$CLI" publish-build "$P" >/dev/null 2>&1
-m5="$(grep -Rl "^commit=$c5$" "$LEAN_CACHE_BUILDS" 2>/dev/null | head -1)"
-check "green publish stamps tree_clean=1"       "tree_clean=1" "$(grep '^tree_clean=' "$m5" 2>/dev/null)"
-: > "$TMP/g.log"
-out="$(PATH="$STUB:$PATH" LAKE_LOG="$TMP/g.log" gitc "$P" push origin HEAD:main 2>&1)"; rc=$?
-check "gate skips build for stored green HEAD"  "0" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
-check "gate announces the skip"                 "yes" \
-  "$(printf '%s' "$out" | grep -q 'skipping the gate build' && echo yes || echo no)"
-check "skipped-gate push goes through"          "$c5" \
-  "$(gitc "$P" ls-remote origin refs/heads/main | cut -f1)"
-
-# LEAN_CACHE_NO_GATE_SKIP forces the rebuild even with a stored green build.
-printf 'def a := 9\n' > "$P/Proj/A.lean"; gitq "$P" add Proj/A.lean; gitq "$P" commit -qm edit6
-rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE9' > "$P/.lake/build/lib/lean/Proj/A.olean"
-PATH="$STUB:$PATH" "$CLI" publish-build "$P" >/dev/null 2>&1
-: > "$TMP/g.log"
-PATH="$STUB:$PATH" LEAN_CACHE_NO_GATE_SKIP=1 LEAN_CACHE_NO_PUBLISH_ON_PUSH=1 \
-  LAKE_LOG="$TMP/g.log" gitc "$P" push -q origin HEAD:main >/dev/null 2>&1 || true
-check "NO_GATE_SKIP forces the gate build"      "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
 }
 
 group_greenguard() {
 new_cache
 STUB="$TMP/stub"; write_lake_stub "$STUB"
-P="$TMP/proj"; new_gate_project "$P"
+P="$TMP/proj"; new_hooked_project "$P"
 echo "== publish honesty: dirty trees, non-green builds, green entries (hermetic) =="
 
 # A dirty-tree publish is refused outright: every stored build must be an honest
@@ -1234,17 +1046,8 @@ if slow "seed-build seeds a non-green entry"; then
     "$(cat "$NG/.lake/build/lib/lean/Proj/A.olean" 2>/dev/null)"
 fi
 
-# The gate must NOT skip on a non-green (tree_clean=0) store entry.
-: > "$TMP/g.log"
-out="$(PATH="$STUB:$PATH" LEAN_CACHE_NO_PUBLISH_ON_PUSH=1 LAKE_LOG="$TMP/g.log" \
-       gitc "$P" push origin HEAD:main 2>&1)"; rc=$?
-check "gate does not skip on a non-green store" "1" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
-check "no skip message on a non-green store"    "no" \
-  "$(printf '%s' "$out" | grep -q 'skipping the gate build' && echo yes || echo no)"
-
 # A stored green build is never overwritten by a later non-green publish at the
-# same commit: an interrupted/OOM'd rebuild must not stale the entry or switch
-# off the gate skip.
+# same commit: an interrupted/OOM'd rebuild must not stale the entry.
 printf 'def a := 20\n' > "$P/Proj/A.lean"; gitq "$P" add Proj/A.lean; gitq "$P" commit -qm green-guard
 c8="$(gitc "$P" rev-parse HEAD)"
 rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'GREEN8' > "$P/.lake/build/lib/lean/Proj/A.olean"
@@ -1264,9 +1067,9 @@ new_cache
 
 echo "== store retention protects green attestations (hermetic) =="
 # Retention keeps the newest build per slug (warmth) AND the newest green build
-# per slug (attestation), so a stream of non-green WIP publishes cannot evict a
-# green entry the gate skips on. Craft entries with explicit published_at so the
-# ordering is deterministic.
+# per slug (attestation), so a stream of non-green WIP publishes cannot evict the
+# newest attestation that a commit compiles. Craft entries with explicit
+# published_at so the ordering is deterministic.
 RB="$LEAN_CACHE_BUILDS/retain-repo"
 mkentry() { # dir published_at tree_clean
   mkdir -p "$1/lib"; printf 'OLE' > "$1/lib/x.olean"
@@ -1327,7 +1130,7 @@ check "use with a stale stamp refreshes the stamp" "yes" \
 group_hostslot() {
 new_cache
 STUB="$TMP/stub"; write_lake_stub "$STUB"
-P="$TMP/proj"; new_gate_project "$P"
+P="$TMP/proj"; new_hooked_project "$P"
 # The wrapper cases below are about warm builds, so stage one.
 mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE' > "$P/.lake/build/lib/lean/Proj/A.olean"
 
@@ -1371,19 +1174,6 @@ out="$(PATH="$STUB:$PATH" LEAN_CACHE_FORCE_WAIT=1 LEAN_CACHE_BUILD_SLOTS=0 "$CLI
 check "SLOTS=0 disables serialization"          "0" "$rc"
 check "SLOTS=0 emits no slot messages"          "no" \
   "$(printf '%s' "$out" | grep -q 'build slot' && echo yes || echo no)"
-
-# The gate's publish re-exec rides the gate's own slot (no self-deadlock, no
-# waiting): with a single slot and publish-on-push enabled, the push completes
-# with two lake runs (gate + publish's no-op) and never waits for a slot.
-printf 'def a := 11\n' > "$P/Proj/A.lean"; gitq "$P" add Proj/A.lean; gitq "$P" commit -qm edit8
-rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE11' > "$P/.lake/build/lib/lean/Proj/A.olean"
-: > "$TMP/g.log"
-out="$(PATH="$STUB:$PATH" LEAN_CACHE_BUILD_SLOTS=1 LEAN_CACHE_BUILD_WAIT=45 \
-       LAKE_LOG="$TMP/g.log" gitc "$P" push origin HEAD:main 2>&1)"; rc=$?
-check "gate+publish share one slot: push succeeds" "0" "$rc"
-check "gate+publish share one slot: both builds ran" "2" "$(grep -c '^lake' "$TMP/g.log" 2>/dev/null)"
-check "gate+publish share one slot: no slot wait"  "no" \
-  "$(printf '%s' "$out" | grep -q 'waiting for a host build slot' && echo yes || echo no)"
 }
 
 group_policy() {
@@ -1583,12 +1373,11 @@ new_cache
 STUB="$TMP/stub"; write_lake_stub "$STUB"
 
 echo "== event log & stats (hermetic) =="
-# Redirect the event log to a throwaway dir and drive a use/seed/publish/gate
-# flow (stub lake), asserting each event lands with the right fields. Then check
+# Redirect the event log to a throwaway dir and drive a use/seed/publish flow
+# (stub lake), asserting each event lands with the right fields. Then check
 # that an unusable log dir never breaks a command, and that `stats` summarizes a
 # synthetic log deterministically.
 export LEAN_CACHE_LOG_DIR="$TMP/eventlog"
-export LEAN_CACHE_NO_PUBLISH_ON_PUSH=1     # keep the gate's own event isolated
 evlog="$LEAN_CACHE_LOG_DIR/events.$(id -un).log"
 
 EV="$TMP/evproj"; mkdir -p "$EV/Proj"; gitq "$EV" init -q
@@ -1617,18 +1406,6 @@ check "publish event records the short commit" "${evcommit:0:12}" "$(ev_field "$
 "$CLI" seed-build "$EV" >/dev/null 2>&1
 check "seed hit logged after a matching publish" "1" "$(ev_field "$evlog" seed hit)"
 
-# gate: a green build is stored for HEAD, so the push gate SKIPs and logs it.
-git init -q --bare -b main "$TMP/evremote.git"
-gitc "$EV" remote add origin "$TMP/evremote.git"
-PATH="$STUB:$PATH" gitc "$EV" push -q origin HEAD:main >/dev/null 2>&1 || true
-check "gate skip logged (stored green build)"  "skip" "$(ev_field "$evlog" gate outcome)"
-check "gate skip records secs=0"               "0" "$(ev_field "$evlog" gate secs)"
-
-# gate build: a new commit with no stored build, gate skip forced off -> ok.
-printf 'def b := 2\n' > "$EV/Proj/B.lean"; gitq "$EV" add -A; gitq "$EV" commit -qm addb
-PATH="$STUB:$PATH" LEAN_CACHE_NO_GATE_SKIP=1 gitc "$EV" push -q origin HEAD:main >/dev/null 2>&1 || true
-check "gate ok logged on a built push"         "ok" "$(ev_field "$evlog" gate outcome)"
-
 # An unusable log dir must never break a command. Point LOG_DIR below a regular
 # file: mkdir -p fails (ENOTDIR) even for root, so log_event silently no-ops.
 printf 'x' > "$TMP/notadir"
@@ -1643,8 +1420,6 @@ SL="$TMP/statslog"; mkdir -p "$SL"; snow="$(date +%s)"
   printf '%s\tu1\tseed\thit=0\trepo=r\tcommit=c\tslug=s\n'          "$snow"
   printf '%s\tu1\tinstall\tslug=s\tsecs=100\tok=1\tforced=0\n'      "$snow"
   printf '%s\tu1\tinstall\tslug=s\tsecs=300\tok=0\tforced=0\n'      "$snow"
-  printf '%s\tu1\tgate\toutcome=ok\trepo=r\tcommit=c\tsecs=50\n'    "$snow"
-  printf '%s\tu1\tgate\toutcome=skip\trepo=r\tcommit=c\tsecs=0\n'   "$snow"
   printf '%s\tu1\tverify\tfails=0\twarns=1\tok=1\n'                 "$snow"  # a type the specialized sections don't know
   printf '%s\tu1\tfrobnicate\tx=1\n'                               "$snow"  # a type stats has never heard of
   printf '%s\tu1\tinstall\tslug=s\tsecs=999\tok=1\tforced=0\n' "$(( snow - 30*86400 ))"  # out of window
@@ -1654,7 +1429,6 @@ seen() { grep -qE "$2" <<<"$1" && echo yes || echo no; }
 check "stats: seed hit rate"       "yes" "$(seen "$sout" 'seed +2 applicable, 1 hit, 1 miss \(50% hit rate\)')"
 check "stats: install durations exclude out-of-window" "yes" \
   "$(seen "$sout" 'install +2 run: 1 ok, 1 fail.*median 200, max 300')"
-check "stats: gate outcomes"       "yes" "$(seen "$sout" 'gate +2 engaged: 1 ok, 1 skip, 0 fail')"
 # The per-event counts must be generic: an event type none of the specialized
 # sections know (verify) and one stats has never heard of (frobnicate) still
 # show up, rather than vanishing.
@@ -1811,11 +1585,13 @@ check "fix-perms of an uninstalled version fails"    "1" "$rc"
 # ------------------------------------------------------------------ runner ---
 # Groups are hermetic, so they run concurrently; their output is buffered and
 # replayed in declaration order so a parallel run reads like a serial one.
-SUITES=(static overlay_reset overlay_pick overlay_file overlay_hooks overlay_uninst multiproj hookmono pinnedroot elanwire elancmds install slots noflock seed gate gateextra_e gateextra_g pubpush gateskip greenguard store hostslot policy shim selfheal events verify)
+SUITES=(static overlay_reset overlay_pick overlay_file overlay_hooks overlay_uninst multiproj hookmono pinnedroot elanwire elancmds install slots noflock seed commithint greenguard store hostslot policy shim selfheal events verify)
 # Deferred to the nightly tier: end-to-end round-trips whose core behaviour a
 # fast-tier group already covers, and which the deploy gate should not pay for.
-NIGHTLY_SUITES=(gateextra_f)
-if [[ "$RUN_SLOW" == 1 ]]; then SUITES+=("${NIGHTLY_SUITES[@]}"); fi
+# No whole group currently qualifies; see the `if slow ...` cases for the
+# nightly tier's single-case markers.
+NIGHTLY_SUITES=()
+if [[ "$RUN_SLOW" == 1 ]]; then SUITES+=(${NIGHTLY_SUITES[@]:+"${NIGHTLY_SUITES[@]}"}); fi
 OUT="$(mktemp -d)"; trap 'rm -rf "$OUT"' EXIT
 # Groups are dominated by process spawning and short git calls rather than by
 # sustained CPU, so running them all at once beats capping at core count.

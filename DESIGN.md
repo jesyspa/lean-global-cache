@@ -236,7 +236,7 @@ slug, or lake sees the deps as missing and tries (and fails) to fetch them.
 normalizes to and re-overlays only on a mismatch. The check reads a single
 symlink — no fetch, no guess — so it is cheap enough to run on every ref update.
 
-Four hooks are installed:
+Three hooks are installed:
 
 - **post-checkout** — `git checkout` / `switch` / `worktree add`.
 - **reference-transaction** — the only stock hook that also fires on
@@ -246,11 +246,9 @@ Four hooks are installed:
   and otherwise exits immediately; `refresh`'s staleness check is the second
   cheap gate. Because it also covers rebase and `commit --amend` (both move a
   local branch), no separate `post-rewrite` hook is installed.
-- **pre-push** — the project build gate, which also publishes the resulting warm
-  build for reuse (see "Pre-push build gate" and "Publishing on push" below).
 - **post-commit** — prints a reminder when a commit touches `*.lean` that the
-  warm build can be published (see "Publishing on push"). Cheap: it exits after a
-  single `diff-tree` when no `*.lean` changed, and honours
+  warm build can be published (see "Publishing a warm build"). Cheap: it exits
+  after a single `diff-tree` when no `*.lean` changed, and honours
   `LEAN_CACHE_NO_COMMIT_HINT`.
 
 The two overlay hooks no-op outside a Lean project and while the CLI is
@@ -326,13 +324,23 @@ green) — then snapshots `.lake/build/{lib,ir}` into the store under a per-buil
 entry is replaced, so it doubles as "refresh after main advances"). It records a
 `published_at` epoch in the manifest and then rotates the store (below).
 
+The manifest also records `tree_clean`: 1 when `lake` exited 0 over a tree
+carrying nothing that could make its build differ from a fresh checkout of HEAD
+(no tracked changes, no untracked `.lean`/lakefile/toolchain files), 0 otherwise.
+Only a `tree_clean=1` build attests that the *commit* compiles. A non-green build
+is still stored — it is fine to seed from, since Lake re-elaborates anything whose
+sources differ — but it never overwrites a stored green build of the same commit,
+so an interrupted or failed rebuild cannot demote an entry already known green.
+
 ### Rotation
 
 The store would otherwise grow unbounded as `main` advances. The policy: keep
 the **newest build per (repo, toolchain) indefinitely** — that is "latest main",
-the build fresh worktrees will actually seed from — and drop any *other* build
-published more than `BUILD_KEEP_DAYS` (default 7) ago. "Latest" is defined by
-publish time rather than git topology, which needs no repo access and matches the
+the build fresh worktrees will actually seed from — plus the newest *green* build
+per toolchain, so a stream of non-green WIP publishes cannot wash out the
+attestation that a commit compiles; drop any *other* build published more than
+`BUILD_KEEP_DAYS` (default 7) ago. "Latest" is defined by publish time rather
+than git topology, which needs no repo access and matches the
 workflow (you publish exactly when main advances, so the newest publish is latest
 main). `publish-build` rotates the repo it just wrote; `lean-cache prune-builds
 [--keep-days N]` applies the policy across the whole store and is safe to cron.
@@ -392,57 +400,6 @@ and the stale leftover would otherwise linger. It leaves `.lake/packages` (the
 overlay) alone, since that is just symlinks the hooks refresh, and is a no-op off
 a Lake project so a recycler can call it unconditionally.
 
-## Pre-push build gate
-
-A targeted check (`lake build <submodule>`, `lake env lean <file>`) can report
-green on non-compiling code via stale-olean replay, which is enough to let a
-non-compiling commit reach `main`. The `pre-push` hook closes that gap: for any
-project with a lakefile, before allowing a push that changes `*.lean`, it
-
-1. computes the changed `*.lean` across the pushed range,
-2. `touch`es them (bumping mtime invalidates their traces — defeating replay),
-3. runs the bare default `lake build`,
-4. aborts the push if the build fails.
-
-A bare `lake build` can take minutes; that latency is the intended cost of the
-gate. It is generic (no project-specific paths), no-ops when the push changes no
-`*.lean`, and is bypassable with `SKIP_LEAN_PUSH_GATE=1` for when the user has
-just run a clean build themselves.
-
-The changed set for a pushed ref is computed against the best base available,
-degrading conservatively:
-
-- remote ref exists and its tip is in the local odb — plain `roid..loid` diff;
-- ref is new on the remote, or the remote tip is absent locally (a force-push
-  after the remote moved, without fetching) — diff from just below the oldest
-  pushed commit no remote-tracking ref already has, or from the **empty tree**
-  when the entire history is new to the remote (a first push gates every commit,
-  not just the tip);
-- remote tip absent *and* every pushed commit is already on a remote-tracking
-  ref (a force-pushed rollback) — the changed set is undecidable locally, so the
-  gate builds anyway rather than waving the push through.
-
-The gate can only build the tree it has: the checked-out worktree. A pushed ref
-whose tip is not the worktree's HEAD (`git push origin other` while on `main`)
-is **not gated** — a build of `main` says nothing about `other`, so the gate
-prints a warning and lets the ref pass rather than green-lighting it on the
-strength of the wrong tree. To gate such a ref, check it out and push from that
-worktree.
-
-### Skipping the gate for a stored green build
-
-The gate skips its rebuild when the warm-build store already holds this exact
-(commit, toolchain) **published from a clean tree** (`tree_clean=1` in the
-manifest — no tracked changes, no untracked `.lean`/lakefile/toolchain files):
-such a build attests that the commit itself compiles, so rebuilding it only
-repeats minutes of work. This kills the observed triple-build pattern (a worker
-builds green and publishes, a coordinator re-verifies, and the gate built a
-third time) and the re-push of an already-green branch. A store entry published
-from a dirty tree records `tree_clean=0` and never skips — the artifacts may
-not correspond to the commit (they are still fine to *seed* from: Lake
-re-elaborates anything whose sources differ). `LEAN_CACHE_NO_GATE_SKIP=1`
-forces the rebuild.
-
 ## Transparent `lake` shim
 
 Instances should run bare `lake build` and the LSP as on stock Lean and never
@@ -460,8 +417,8 @@ build`, handing down the resolved real-lake path (`LEAN_CACHE_REAL_LAKE`) so the
 build underneath never re-enters the shim and recurses. Keeping the policy in the
 CLI — the shim is a thin stub, like the git hooks — means one home for it and one
 place a fix lands. `lean-cache`'s own `run_lake_build` resolves the real lake the
-same way, so a `lake build` it spawns (the gate, `publish-build`) also skips the
-shim.
+same way, so a `lake build` it spawns (`publish-build`, `lean-cache build`) also
+skips the shim.
 
 ## Host-wide build serialization
 
@@ -527,9 +484,9 @@ background.
 The policy reads that regime for a cold build:
 
 - **force-wait** (`LEAN_CACHE_FORCE_WAIT=1`, or `--wait` on `lean-cache build`) —
-  acquire a slot and build to completion regardless of regime. This is what the
-  pre-push gate and `publish-build` set internally, since they must complete
-  synchronously (the gate blocks the push).
+  acquire a slot and build to completion regardless of regime. This is what
+  `publish-build` sets internally, since it must complete synchronously before it
+  can snapshot the result.
 - **bounded foreground** — do **not** build: print the exact command to re-run
   (backgrounded, so the model is woken on completion, or with a 10-minute
   timeout) and exit a distinct code (75, so a caller can tell "re-run me
@@ -555,65 +512,52 @@ proceed to install. The git-hook path (`refresh`) never reaches this — it no-o
 on an uninstalled version rather than provisioning — so a checkout can't trip
 the bail either.
 
-Like the two overlay hooks (which delegate to `refresh`), the installed
-`pre-push` hook is a thin stub: it does the cheap guards (`SKIP_LEAN_PUSH_GATE`,
-lakefile present) and then `exec`s `lean-cache pre-push-gate`, where the actual
-gate lives. Keeping the logic in the CLI rather than inlined in the hook means a
-fix to the gate reaches every already-installed worktree the moment the CLI is
-upgraded — no hook regeneration. (Existing inline hooks still need one `use`/
-`refresh` to switch over to the stub; after that they track the CLI.)
+Every hook is a thin stub: it does the cheap guards and then `exec`s the CLI
+(`refresh`, `commit-hint`), where the actual logic lives. Keeping it in the CLI
+rather than inlined in the hook means a fix reaches every already-installed
+worktree the moment the CLI is upgraded — no hook regeneration.
 
-The gate runs `lake build` with git's hook-injected environment scrubbed
-(`env -u GIT_DIR -u GIT_WORK_TREE …`). `git push` from a *linked worktree*
-exports `GIT_DIR`/`GIT_WORK_TREE` into the hook; without scrubbing, the `git`
-processes Lake spawns to validate each dependency inherit them and resolve
-against the superproject's git dir instead of the package's own checkout. Lake
-reads back the superproject's remote URL, decides the package URL "has changed",
-and tries to re-clone it — which fails hard against a read-only cache symlink and
-would silently re-clone every dependency otherwise. The gate's own git plumbing
-(diffing the pushed range) is left on the superproject deliberately; only the
-`lake build` is run in the scrubbed environment, matching a plain interactive
-`lake build`.
+`run_lake_build` runs `lake build` with git's hook-injected environment scrubbed
+(`env -u GIT_DIR -u GIT_WORK_TREE …`), so a build started from inside a git hook
+in a *linked worktree* behaves like a plain interactive one. git exports
+`GIT_DIR`/`GIT_WORK_TREE` into its hooks; without scrubbing, the `git` processes
+Lake spawns to validate each dependency inherit them and resolve against the
+superproject's git dir instead of the package's own checkout. Lake reads back the
+superproject's remote URL, decides the package URL "has changed", and tries to
+re-clone it — which fails hard against a read-only cache symlink and would
+silently re-clone every dependency otherwise. Only the `lake build` is run in the
+scrubbed environment; the CLI's own git plumbing stays on the superproject.
 
 Each hook carries a sentinel comment line. Re-running `use` regenerates the
 hooks it owns — and upgrades a pre-sentinel legacy `post-checkout` hook in
 place — but never overwrites a hook some other tool installed.
 
-## Publishing on push
+The `pre-push` slot is actively kept clear: `use` and `refresh` delete a hook
+there that carries our sentinel, and leave a foreign one alone. `refresh` does it
+on its cheap path too, so ordinary checkout traffic clears a worktree without
+waiting for an explicit `use`. Nothing lean-cache installs stands between a
+commit and its push; a build is never the price of pushing.
 
-Publishing the warm build is bound to **push, not commit**, and specifically to
-the moment the pre-push gate's `lake build` succeeds. That is the ideal capture
-point for two reasons: the tree is known to compile (a failed gate build aborts
-the push, so a broken build is never stored), and the gate has *already* built it
-to completion — so `cmd_pre_push_gate` re-invoking `publish-build` costs only an
-up-to-date-no-op `lake build` plus the artifact copy. It captures the warm build
-for reuse exactly when a branch advances, which is also when a sibling worktree
-is most likely to want to seed from that commit.
+## Publishing a warm build
 
-The publish runs as a re-exec of `lean-cache publish-build` in the same scrubbed
-environment as the gate build (same linked-worktree reason — see below), inside
-`( … ) || …` so a publish failure is logged but never fails the already-allowed
-push. `LEAN_CACHE_NO_PUBLISH_ON_PUSH=1` skips it.
+Publishing is **explicit**: `lean-cache publish-build` when you want this
+worktree's build available to its siblings. Nothing publishes on your behalf, so
+no git operation ever pays for a build it didn't ask for.
 
-Commit only *reminds*. The `post-commit` hook delegates to `lean-cache
-commit-hint`, which prints a one-line note when the commit touched `*.lean`.
-Keeping the reminder on commit and the action on push mirrors the workflow: you
-commit repeatedly, but the warm build is worth storing when you push. As with the
-gate, the hint/publish logic lives in the CLI (the hooks are thin stubs), so a
-fix reaches every worktree the moment the CLI is upgraded.
-
-Why not auto-publish on every commit: commit is not build-gated and fires on
-intermediate/WIP states, so it would store partial or non-compiling builds (which
-`seed-build` would then have to reject) and rebuild repeatedly for commits no one
-seeds from. Publishing off the push's completed, gated build avoids both.
+Commit *reminds*. The `post-commit` hook delegates to `lean-cache commit-hint`,
+which prints a one-line note when the commit touched `*.lean`. A reminder rather
+than an action, because commit fires on intermediate and WIP states: auto-
+publishing there would rebuild repeatedly for commits no one seeds from, and
+store partial or non-compiling builds. The note lands at the moment you can judge
+whether this commit is worth storing — typically when a branch advances, which is
+also when a sibling worktree is most likely to want to seed from it.
 
 ## Event log
 
 The warm-build machinery makes strong performance claims — seeding replays a
-build in seconds, the gate skips an already-green rebuild, slots keep cold
-builds from thrashing the host — with no way to see whether any of it fires in
-practice. An append-only event log closes that gap: `stats` turns it into a
-seed hit rate, a gate skip/build/fail split, build durations, and slot-wait
+build in seconds, slots keep cold builds from thrashing the host — with no way to
+see whether any of it fires in practice. An append-only event log closes that
+gap: `stats` turns it into a seed hit rate, build durations, and slot-wait
 counts.
 
 ### What is logged
@@ -631,9 +575,6 @@ file. The whole set:
   applicable (valid commit+toolchain) but the store held no match. The two
   together are the seed hit rate.
 - `publish` — `repo commit slug green secs`.
-- `gate` — `outcome=skip|ok|fail`, `repo commit secs` (`secs=0` for a skip).
-  Logged only when the gate actually engaged (the push changed `*.lean` at the
-  checked-out HEAD).
 - `bail` — `where=build|use`, the foreground exit-75 paths that decline to start
   a multi-minute build inside a bounded foreground call.
 - `slot` — `wait outcome=acquired|unserialized`, logged only when a cold build
@@ -734,9 +675,9 @@ pinned toolchain the first time it is needed; pruning is manual via
 `test.sh` runs first in an isolated worktree, against a stub `lake` and a stub
 `elan`: version resolution and validation, config resolution and its parity with
 `lib/config.sh`, the overlay/hooks scenarios, multi-project discovery, build
-seeding and the push gate, the warm/cold build policy, `slots`, the
-opportunistic prune on `use`, the `lake` shim, store rotation and retention, the
-event log and `stats`, `verify` and `fix-perms`. It touches neither the real
+seeding, the warm/cold build policy, `slots`, the opportunistic prune on `use`,
+the `lake` shim, store rotation and retention, the event log and `stats`,
+`verify` and `fix-perms`. It touches neither the real
 cache nor the network.
 
 The suite is split into hermetic groups run in parallel, and into a push tier
@@ -749,19 +690,12 @@ step.
 
 ## Known limitations / open points
 
-- **Pre-push gate and commit-hint are not multi-project aware.** `use`,
-  `refresh`, `seed-build`, `publish-build`, and `clean` all fall back to
-  sweeping the Lake projects beneath a non-project path (see "Repos with
-  several Lake projects" above), but `pre-push`/`pre-push-gate` and
-  `post-commit`/`commit-hint` still check only the repo root
-  (`$root/lakefile.toml`/`.lean`, `$root/lean-toolchain`) and no-op entirely
-  when it isn't a project. A push to a repo of several Lake projects with none
-  at the root is therefore never build-gated, and a commit touching such a
-  project's `*.lean` prints no publish reminder. Extending the gate to build
-  (and skip-check, and publish) every touched subproject on a push is a larger
-  change — it turns one gate build into up to N, needs its own per-project
-  changed-file computation — and is left for when it's actually needed rather
-  than spidered in behind the overlay fix.
+- **commit-hint is not multi-project aware.** `use`, `refresh`, `seed-build`,
+  `publish-build`, and `clean` all fall back to sweeping the Lake projects
+  beneath a non-project path (see "Repos with several Lake projects" above), but
+  `post-commit`/`commit-hint` still checks only the repo root
+  (`$root/lean-toolchain`) and no-ops entirely when it isn't a project, so a
+  commit touching such a project's `*.lean` prints no publish reminder.
 - **Shared cache is the mathlib closure.** `install` provisions mathlib and its
   transitive dependencies. Packages beyond that closure are handled per-project
   by the consumer overlay (above), not added to the shared cache — so they

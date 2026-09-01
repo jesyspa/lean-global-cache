@@ -1741,7 +1741,9 @@ run_group() { # run_group <name> — buffer the group's output, record its statu
 }
 
 for g in "${SUITES[@]}"; do
-  while (( $(jobs -rp | wc -l) >= JOBS )); do wait -n || true; done
+  # bash 3.2 has no `wait -n` (wait for the next job to finish, whichever it
+  # is); poll the running-job count instead.
+  while (( $(jobs -rp | wc -l) >= JOBS )); do sleep 0.2; done
   run_group "$g" &
 done
 wait

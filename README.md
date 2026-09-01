@@ -11,9 +11,14 @@ limitations.
 
 ## Install
 
-**Single-user host** — put `bin/lean-cache` on your PATH. Nothing else: the
-cache lands in `~/.local/share/lean-global-cache`, you own it, no config file
-or sudo is involved. Run `lean-cache check-env` to confirm the wiring.
+**Single-user host** — get `elan` on your PATH first; the CLI drives it but does
+not install it (`elan-init.sh` from elan.lean-lang.org). Then put
+`bin/lean-cache` on your PATH. The cache lands in
+`~/.local/share/lean-global-cache`, you own it, and no config file or sudo is
+involved. The cache and the shared toolchain dir stay empty until the first
+`lean-cache use` in a project, which creates them and installs that project's
+pinned toolchain. `lean-cache check-env` reports the wiring after that; on a
+bare install it correctly reports both as missing.
 
 **Multi-user host** — copy [`lean-cache.conf.example`](lean-cache.conf.example)
 to `/etc/lean-cache/lean-cache.conf` and edit it, do the one-time root setup in

@@ -112,7 +112,7 @@ log()  { echo "==> $*" >&2; }
 # tab or newline — so the line stays one field-per-value.
 log_event() { # args: event [key=value ...]
   local event="$1"; shift || return 0
-  local line="$EPOCHSECONDS"$'\t'"$ME"$'\t'"$event" kv
+  local line="$(date +%s)"$'\t'"$ME"$'\t'"$event" kv
   for kv in "$@"; do line+=$'\t'"$kv"; done
   [[ -d "$LOG_DIR" ]] || mkdir -p "$LOG_DIR" 2>/dev/null || return 0
   printf '%s\n' "$line" >> "$LOG_DIR/events.$ME.log" 2>/dev/null || true
@@ -121,10 +121,22 @@ log_event() { # args: event [key=value ...]
 
 # Count non-empty lines in $1 without a printf|grep -c fork.
 count_nonempty_lines() {
-  local -a lines=(); mapfile -t lines <<<"$1"
   local n=0 l
-  for l in "${lines[@]}"; do [[ -n "$l" ]] && n=$((n + 1)); done
+  while IFS= read -r l || [[ -n "$l" ]]; do [[ -n "$l" ]] && n=$((n + 1)); done <<<"$1"
   printf '%s' "$n"
+}
+
+# bash 3.2 has no associative arrays; a "map" here is a pair of parallel
+# "keys"/"vals" arrays, and this walks the keys with a linear scan (small
+# enough for the memoized lookups and toolchain/build listings that use it).
+# Echoes the matching index and returns 0, or returns 1 and echoes nothing.
+index_of_key() { # args: key key1 [key2 ...]
+  local key="$1" i=0 k; shift
+  for k in "$@"; do
+    [[ "$k" == "$key" ]] && { printf '%s' "$i"; return 0; }
+    i=$((i + 1))
+  done
+  return 1
 }
 
 usage() {
@@ -292,11 +304,11 @@ toolchain_installed() { # arg: toolchain
 # times per invocation (for the store path and again for log_event), and a
 # `$(...)` capture would run this in a subshell, discarding the memoized entry
 # before the caller ever sees it.
-declare -A _REPO_IDENTITY_CACHE=()
+_REPO_IDENTITY_CACHE_KEYS=(); _REPO_IDENTITY_CACHE_VALS=()
 repo_identity() {
-  local proj="$1"
-  if [[ -n "${_REPO_IDENTITY_CACHE[$proj]+x}" ]]; then
-    _RI="${_REPO_IDENTITY_CACHE[$proj]}"
+  local proj="$1" idx
+  if idx="$(index_of_key "$proj" "${_REPO_IDENTITY_CACHE_KEYS[@]}")"; then
+    _RI="${_REPO_IDENTITY_CACHE_VALS[$idx]}"
     return 0
   fi
   _RI=""
@@ -309,7 +321,7 @@ repo_identity() {
   [[ -n "$base" && "$base" != "." && "$base" != "/" ]] || base="repo"
   hash="$(printf '%s' "$gitdir" | sha1sum)"; hash="${hash:0:12}"
   _RI="$base-$hash"
-  _REPO_IDENTITY_CACHE[$proj]="$_RI"
+  _REPO_IDENTITY_CACHE_KEYS+=("$proj"); _REPO_IDENTITY_CACHE_VALS+=("$_RI")
 }
 
 # Store dir for a (proj, commit, slug). Sets $_BSF rather than printing (see
@@ -879,27 +891,32 @@ cmd_verify() {
   # with no matching toolchain, each mean install/uninstall left the two out
   # of sync. Only leanprover/lean4:v* entries count; elan's " (default)"
   # suffix is stripped before matching.
-  local -A tc_slug=()
-  local line
+  local -a tc_slug_keys=() tc_slug_vals=()
+  local line idx
   while IFS= read -r line; do
     line="${line% (default)}"
     case "$line" in leanprover/lean4:v*) ;; *) continue ;; esac
     s="$( { normalize_version "$line" && printf '%s' "$SLUG"; } 2>/dev/null )" || continue
-    tc_slug["$s"]="$line"
+    if idx="$(index_of_key "$s" "${tc_slug_keys[@]}")"; then
+      tc_slug_vals[$idx]="$line"
+    else
+      tc_slug_keys+=("$s"); tc_slug_vals+=("$line")
+    fi
   done < <(elan toolchain list 2>/dev/null || true)
-  for s in "${!tc_slug[@]}"; do
+  for idx in "${!tc_slug_keys[@]}"; do
+    s="${tc_slug_keys[$idx]}"
     [[ -d "$LAKES/$s/packages" ]] \
-      || warn "orphan elan toolchain ${tc_slug[$s]}: no matching cache at $LAKES/$s/packages (run '$PROG install <version>' to add it, or remove the toolchain with elan)"
+      || warn "orphan elan toolchain ${tc_slug_vals[$idx]}: no matching cache at $LAKES/$s/packages (run '$PROG install <version>' to add it, or remove the toolchain with elan)"
   done
   for s in "${slugs[@]}"; do
-    [[ -n "${tc_slug[$s]:-}" ]] \
+    index_of_key "$s" "${tc_slug_keys[@]}" >/dev/null \
       || warn "orphan cache dir $LAKES/$s: no matching elan toolchain (run '$PROG install <version>' to add it, or '$PROG uninstall <version>' to remove the orphaned cache)"
   done
 
   # 6. Stale scratch: leftovers from an install interrupted mid-flight
   # (cmd_install's own .build.<slug>.* and .packages.incoming/old.* dirs). A
   # fresh one may be an in-flight install, so only flag entries over a day old.
-  local now p mtime age; now="$EPOCHSECONDS"
+  local now p mtime age; now="$(date +%s)"
   for p in "$LAKES"/.build.* "$LAKES"/*/.packages.incoming.* "$LAKES"/*/.packages.old.*; do
     [[ -e "$p" ]] || continue
     mtime="$(stat -c '%Y' "$p" 2>/dev/null || echo "$now")"
@@ -994,7 +1011,7 @@ _install_exit() {
   local rc=$?
   rm -rf "${build:-}"
   local ok=1; [[ "$rc" -eq 0 ]] || ok=0
-  log_event install slug="${INSTALL_SLUG:-}" secs="$(( EPOCHSECONDS - ${INSTALL_T0:-0} ))" \
+  log_event install slug="${INSTALL_SLUG:-}" secs="$(( $(date +%s) - ${INSTALL_T0:-0} ))" \
     ok="$ok" forced="${INSTALL_FORCED:-0}"
 }
 
@@ -1026,7 +1043,7 @@ cmd_install() {
   # in global scope (after cmd_install returns), where a local would be invisible
   # — the same reason `build` below is global. The trap logs the install event on
   # every exit path, so a failure (any `die`) records ok=0 as well.
-  INSTALL_SLUG="$SLUG"; INSTALL_FORCED="$force"; INSTALL_T0="$EPOCHSECONDS"
+  INSTALL_SLUG="$SLUG"; INSTALL_FORCED="$force"; INSTALL_T0="$(date +%s)"
 
   # Serialize installs of the same version.
   mkdir -p "$LAKES"
@@ -1403,7 +1420,7 @@ cmd_use() {
   if [[ -d "$BUILDS" ]]; then
     local prune_stamp="$BUILDS/.last-prune" prune_stamp_age
     prune_stamp_age="$(stat -c %Y "$prune_stamp" 2>/dev/null || echo 0)"
-    if [[ $(( EPOCHSECONDS - prune_stamp_age )) -ge 86400 ]]; then
+    if [[ $(( $(date +%s) - prune_stamp_age )) -ge 86400 ]]; then
       cmd_prune_builds || true
       touch "$prune_stamp" 2>/dev/null || true
     fi
@@ -1588,7 +1605,7 @@ cmd_publish_build() {
   tree_clean_for_build "$proj" \
     || die "refusing to publish a dirty tree; commit your changes first"
 
-  local pub_t0; pub_t0="$EPOCHSECONDS"
+  local pub_t0; pub_t0="$(date +%s)"
   log "building $proj before publishing (this can take minutes)"
   acquire_build_slot "$PROG publish-build"
   # A failed build is still publishable: its .lake/build holds honest olean/trace
@@ -1613,7 +1630,7 @@ cmd_publish_build() {
   # switch off the gate's skip. Leave the stored green build in place, and never
   # fail the caller (a push must not be affected).
   if [[ "$green" -eq 0 ]] && build_is_green "$store"; then
-    log_event publish repo="$rid" commit="${commit:0:12}" slug="$SLUG" green="$green" secs=$(( EPOCHSECONDS - pub_t0 ))
+    log_event publish repo="$rid" commit="${commit:0:12}" slug="$SLUG" green="$green" secs=$(( $(date +%s) - pub_t0 ))
     log "keeping stored green build for $TCVER @ ${commit:0:12}; not overwriting with a non-green build"
     return 0
   fi
@@ -1624,16 +1641,18 @@ cmd_publish_build() {
   cp -a "$proj/.lake/build/lib" "$incoming/lib"
   [[ -d "$proj/.lake/build/ir" ]] && cp -a "$proj/.lake/build/ir" "$incoming/ir"
   local -a oleans=()
-  mapfile -t oleans < <(find "$incoming/lib" -name '*.olean' 2>/dev/null)
+  local _olean
+  while IFS= read -r _olean; do oleans+=("$_olean"); done \
+    < <(find "$incoming/lib" -name '*.olean' 2>/dev/null)
   printf 'repo=%s\ncommit=%s\ntoolchain=%s\nslug=%s\noleans=%s\npublished_by=%s\npublished_at=%s\ntree_clean=%s\n' \
     "$rid" "$commit" "$TOOLCHAIN" "$SLUG" \
-    "${#oleans[@]}" "$ME" "$EPOCHSECONDS" "$green" \
+    "${#oleans[@]}" "$ME" "$(date +%s)" "$green" \
     > "$incoming/.seed-manifest"
   normalize_build_store "$incoming"
 
   rm -rf "$store"
   mv "$incoming" "$store"
-  log_event publish repo="$rid" commit="${commit:0:12}" slug="$SLUG" green="$green" secs=$(( EPOCHSECONDS - pub_t0 ))
+  log_event publish repo="$rid" commit="${commit:0:12}" slug="$SLUG" green="$green" secs=$(( $(date +%s) - pub_t0 ))
   log "published $([[ "$green" -eq 1 ]] && echo green || echo non-green) build for $TCVER @ ${commit:0:12} -> $store"
 
   # Rotate this repo's store: the build just published is now "latest" and is
@@ -1665,9 +1684,12 @@ build_is_green() { # arg: build store dir
 prune_builds_under() {
   local repo="$1" keep_days="$2"
   [[ -d "$repo" ]] || return 0
-  local now cutoff; now="$EPOCHSECONDS"; cutoff=$(( now - keep_days * 86400 ))
-  local -A latest=() latest_green=() ts_of=() green_of=()
-  local d slug ts
+  local now cutoff; now="$(date +%s)"; cutoff=$(( now - keep_days * 86400 ))
+  # bash 3.2 has no associative arrays; each map below is a pair of parallel
+  # "keys"/"vals" arrays walked via index_of_key.
+  local -a latest_keys=() latest_vals=() latest_green_keys=() latest_green_vals=()
+  local -a ts_of_keys=() ts_of_vals=() green_of_keys=()
+  local d slug ts idx latest_ts latest_green_ts
   # One traversal, candidate dirs kept in order: compute (and cache) each dir's
   # publish time and green status once, tracking the newest-per-slug and
   # newest-green-per-slug times as we go — pass 2 below reuses this instead of
@@ -1678,19 +1700,32 @@ prune_builds_under() {
     [[ -e "$d/.seed-manifest" || -d "$d/lib" ]] || continue
     dirs+=("$d")
     slug="${d##*/}"; ts="$(build_published_at "$d")"
-    ts_of["$d"]="$ts"
-    [[ -z "${latest[$slug]:-}" || "$ts" -gt "${latest[$slug]}" ]] && latest[$slug]="$ts"
+    ts_of_keys+=("$d"); ts_of_vals+=("$ts")
+    if idx="$(index_of_key "$slug" "${latest_keys[@]}")"; then
+      [[ "$ts" -gt "${latest_vals[$idx]}" ]] && latest_vals[$idx]="$ts"
+    else
+      latest_keys+=("$slug"); latest_vals+=("$ts")
+    fi
     if build_is_green "$d"; then
-      green_of["$d"]=1
-      [[ -z "${latest_green[$slug]:-}" || "$ts" -gt "${latest_green[$slug]}" ]] && latest_green[$slug]="$ts"
+      green_of_keys+=("$d")
+      if idx="$(index_of_key "$slug" "${latest_green_keys[@]}")"; then
+        [[ "$ts" -gt "${latest_green_vals[$idx]}" ]] && latest_green_vals[$idx]="$ts"
+      else
+        latest_green_keys+=("$slug"); latest_green_vals+=("$ts")
+      fi
     fi
   done < <(find "$repo" -mindepth 2 -maxdepth 2 -type d -print0 2>/dev/null)
   # Pass 2: drop builds that are neither newest-per-slug nor newest-green-per-slug
   # and are older than the window.
   for d in "${dirs[@]}"; do
-    slug="${d##*/}"; ts="${ts_of[$d]}"
-    [[ "$ts" -eq "${latest[$slug]:-0}" ]] && continue   # newest per slug: keep
-    [[ "$ts" -eq "${latest_green[$slug]:-0}" && -n "${green_of[$d]:-}" ]] && continue  # newest green per slug: keep
+    slug="${d##*/}"
+    idx="$(index_of_key "$d" "${ts_of_keys[@]}")"; ts="${ts_of_vals[$idx]}"
+    idx="$(index_of_key "$slug" "${latest_keys[@]}")" && latest_ts="${latest_vals[$idx]}" || latest_ts=0
+    [[ "$ts" -eq "$latest_ts" ]] && continue   # newest per slug: keep
+    idx="$(index_of_key "$slug" "${latest_green_keys[@]}")" && latest_green_ts="${latest_green_vals[$idx]}" || latest_green_ts=0
+    if [[ "$ts" -eq "$latest_green_ts" ]] && index_of_key "$d" "${green_of_keys[@]}" >/dev/null; then
+      continue                                          # newest green per slug: keep
+    fi
     [[ "$ts" -lt "$cutoff" ]] || continue               # within window: keep
     local repo_base="${d%/*}"; repo_base="${repo_base##*/}"
     log "pruning stale build $repo_base/$slug (~$(( (now - ts) / 86400 ))d old)"
@@ -1915,12 +1950,12 @@ cmd_pre_push_gate() {
   # checkout, so Lake sees a bogus URL mismatch and tries to re-clone the
   # (read-only, cache-symlinked) package. run_lake_build scrubs the injected
   # vars so the gate build matches a plain interactive lake build.
-  gate_t0="$EPOCHSECONDS"
+  gate_t0="$(date +%s)"
   acquire_build_slot "lean push gate"
   run_lake_build "$root" "lean push gate" \
-    || { echo 'lean push gate: lake build FAILED — push aborted (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; repo_identity "$root"; log_event gate outcome=fail repo="$_RI" commit="${head:0:12}" secs=$(( EPOCHSECONDS - gate_t0 )); exit 1; }
+    || { echo 'lean push gate: lake build FAILED — push aborted (set SKIP_LEAN_PUSH_GATE=1 to bypass)' >&2; repo_identity "$root"; log_event gate outcome=fail repo="$_RI" commit="${head:0:12}" secs=$(( $(date +%s) - gate_t0 )); exit 1; }
   repo_identity "$root"
-  log_event gate outcome=ok repo="$_RI" commit="${head:0:12}" secs=$(( EPOCHSECONDS - gate_t0 ))
+  log_event gate outcome=ok repo="$_RI" commit="${head:0:12}" secs=$(( $(date +%s) - gate_t0 ))
   echo 'lean push gate: build OK — allowing push' >&2
   # The full build just passed, so .lake/build is a complete warm build for this
   # exact commit — capture it for reuse now. publish-build's own `lake build` is
@@ -2018,7 +2053,7 @@ cmd_stats() {
   [[ "$since" =~ ^[0-9]+$ ]] || die "--since must be a non-negative integer"
 
   [[ -d "$LOG_DIR" ]] || { echo "no event log at $LOG_DIR (nothing logged yet)"; return 0; }
-  local now cutoff; now="$EPOCHSECONDS"; cutoff=$(( now - since * 86400 ))
+  local now cutoff; now="$(date +%s)"; cutoff=$(( now - since * 86400 ))
 
   local files=() f
   for f in "$LOG_DIR"/events.*.log; do

@@ -29,4 +29,4 @@ Order:
    `set-default-toolchain`/`fix-filemode`/`fix-perms` as OWNER.
 
 After all three, deploy the repo through the hostbot deploy-handler as usual;
-`deploy.sh` installs the CLI and reconciles the `versions` manifest.
+`deploy.sh` installs the CLI.

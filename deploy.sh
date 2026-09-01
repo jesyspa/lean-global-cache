@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# deploy.sh — install the lean-cache CLI and reconcile the versions manifest.
+# deploy.sh — install the lean-cache CLI and provision the shared cache tree.
 #
 # Installs the CLI to BIN (default: $HOME/.local/bin/lean-cache on a single-user
-# host; a shared path on a multi-user host via the config file) and reconciles
-# ./versions against the shared cache (idempotent). All cache files end up
-# OWNER-owned and not group-writable.
+# host; a shared path on a multi-user host via the config file). Versions are
+# not provisioned here: `lean-cache use` installs the toolchain a project pins
+# the first time it is needed, and `lean-cache list` reports what a host holds.
+# All cache files end up OWNER-owned and not group-writable.
 #
 # One-time root setup (ownership migration + sudoers) lives in admin/ and is
 # NOT run here — see admin/README.md. deploy.sh never needs root.
@@ -61,16 +62,5 @@ log "ensuring event log dir $LOG_DIR"
 mkdir -p "$LOG_DIR"
 chgrp "$GROUP" "$LOG_DIR" 2>/dev/null || true
 chmod 3775 "$LOG_DIR" 2>/dev/null || true
-
-# --- 3. Reconcile versions ----------------------------------------------------
-
-if [[ -f "$REPO_DIR/versions" ]]; then
-  while IFS= read -r line; do
-    line="${line%%#*}"; line="${line//[[:space:]]/}"
-    [[ -n "$line" ]] || continue
-    log "ensuring version $line"
-    "$BIN_DST" install "$line"
-  done < "$REPO_DIR/versions"
-fi
 
 log "deploy complete"

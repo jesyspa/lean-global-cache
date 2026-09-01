@@ -743,10 +743,13 @@ Standard hostbot deploy-handler repo. `deploy.sh` (as `OWNER`):
 3. ensures `ROOT/{lakes,elan}` exist `2755`,
 4. ensures the event-log dir (`LOG_DIR`, default `ROOT/log`) exists `3775`
    (setgid+sticky, group `GROUP`), so any group member writes its own
-   `events.<user>.log` but cannot remove another's,
-5. reconciles the `versions` manifest — each listed version is `install`ed
-   (idempotent). The manifest is a **floor**: ad-hoc installs are never
-   auto-removed, and pruning is manual via `uninstall`.
+   `events.<user>.log` but cannot remove another's.
+
+It provisions no versions. Which versions a host holds is host state, and the
+cache tree already records it: `lakes/<slug>/packages/` exists for exactly the
+installed ones and `lean-cache list` reports them. `use` installs a project's
+pinned toolchain the first time it is needed; pruning is manual via
+`uninstall`.
 
 `test.sh` runs first in an isolated worktree, against a stub `lake` and a stub
 `elan`: version resolution and validation, config resolution and its parity with

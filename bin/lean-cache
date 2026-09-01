@@ -1041,8 +1041,8 @@ cmd_install() {
 
   # The install-time replay build (lake build Mathlib widgetJsAll) is a cold
   # from-scratch build — as thrash-prone as any `lean-cache build`, and reached
-  # not just by hand but by `use`'s auto-install and deploy.sh's versions
-  # reconcile. Take a host build slot so it serializes with policied cold builds
+  # not just by hand but by `use`'s auto-install. Take a host build slot so it
+  # serializes with policied cold builds
   # instead of stacking on top of them. Held (fd 8) until this process exits;
   # a nested install riding a parent's slot (LEAN_CACHE_BUILD_SLOT_HELD) skips
   # re-acquiring, so a `use`-triggered auto-install during a slotted build never

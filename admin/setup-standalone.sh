@@ -103,9 +103,9 @@ else
 fi
 
 # --- 6. install the CLI + cache tree (no version provisioning) ---------------
-# Versions are installed on demand by users (`lean-cache install <ver>`), so we
-# deliberately skip deploy.sh's `versions` reconcile and just lay down the CLI
-# and the cache dirs. The CLI reads $CONF at runtime.
+# Versions are installed on demand — by `lean-cache use` on a project's pin, or
+# by hand with `lean-cache install <ver>` — so this lays down only the CLI and
+# the cache dirs. The CLI reads $CONF at runtime.
 log "installing the lean-cache CLI to $BIN"
 run_owner install -m 0755 "$SRC/bin/lean-cache" "$BIN"
 run_owner install -d -m 2755 "$ROOT/lakes" "$ROOT/elan"

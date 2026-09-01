@@ -1,257 +1,167 @@
 # lean-global-cache
 
-Owns a shared Lean/mathlib package cache and exposes a CLI (`lean-cache`) that
-bots use to install, remove, and link mathlib versions.
+A shared Lean/mathlib package cache plus a CLI (`lean-cache`) that installs
+mathlib versions into it and overlays them onto your projects. Projects read
+mathlib's prebuilt oleans from the cache instead of building or downloading
+them per worktree.
 
-## Why
+The cache is single-writer: everything in it is owned by one configured user
+and is not group-writable, so consumers can only read it. All mutation goes
+through the CLI. See [DESIGN.md](DESIGN.md) for the rationale and internals.
 
-The cache used to be group-writable and owned by whichever bot happened to
-publish each version. Bots wrote into it directly — stray `lake update`/
-`git checkout`/`cache get` in the shared checkouts clobbered it for everyone,
-and a publish under the wrong umask once left an entire version unreadable to
-the rest of the group.
+## Install
 
-This repo makes the cache **single-writer**: every file is owned by the
-configured owner and is not group-writable. Consumers can only read it, so
-they cannot clobber it. All mutation goes through one CLI that applies a
-deterministic umask and permission pass every time.
+**Single-user host** — put `bin/lean-cache` on your PATH. No config file, no
+sudo. The cache lands in `~/.local/share/lean-global-cache` and you own it.
 
-## CLI
+```bash
+lean-cache config      # show the resolved OWNER/GROUP/ROOT/BIN
+lean-cache check-env   # verify this user's wiring to the cache
+```
+
+**Multi-user host** — copy [`lean-cache.conf.example`](lean-cache.conf.example)
+to `/etc/lean-cache/lean-cache.conf` and edit it, then do the one-time root
+setup in [admin/README.md](admin/README.md). After that, deploy with
+`deploy.sh`: it installs the CLI to `BIN`, installs the transparent `lake` shim
+beside it, and reconciles the [`versions`](versions) manifest.
+
+## Usage
+
+### In a project
+
+```bash
+cd ~/dev/my-lean-project   # has a lean-toolchain file
+lean-cache use             # overlay .lake/packages onto the shared cache
+lake build                 # builds your code into project-local .lake/build
+```
+
+`use` installs the version if the cache doesn't have it yet, symlinks each
+shared package into `.lake/packages`, seeds `.lake/build` from a stored warm
+build if one matches HEAD, and installs the git hooks described below. Re-run
+it after a version bump; `lean-cache use --clean` rebuilds the overlay from
+scratch.
+
+Then use bare `lake` and the LSP exactly as on stock Lean. Your own build
+artifacts stay in the project's `.lake/build`; only mathlib's oleans come from
+the shared cache.
+
+`.lake/packages` is a real directory, so a project needing packages beyond
+mathlib's closure can let `lake` clone them in alongside the symlinks.
+
+If the path you give `use` is not itself a Lake project and you name no
+version, the command applies to every Lake project found beneath it — a repo
+root holding several independent projects works without per-project wiring.
+The same fallback applies to `refresh`, `seed-build`, `publish-build`, and
+`clean`.
+
+### Sharing a warm build between worktrees
+
+`.lake/build` is per-worktree, so a fresh worktree cold-builds the whole
+project even when an identical build exists next door. `lean-cache` keeps a
+per-user store of warm builds keyed by (repo, exact commit, toolchain).
+
+```bash
+lean-cache publish-build   # store this worktree's warm build
+# … later, in a fresh worktree at the same commit …
+lean-cache use             # overlays packages AND seeds .lake/build
+lake build                 # re-elaborates only what you edit
+```
+
+Seeding happens only on an exact commit+toolchain match, so a stale build can
+never replay as a false green. The store lives under
+`~/.cache/lean-global-cache/builds` (`LEAN_CACHE_BUILDS`) and rotates itself;
+`lean-cache prune-builds [--keep-days N]` prunes it on demand.
+
+### Git hooks `use` installs
+
+- `post-checkout` / `reference-transaction` — run `lean-cache refresh`, which
+  repoints the overlay when HEAD moves to a commit pinning a different
+  toolchain, and is a cheap no-op otherwise.
+- `pre-push` — runs `lake build` before a push that changes any `*.lean` and
+  aborts on failure. Skipped when the warm-build store already holds this
+  commit as green; on success it publishes the build for reuse. Bypass with
+  `SKIP_LEAN_PUSH_GATE=1`. The gate only fires when the repo root itself is a
+  Lake project.
+
+### Builds
+
+Where the `lake` shim is installed, bare `lake build` routes through a shared
+policy (also reachable as `lean-cache build`). Warm and incremental builds run
+immediately. Cold full builds first take one of `LEAN_CACHE_BUILD_SLOTS`
+(default 2) host-wide slots, so concurrent sessions don't stack several
+thrashing builds onto the same cores. `lean-cache slots` shows which slots are
+free or held.
+
+A cold build cannot finish inside a bounded foreground Claude Code call, so
+there the policy prints the command to re-run and exits 75 — re-run it
+backgrounded or with a long timeout. `--wait` (or `LEAN_CACHE_FORCE_WAIT=1`)
+blocks to completion regardless. `LEAN_CACHE_BUILD_SLOTS=0` disables
+serialization.
+
+### Monitoring
+
+```bash
+lean-cache stats [--since DAYS]   # summarize the event log, default 7 days
+lean-cache verify                 # read-only invariant sweep, cron-friendly
+```
+
+Mutating and build-policy paths append tab-separated lines to
+`$LOG_DIR/events.<user>.log`; `stats` summarizes seed hit rate, gate outcomes,
+build durations, and slot waits. `verify` checks the cache's invariants and
+exits 1 on any FAIL, so it fits a cron job that pages on the exit code. Both
+are read-only and need no privilege.
+
+## Commands
 
 ```
-lean-cache install <version>     # build & install a mathlib version
-lean-cache uninstall <version>   # remove a version's lake cache and elan toolchain
-lean-cache set-default-toolchain <version>  # default for bare lean/lake outside a project
-lean-cache link <version>        # print the packages path to symlink against
-lean-cache use [version] [path]  # set up .lake/packages in a project
-lean-cache refresh [path]        # re-overlay only if the toolchain changed
-lean-cache seed-build [path]     # seed .lake/build from a stored warm build
-lean-cache publish-build [path]  # store this project's warm build for reuse
-lean-cache build [--wait] [path] [args]  # lake build under the shared build policy
-lean-cache clean [path]          # wipe .lake/build (cold-reset a reused worktree)
-lean-cache prune-builds [--keep-days N]  # rotate the warm-build store
-lean-cache slots                 # report host build-slot state (free/held)
-lean-cache list                  # installed versions + sizes
-lean-cache resolve <version>     # show normalized toolchain/rev/slug
-lean-cache config                # show resolved owner/group/root/builds/bin
-lean-cache verify                # read-only cache invariant sweep (cron-friendly)
-lean-cache stats [--since DAYS]  # summarize the event log (default 7 days)
-lean-cache fix-perms [version]   # re-normalize cache permissions (verify's remedy)
+lean-cache install [--force] <version>      build & install a mathlib version
+lean-cache uninstall <version>              remove a version's cache and toolchain
+lean-cache set-default-toolchain <version>  default for bare lean/lake outside a project
+lean-cache link <version>                   print the packages path to symlink against
+lean-cache use [version] [path]             set up .lake/packages in a project
+lean-cache refresh [path]                   re-overlay only if the toolchain changed
+lean-cache seed-build [path]                seed .lake/build from a stored warm build
+lean-cache publish-build [path]             store this project's warm build for reuse
+lean-cache build [--wait] [path] [args]     lake build under the shared build policy
+lean-cache clean [path]                     wipe .lake/build
+lean-cache prune-builds [--keep-days N]     rotate the warm-build store
+lean-cache slots                            report host build-slot state
+lean-cache list                             installed versions + sizes
+lean-cache resolve <version>                show normalized toolchain/rev/slug
+lean-cache config                           show resolved owner/group/root/builds/bin
+lean-cache check-env                        check this user's wiring to the cache
+lean-cache verify                           read-only cache invariant sweep
+lean-cache stats [--since DAYS]             summarize the event log
+lean-cache fix-perms [version]              re-normalize cache permissions
 ```
 
 `<version>` accepts `4.30`, `4.30.0`, `v4.30.0`, `leanprover/lean4:v4.30.0`, or
 an RC like `4.30.0-rc2`. Bare `major.minor` expands to `major.minor.0`;
-otherwise the version is exact (no "latest patch" resolution).
+otherwise the version is exact — there is no "latest patch" resolution.
 
-`install`, `uninstall`, and `set-default-toolchain` re-exec themselves as the
-cache owner via sudo on a multi-user host, so they work from any group member
-while always producing owner-owned files. On a single-user host the current user
-IS the owner, so no sudo is needed. `link`, `use`, `refresh`, `list`, `config`, and `resolve` only
-read the shared cache (writing at most into the consuming project) and need no
-privilege.
-
-### Consuming the cache from a project
-
-```bash
-cd ~/dev/my-lean-project          # has a lean-toolchain file
-lean-cache use                    # overlays .lake/packages onto the shared cache
-lake exe cache get                # near-instant; oleans already present
-lake build                        # builds your code into project-local .lake/build
-```
-
-Use bare `lake` (and the LSP) exactly as on stock Lean. On the fleet a
-transparent `lake` shim sits ahead of the real `lake` on PATH: every subcommand
-except `build` passes straight through, and `lake build` routes through the
-[shared build policy](#transparent-builds-cold-only-serialization) so cold/full
-builds serialize host-wide — you never invoke `lean-cache build` or manage a
-build timeout yourself.
-
-`use` makes `.lake/packages` a real directory containing one symlink per shared
-package (mathlib + its closure). Because the directory itself is writable, a
-project that requires extra packages beyond mathlib's closure can let `lake`
-clone them in alongside the symlinks — those live in the project, so they never
-conflict with other projects in the read-only shared tree. Re-running `use`
-repoints the shared symlinks (e.g. after a version bump) and leaves the
-project's own package dirs untouched; `lean-cache use --clean` rebuilds the
-overlay from scratch.
-
-A repo need not be a single Lake project. If the path given to `use`/`refresh`
-(or `seed-build`/`publish-build`/`clean`) is not itself a Lake project —
-missing a `lakefile.toml`/`lakefile.lean` of its own, whether or not it
-happens to carry a `lean-toolchain` pin — and, for `use`, no version was given
-either, each command instead looks for Lake projects **beneath** that path (a
-directory holding a `lakefile.toml`/`lakefile.lean` plus a `lean-toolchain`,
-`.lake` and `.git` pruned from the walk) and applies itself to each one found.
-A directory that IS a Lake project keeps today's exact single-project
-behavior; the sweep only kicks in for a directory that isn't one, e.g. a repo
-root holding several independent Lake projects (`examples/`, `homework/hw00/`,
-…) with no lakefile of its own — even if that root does carry a
-`lean-toolchain` pin (say, so bare `lean` resolves *some* toolchain outside
-any project). If the sweep finds nothing beneath a path that at least has its
-own `lean-toolchain`, the command falls back to treating that path as the
-target, same as before this existed. `lean-cache use` at a monorepo root
-overlays every project it finds; the git hooks (below) call `lean-cache
-refresh` with the repo root regardless of which subproject changed, so this is
-what makes them work correctly without per-project hook wiring.
-
-`use` also installs git hooks (`post-checkout` and `reference-transaction`) that
-repoint the overlay automatically whenever HEAD moves to a commit pinning a
-different toolchain — including via `git reset --hard` and `git cherry-pick`.
-They call `lean-cache refresh`, which re-overlays only on an actual toolchain
-mismatch and is otherwise a cheap no-op. See [DESIGN.md](DESIGN.md) for details.
-
-Your project's own build artifacts live in `.lake/build`; only mathlib's
-prebuilt oleans are read from the shared cache, so read-only access is enough.
-
-### Seeding a worktree's project build
-
-`.lake/build` is per-worktree, so every fresh worktree of a repo cold-builds the
-entire project from scratch — even when a byte-identical warm build already
-exists in a sibling worktree at the same commit. To avoid that, `lean-cache`
-keeps a per-user store of warm project builds keyed by **(repo, exact commit,
-toolchain slug)**:
-
-```bash
-lean-cache publish-build           # build to completion, then store the warm
-                                   # .lake/build for the current commit+toolchain
-# … later, in any fresh worktree at that same commit …
-lean-cache use                     # overlays packages AND seeds .lake/build
-lake build                         # re-elaborates only the files you edit
-```
-
-`use` and `refresh` call `seed-build` automatically, so both overlay hooks
-(post-checkout and reference-transaction) reach it. Seeding happens **only** when
-the worktree's HEAD exactly matches a stored build's commit and the toolchain
-matches; on any mismatch it seeds nothing and the normal cold/incremental build
-runs, so a stale build can never replay as a false green. When HEAD does match,
-seeding replaces any `.lake/build` already present (a reused worktree's stale
-leftover is exactly what otherwise forces a needless full rebuild); Lake still
-re-elaborates any module you have since edited. Oleans are hardlinked from the read-only store (so they cost no disk and
-can't be mutated through the worktree — a rebuild replaces the link with a fresh
-file); the small bookkeeping files Lake rewrites in place are copied. The store
-lives under `~/.cache/lean-global-cache/builds` by default (`LEAN_CACHE_BUILDS`
-to override); it is per-user because a project's build is reproducible and the
-worktrees that share it belong to one user — unlike the cross-bot mathlib cache.
-
-The store is rotated automatically: `publish-build` keeps the newest build per
-`(repo, toolchain)` indefinitely (that is "latest main") and drops any older one
-past a window (`LEAN_CACHE_BUILD_KEEP_DAYS`, default 7). `lean-cache prune-builds
-[--keep-days N]` applies the same policy across the whole store on demand (cron-
-friendly). `use` also rotates the store opportunistically (at most once a day),
-so a repo that stops being published to doesn't accumulate stale builds forever
-even with no cron in place.
-
-### Pre-push build gate
-
-`use` also installs a `pre-push` hook. Before allowing a push that changes any
-`*.lean`, it bumps the mtime of the changed files (defeating stale-olean replay)
-and runs a bare `lake build`, aborting the push if the build fails. This catches
-the "pushed non-compiling code that targeted checks falsely reported green" case.
-A full `lake build` can take minutes — that latency is the intended cost. Set
-`SKIP_LEAN_PUSH_GATE=1` to bypass it (e.g. right after a known-clean build).
-Unlike `use`/`refresh`, the gate is **not** multi-project aware: it only fires
-when the repo root itself is a Lake project (`$root/lakefile.toml` or
-`.lean`). A repo of several Lake projects with none at its root is not gated
-at all — see [Known limitations](DESIGN.md#known-limitations--open-points).
-
-The gate skips the rebuild when the warm-build store already holds this exact
-commit+toolchain published from a clean tree — that build already attests the
-commit compiles, so re-pushing an already-green branch (or pushing right after
-a `publish-build`) is near-instant. `LEAN_CACHE_NO_GATE_SKIP=1` forces the
-rebuild. The gate only vouches for the checked-out HEAD: pushing a ref whose
-tip is some other commit passes with a warning instead of being validated
-against the wrong tree.
-
-### Transparent builds & cold-only serialization
-
-Instances run bare `lake build`; the serialization is transparent and engages
-only for builds that actually thrash the host. The installed `lake` shim routes
-`lake build` through a shared policy (also reachable explicitly as `lean-cache
-build`):
-
-- **warm/incremental** (a stored warm build matches HEAD, or `.lake/build`
-  already holds oleans) → runs immediately, foreground, with no slot. This is
-  the common case and feels exactly like a plain `lake build`.
-- **cold/full** (no stored build matches HEAD *and* `.lake/build` has no oleans)
-  → takes one of `LEAN_CACHE_BUILD_SLOTS` (default 2) host-wide lock slots first,
-  so concurrent sessions don't stack five thrashing cold builds onto six cores.
-  Waiting is capped (`LEAN_CACHE_BUILD_WAIT`, default 3600s) and degrades to an
-  unserialized build rather than blocking; progress lines print while waiting and
-  every 30s during the build.
-
-A cold/full build cannot finish inside a bounded foreground tool call. The
-harness stamps `CLAUDE_BASH_MODE=background` onto backgrounded Bash calls only,
-and exports `CLAUDECODE=1` into every call it launches, so a bounded foreground
-call is the one where `CLAUDECODE` is set and `CLAUDE_BASH_MODE` is unset. There,
-the policy does **not** build: it prints the exact command to re-run and exits
-code 75, so you re-run it backgrounded (woken on completion) or with a 10-minute
-timeout instead of having it killed mid-build. Backgrounded, and outside the
-harness entirely (a human terminal or cron, where neither variable is set and
-nothing gets killed at 2 minutes), a cold build queues on a slot and runs to
-completion. Set `LEAN_CACHE_FORCE_WAIT=1` (or pass `--wait` to `lean-cache
-build`) to block to completion regardless of mode; the pre-push gate and
-`publish-build` force-wait internally, since they must complete synchronously. A
-build riding a parent's slot (`LEAN_CACHE_BUILD_SLOT_HELD`) completes in place —
-no second slot, no bail. `LEAN_CACHE_BUILD_SLOTS=0` disables serialization.
-`lean-cache slots` reports which slots are free or held (and the holder, when
-it can be identified) — read-only, for answering "why is my build queued".
-
-Before either path runs, the build policy also checks the project's package
-overlay: if a shared-cache symlink under `.lake/packages` has gone dangling
-(e.g. its version was `uninstall`ed out from under a worktree that still
-points at it), it re-overlays once to repair it, then proceeds. A healthy
-overlay costs one stat and changes nothing, so this never touches an
-already-fine `.lake/build`; you no longer need to run `lean-cache use` by hand
-to recover from a broken overlay.
-
-Because the gate already builds the pushed commit to completion, it then
-**publishes that warm build** (`publish-build`) so future worktrees at the same
-commit seed instead of cold-building — capturing the build for reuse at exactly
-the moment a branch advances, at no extra build cost. Skip this with
-`LEAN_CACHE_NO_PUBLISH_ON_PUSH=1`. A commit touching any `*.lean` also prints a
-one-line reminder that `lean-cache publish-build` is available (silence with
-`LEAN_CACHE_NO_COMMIT_HINT=1`); it's just a nudge, since a clean push publishes
-automatically.
-
-## Monitoring
-
-The CLI keeps an append-only event log so the warm-build machinery (seeding,
-the gate skip, build slots) can be measured rather than trusted on faith. Each
-mutating or build-policy path appends one tab-separated line to
-`$LOG_DIR/events.<user>.log` (`LEAN_CACHE_LOG_DIR`, else the config `LOG_DIR`,
-else `<root>/log`): `install`, `use`, `seed` (hit/miss), `publish`, the push
-`gate` (skip/ok/fail), a foreground build `bail`, and build-`slot` waits.
-Logging is best-effort — a single guarded `>>` that silently no-ops if the log
-dir is unwritable — so it can never fail or slow a build, a hook, or a push.
-
-The dir is shared like the cache, but every user writes only its own file, so
-the single-writer model holds: one writer per file. `deploy.sh` provisions it
-setgid+sticky (mode `3775`, group `$GROUP`), so any group member can create its
-own file but not remove another's; on a single-user host it sits under your own
-`$ROOT` and just works.
-
-```bash
-lean-cache stats            # summary over the last 7 days
-lean-cache stats --since 30 # …over the last 30 days
-```
-
-`stats` reads every readable `events.*.log` and prints per-event counts, the
-seed hit rate, gate outcomes, install/publish build durations (median/max),
-and slot waits — split by user when more than one wrote. It is read-only and
+`install`, `uninstall`, and `set-default-toolchain` re-exec as the cache owner
+via sudo on a multi-user host. Everything else only reads the shared cache and
 needs no privilege.
 
-```bash
-lean-cache verify   # invariant sweep — safe to run from cron
-```
+## Configuration
 
-`verify` is the cronnable integrity sweep: it checks the shared cache itself
-(mathlib oleans present, no group/other-writable paths, everything owned by
-`OWNER`, `core.fileMode` untracked, elan toolchains and cache dirs in sync, no
-stale install scratch) and reports `ok`/`warn`/`FAIL` per check, the same style
-as `check-env`. It is read-only and needs no privilege; exit 0 when clean or
-warnings-only, 1 on any FAIL, so it fits a cron job that pages on the exit code.
+Precedence: env var > config file > built-in default.
 
-## Layout it manages
+| Setting           | Env var                      | Default (single-user)                              |
+|-------------------|------------------------------|----------------------------------------------------|
+| OWNER             | LEAN_CACHE_OWNER             | current user (`id -un`)                            |
+| GROUP             | LEAN_CACHE_GROUP             | current group (`id -gn`)                           |
+| ROOT              | LEAN_CACHE_ROOT              | `$HOME/.local/share/lean-global-cache`             |
+| BIN               | LEAN_CACHE_BIN               | realpath of the running `lean-cache` script        |
+| INSTALL_LAKE_SHIM | LEAN_CACHE_INSTALL_LAKE_SHIM | `0` (no `lake` shim)                               |
+| LOG_DIR           | LEAN_CACHE_LOG_DIR           | `$ROOT/log`                                        |
+
+`LEAN_CACHE_CONF`, if set, is the config file and nothing else is read.
+Otherwise the first existing of `~/.config/lean-cache/lean-cache.conf`,
+`/etc/lean-cache/lean-cache.conf`, `/etc/lean-cache.conf` is used. It may set
+any subset of the settings as plain shell assignments.
+
+The cache layout under `ROOT`:
 
 ```
 <root>/elan/                    ELAN_HOME — lean toolchains
@@ -259,57 +169,3 @@ warnings-only, 1 on any FAIL, so it fits a cron job that pages on the exit code.
 ```
 
 `<slug>` is the toolchain version with dots replaced by dashes, e.g. `v4-30-0`.
-Consumers symlink `.lake/packages` at `<root>/lakes/<slug>/packages`.
-
-On the fleet these paths are under `/opt/bots/lean` (see [Configuration](#configuration)).
-
-## Configuration
-
-These settings control the host layout:
-
-| Setting           | Env var                       | Default (single-user)                              |
-|-------------------|-------------------------------|----------------------------------------------------|
-| OWNER             | LEAN_CACHE_OWNER              | current user (`id -un`)                            |
-| GROUP             | LEAN_CACHE_GROUP              | current group (`id -gn`)                           |
-| ROOT              | LEAN_CACHE_ROOT              | `$HOME/.local/share/lean-global-cache`             |
-| BIN               | LEAN_CACHE_BIN               | realpath of the running `lean-cache` script itself |
-| INSTALL_LAKE_SHIM | LEAN_CACHE_INSTALL_LAKE_SHIM | `0` (no `lake` shim)                               |
-| LOG_DIR           | LEAN_CACHE_LOG_DIR           | `$ROOT/log` (event log, see [Monitoring](#monitoring)) |
-
-**Precedence:** env var > config file > built-in default.
-
-**Config file:** `LEAN_CACHE_CONF`, if set, is used exclusively; otherwise the
-first that exists is read — `~/.config/lean-cache/lean-cache.conf` (per-user)
-then `/etc/lean-cache/lean-cache.conf` (multi-user), plus the legacy
-`/etc/lean-cache.conf`. It may set any subset of the settings as plain shell
-assignments. See [`lean-cache.conf.example`](lean-cache.conf.example).
-
-**Single-user host:** no config file needed. Just put `bin/lean-cache` on your
-PATH (or install it anywhere). The cache lands in
-`~/.local/share/lean-global-cache`, you already own it, and no sudo or admin
-scripts are required.
-
-```bash
-lean-cache config      # show the resolved OWNER/GROUP/ROOT/BIN
-lean-cache check-env   # verify this user's wiring to the cache
-```
-
-**Multi-user host:** copy `lean-cache.conf.example` to
-`/etc/lean-cache/lean-cache.conf` and edit to taste (the fleet values are
-`OWNER=hostbot GROUP=bots ROOT=/opt/bots/lean BIN=/opt/bots/bin/lean-cache`,
-`INSTALL_LAKE_SHIM=1`), then follow [admin/README.md](admin/README.md) for the
-one-time root setup.
-
-## Setup & deployment
-
-**Single-user:** no setup — just use the CLI.
-
-**Multi-user:** one-time root setup (ownership migration + sudoers) — see
-[admin/README.md](admin/README.md). After that, deploy through the hostbot
-deploy-handler: `deploy.sh` installs the CLI to `BIN`, installs the transparent
-`lake` shim next to it (`$(dirname BIN)/lake`), and reconciles the
-[`versions`](versions) manifest (a floor of versions to keep present — it never
-auto-removes).
-
-See [DESIGN.md](DESIGN.md) for the full rationale, install internals, and known
-limitations.

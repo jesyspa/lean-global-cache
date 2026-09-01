@@ -32,7 +32,7 @@ DROP=(
 )
 
 echo "==> dropping pre-4.28 versions and orphan RC toolchains"
-for p in "${DROP[@]}"; do
+for p in ${DROP[@]:+"${DROP[@]}"}; do
   [[ -e "$p" ]] && { echo "    rm -rf $p"; rm -rf "$p"; }
 done
 

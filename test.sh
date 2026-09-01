@@ -175,7 +175,7 @@ echo "== config resolution =="
 cfg_field() { # cfg_field <env...> <field>
   local field="${@: -1}"
   local env_args=("${@:1:$#-1}")
-  env "${env_args[@]}" LEAN_CACHE_CONF=/nonexistent "$CLI" config \
+  env ${env_args[@]:+"${env_args[@]}"} LEAN_CACHE_CONF=/nonexistent "$CLI" config \
     | awk -v f="$field:" '$1==f{print $2}'
 }
 check "default owner = current user" \
@@ -221,7 +221,11 @@ pin v4.30.0 "$A"; gitc "$A" add -A; gitc "$A" commit -qm a30
 pin v4.31.0 "$A"; gitc "$A" add -A; gitc "$A" commit -qm b31
 b31="$(gitc "$A" rev-parse HEAD)"
 gitc "$A" checkout -q HEAD~1
-"$CLI" use "$A" >/dev/null 2>&1
+# This is the first `use` in a fresh CLI process, so repo_identity's memo
+# (_REPO_IDENTITY_CACHE_KEYS) is still empty on its first call — the case that
+# broke bash 3.2 under set -u before its array expansions were guarded.
+rc=0; "$CLI" use "$A" >/dev/null 2>&1 || rc=$?
+check "use succeeds with repo_identity's memo empty" "0" "$rc"
 check "use overlays current toolchain"        "v4-30-0" "$(live_slug "$A")"
 gitc "$A" reset --hard -q "$b31"
 check "reset --hard repoints overlay"         "v4-31-0" "$(live_slug "$A")"

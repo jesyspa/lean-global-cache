@@ -307,7 +307,7 @@ toolchain_installed() { # arg: toolchain
 _REPO_IDENTITY_CACHE_KEYS=(); _REPO_IDENTITY_CACHE_VALS=()
 repo_identity() {
   local proj="$1" idx
-  if idx="$(index_of_key "$proj" "${_REPO_IDENTITY_CACHE_KEYS[@]}")"; then
+  if idx="$(index_of_key "$proj" ${_REPO_IDENTITY_CACHE_KEYS[@]:+"${_REPO_IDENTITY_CACHE_KEYS[@]}"})"; then
     _RI="${_REPO_IDENTITY_CACHE_VALS[$idx]}"
     return 0
   fi
@@ -878,7 +878,7 @@ cmd_verify() {
   # repo (fix-filemode backfills older caches); without it, normalize_perms'
   # exec-bit flip makes every consumer build spam "local changes" warnings.
   local s repo bad
-  for s in "${slugs[@]}"; do
+  for s in ${slugs[@]:+"${slugs[@]}"}; do
     bad=0
     for repo in "$LAKES/$s/packages"/*/; do
       [[ -e "$repo/.git" ]] || continue
@@ -897,19 +897,22 @@ cmd_verify() {
     line="${line% (default)}"
     case "$line" in leanprover/lean4:v*) ;; *) continue ;; esac
     s="$( { normalize_version "$line" && printf '%s' "$SLUG"; } 2>/dev/null )" || continue
-    if idx="$(index_of_key "$s" "${tc_slug_keys[@]}")"; then
+    if idx="$(index_of_key "$s" ${tc_slug_keys[@]:+"${tc_slug_keys[@]}"})"; then
       tc_slug_vals[$idx]="$line"
     else
       tc_slug_keys+=("$s"); tc_slug_vals+=("$line")
     fi
   done < <(elan toolchain list 2>/dev/null || true)
-  for idx in "${!tc_slug_keys[@]}"; do
+  # `${!tc_slug_keys[@]:+...}` doesn't compose ("indirect + default" collide in
+  # bash's parser), so index the array by count instead — safe on an empty
+  # array under set -u without any array expansion at all.
+  for ((idx = 0; idx < ${#tc_slug_keys[@]}; idx++)); do
     s="${tc_slug_keys[$idx]}"
     [[ -d "$LAKES/$s/packages" ]] \
       || warn "orphan elan toolchain ${tc_slug_vals[$idx]}: no matching cache at $LAKES/$s/packages (run '$PROG install <version>' to add it, or remove the toolchain with elan)"
   done
-  for s in "${slugs[@]}"; do
-    index_of_key "$s" "${tc_slug_keys[@]}" >/dev/null \
+  for s in ${slugs[@]:+"${slugs[@]}"}; do
+    index_of_key "$s" ${tc_slug_keys[@]:+"${tc_slug_keys[@]}"} >/dev/null \
       || warn "orphan cache dir $LAKES/$s: no matching elan toolchain (run '$PROG install <version>' to add it, or '$PROG uninstall <version>' to remove the orphaned cache)"
   done
 
@@ -1701,14 +1704,14 @@ prune_builds_under() {
     dirs+=("$d")
     slug="${d##*/}"; ts="$(build_published_at "$d")"
     ts_of_keys+=("$d"); ts_of_vals+=("$ts")
-    if idx="$(index_of_key "$slug" "${latest_keys[@]}")"; then
+    if idx="$(index_of_key "$slug" ${latest_keys[@]:+"${latest_keys[@]}"})"; then
       [[ "$ts" -gt "${latest_vals[$idx]}" ]] && latest_vals[$idx]="$ts"
     else
       latest_keys+=("$slug"); latest_vals+=("$ts")
     fi
     if build_is_green "$d"; then
       green_of_keys+=("$d")
-      if idx="$(index_of_key "$slug" "${latest_green_keys[@]}")"; then
+      if idx="$(index_of_key "$slug" ${latest_green_keys[@]:+"${latest_green_keys[@]}"})"; then
         [[ "$ts" -gt "${latest_green_vals[$idx]}" ]] && latest_green_vals[$idx]="$ts"
       else
         latest_green_keys+=("$slug"); latest_green_vals+=("$ts")
@@ -1717,13 +1720,13 @@ prune_builds_under() {
   done < <(find "$repo" -mindepth 2 -maxdepth 2 -type d -print0 2>/dev/null)
   # Pass 2: drop builds that are neither newest-per-slug nor newest-green-per-slug
   # and are older than the window.
-  for d in "${dirs[@]}"; do
+  for d in ${dirs[@]:+"${dirs[@]}"}; do
     slug="${d##*/}"
-    idx="$(index_of_key "$d" "${ts_of_keys[@]}")"; ts="${ts_of_vals[$idx]}"
-    idx="$(index_of_key "$slug" "${latest_keys[@]}")" && latest_ts="${latest_vals[$idx]}" || latest_ts=0
+    idx="$(index_of_key "$d" ${ts_of_keys[@]:+"${ts_of_keys[@]}"})"; ts="${ts_of_vals[$idx]}"
+    idx="$(index_of_key "$slug" ${latest_keys[@]:+"${latest_keys[@]}"})" && latest_ts="${latest_vals[$idx]}" || latest_ts=0
     [[ "$ts" -eq "$latest_ts" ]] && continue   # newest per slug: keep
-    idx="$(index_of_key "$slug" "${latest_green_keys[@]}")" && latest_green_ts="${latest_green_vals[$idx]}" || latest_green_ts=0
-    if [[ "$ts" -eq "$latest_green_ts" ]] && index_of_key "$d" "${green_of_keys[@]}" >/dev/null; then
+    idx="$(index_of_key "$slug" ${latest_green_keys[@]:+"${latest_green_keys[@]}"})" && latest_green_ts="${latest_green_vals[$idx]}" || latest_green_ts=0
+    if [[ "$ts" -eq "$latest_green_ts" ]] && index_of_key "$d" ${green_of_keys[@]:+"${green_of_keys[@]}"} >/dev/null; then
       continue                                          # newest green per slug: keep
     fi
     [[ "$ts" -lt "$cutoff" ]] || continue               # within window: keep

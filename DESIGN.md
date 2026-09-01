@@ -3,18 +3,16 @@
 ## Problem
 
 `/opt/bots/lean` holds the shared Lean toolchains (`elan/`) and a per-version
-mathlib package cache (`lakes/<slug>/packages/`). Historically it was
-`bots`-group-writable with a permissive default ACL, and every bot wrote into
-it directly. Two failure modes followed:
+mathlib package cache (`lakes/<slug>/packages/`). A group-writable cache that
+every bot writes into directly has two failure modes:
 
-1. **Clobbering.** A bot doing `lake update`, `git checkout`, or `lake exe cache
-   get` inside the *shared* package checkouts mutated them for everyone — e.g.
-   checking out the wrong mathlib rev corrupted the cache other bots were using.
-2. **Permission lottery.** Each version was owned by whoever published it
-   (`v4-28-0` by devbot, `v4-30-0` by brainbot) under whatever umask that
-   session happened to have. One publish ran under umask 077, leaving ~8200
-   oleans mode 600 and the whole version unreadable to the rest of the group
-   until it was hand-repaired with `setfacl`.
+1. **Clobbering.** A bot running `lake update`, `git checkout`, or `lake exe
+   cache get` inside the *shared* package checkouts mutates them for everyone:
+   checking out the wrong mathlib rev corrupts the cache the others are using.
+2. **Permission lottery.** Each version ends up owned by whoever published it,
+   under whatever umask that session happened to have. A single publish under
+   umask 077 leaves all ~8200 of a version's oleans mode 600 and the whole
+   version unreadable to the rest of the group, repairable only by hand.
 
 ## Portability / configuration
 
@@ -43,8 +41,8 @@ only read. This is enforced two ways:
   strips the per-file ACLs, and removes group/other write.
 - All mutation flows through the `lean-cache` CLI, which forces `umask 022` and
   runs a deterministic permission-normalization pass (`u=rwX,go=rX`, setgid on
-  dirs) on everything it writes — so readability no longer depends on the
-  caller's environment.
+  dirs) on everything it writes, so readability does not depend on the caller's
+  environment.
 
 Mutating subcommands (`install`/`uninstall`) re-exec as `OWNER` via a
 tightly-scoped sudoers rule (`admin/install-sudoers.sh`), so any group member
@@ -58,15 +56,15 @@ A consuming project overlays its `.lake/packages` onto the shared
 `lakes/<slug>/packages` (see "Consumer overlay" below). Lake reads mathlib's
 prebuilt oleans from the shared tree but writes the project's *own* build
 artifacts into the project-local `.lake/build`. Nothing in a normal consumer
-build needs to write into the shared `packages/`. The cases that used to write
-there — `lake update`, `cache get`, dependency rebuilds — are exactly the
-clobbering we are removing; under this model they happen once, at install time,
-performed by the owner.
+build needs to write into the shared `packages/`. The operations that would
+write there — `lake update`, `cache get`, dependency rebuilds — are exactly the
+clobbering this model removes; they happen once, at install time, performed by
+the owner.
 
-A direct consequence worth stating: a project pinned to a mathlib rev/toolchain
-that is **not installed** will no longer silently rebuild into the shared tree.
-It fails loudly instead. Version discipline becomes mandatory rather than
-best-effort — which is the intended outcome.
+A direct consequence worth stating: a project pinned to a mathlib
+rev/toolchain that is **not installed** cannot silently rebuild into the shared
+tree. It fails loudly instead, which makes version discipline mandatory rather
+than best-effort — the intended outcome.
 
 ## `install` internals
 
@@ -140,63 +138,44 @@ shared cache precisely to avoid cross-project conflicts.
 
 ### Repos with several Lake projects
 
-The CLI assumed one Lake project per invocation path, and specifically decided
-whether a path *was* one by checking only for `$proj/lean-toolchain` —
-`lakefile.toml`/`lakefile.lean` presence never entered into it. That broke on
-a repo laid out as several independent Lake projects (`examples/`,
-`homework/hw00/`, `homework/hw01/`, each its own project) below a root that
-itself carries a `lean-toolchain` pin (e.g. so bare `lean`/editor tooling at
-the root resolves *some* toolchain) but no lakefile of its own: the old check
-saw the root's `lean-toolchain` and treated the root itself as the project to
-overlay, so `use`/`refresh` operated on the root — deriving a version from its
-pin, overlaying (or checking staleness of) `$root/.lake/packages` — while
-never looking at the real projects below it, which kept no overlay at all.
-Opening one of those in an editor made Lake clone mathlib and its whole
-closure from the network instead of reading the shared cache (hundreds of MB,
-once observed at 666 MB for a single subproject). A root with *no*
-`lean-toolchain` at all failed even more visibly: `refresh` returned early as
-a no-op before touching anything.
+`is_lake_project()` decides whether a path is a Lake project: it requires
+`lakefile.toml` or `lakefile.lean` **and** `lean-toolchain` in the same
+directory. That is the gate for whether `use` (with no version given),
+`refresh`, `seed-build`, `clean`, and `publish-build` treat a path as a direct
+target.
 
-The fix: `is_lake_project()` — `lakefile.toml`/`lakefile.lean` **and**
-`lean-toolchain` in the same directory — replaces the lean-toolchain-only
-check as the gate for whether `use` (with no version given), `refresh`,
-`seed-build`, `clean`, and `publish-build` treat a path as a direct target.
-When a path fails that check — whether because it has no `lean-toolchain` at
-all, or because it has one but no lakefile of its own — `find_lake_projects`
-looks *beneath* it for directories that ARE Lake projects by the strict
-check, depth-limited (`-maxdepth 6`) and pruning `.lake` (a project's own
-dependency checkouts, which would otherwise surface as spurious nested
-"projects") and `.git`. `run_on_subprojects` then re-invokes the same command
-on each one found, in a subshell per project so one project's `die` aborts
-only that project's sweep entry, not the others. If the sweep finds nothing
-below the path either, each command falls back to its original
-lean-toolchain-only behavior on the path itself (rather than a hard
-not-a-project error/no-op it didn't use to have) — so a directory carrying
-only a `lean-toolchain` and no children still behaves exactly as before. A
-path that already satisfies `is_lake_project` skips the sweep entirely: this
-is additive, reached only on the path that used to be (incompletely) treated
-as "not a project." `use` also skips the sweep whenever a version is given
-explicitly, since a version names one direct target, not "apply this version
-everywhere below."
+A path that fails the gate is swept instead. `find_lake_projects` looks
+*beneath* it for directories that are Lake projects by the same strict check,
+depth-limited (`-maxdepth 6`) and pruning `.lake` (a project's own dependency
+checkouts, which would otherwise surface as spurious nested "projects") and
+`.git`. `run_on_subprojects` re-invokes the command on each one found, in a
+subshell per project so one project's `die` aborts only that project's sweep
+entry, not the others. If the sweep finds nothing below the path either, each
+command falls back to treating the path itself as the target on the strength
+of its `lean-toolchain` alone, so a directory carrying only a pin and no
+children still works.
 
-Separately, the post-checkout/reference-transaction hook bodies carried their
-own `[[ -f "$root/lean-toolchain" ]] || exit 0` fast-path guard *before* even
-calling `lean-cache refresh` — a narrower issue than the one above, since it
-only silences a root with no `lean-toolchain` pin of its own at all (not the
-pinned-root-no-lakefile shape the courses-admin repo actually has, where the
-guard passed and `refresh` ran, just against the wrong target). That guard is
-removed too, so a genuinely pin-less root also reaches `refresh`'s own
-discovery rather than being skipped a layer earlier. Existing installed hooks
-pick this up on their next `use`/`refresh` regeneration, same as any other
-hook-body fix.
+The sweep is what makes a repo laid out as several independent Lake projects
+(`examples/`, `homework/hw00/`, `homework/hw01/`) work without per-project
+wiring, including the common shape where the root carries a `lean-toolchain`
+pin — so bare `lean` and editor tooling at the root resolve *some* toolchain —
+but no lakefile of its own. Judging that root by its pin alone would overlay
+the root and leave the real projects below it with no overlay at all, and
+opening one of those in an editor makes Lake clone mathlib and its whole
+closure from the network instead of reading the shared cache (hundreds of MB;
+666 MB for one observed subproject).
 
-Cost: a path that fails `is_lake_project` now pays one `find` (bounded,
-`.lake`/`.git`-pruned) per `refresh` invocation — including from the
-high-frequency `reference-transaction` hook — instead of the previous
-zero-cost early exit (or, for the pinned-root-no-lakefile shape, instead of
-operating directly and uselessly on the root). A path that already satisfies
-`is_lake_project` is unaffected: that check still short-circuits before any
-discovery runs.
+`use` skips the sweep whenever a version is given explicitly: a version names
+one direct target, not "apply this version everywhere below." The
+post-checkout and reference-transaction hook bodies call `lean-cache refresh`
+unconditionally rather than guarding on a `lean-toolchain` at the root, so a
+pin-less root reaches `refresh`'s own discovery instead of being skipped a
+layer earlier.
+
+Cost: a path that fails `is_lake_project` pays one bounded, `.lake`/`.git`-
+pruned `find` per `refresh` invocation, including from the high-frequency
+`reference-transaction` hook. A path that satisfies it is unaffected — that
+check short-circuits before any discovery runs.
 
 ### Wiring elan to the shared toolchain
 
@@ -223,27 +202,19 @@ to for the invoking process — that is deliberate: it is what lets `~/.elan`
 follow a reconfigured `ROOT` (a host migration, a multi-user config change)
 without the caller having to notice and fix it by hand, and `ROOT` itself is
 already meant to be overridable per-invocation via `LEAN_CACHE_ROOT` (env var
-is the *highest*-precedence config source — see Configuration). Once, `test.sh`
-ran real `"$CLI" use` calls under a throwaway `LEAN_CACHE_ROOT` without also
-isolating `HOME`, and `wire_elan` did exactly what it's for: repointed the
-invoking (real) user's `~/.elan` at the throwaway cache's elan dir. `mktemp -d`
-cleaning that dir up on exit then left `~/.elan` dangling — every bare
-`lean`/`lake` broken until the next real `use` — with nothing surfaced,
-because the test redirects the CLI's stderr (where `wire_elan` does log the
-repoint) to `/dev/null`. The fix is hermeticity, not distrust: `test.sh` now
-exports a throwaway `HOME` before the first `use` call in its hermetic
-section (previously only the elan-wiring section's own cases scoped their own
-`HOME`; every other section's `use` calls did not), so `~/.elan` is never in
-the blast radius of a `LEAN_CACHE_ROOT` the test suite controls.
-`wire_elan` itself was deliberately left alone: it has no way to distinguish
-a test's throwaway `ROOT` from a legitimate reconfiguration, because from
-its perspective the environment *is* the configuration surface — same as
-every other `LEAN_CACHE_*` override the CLI honors. Making it second-guess
-`ROOT` would either break the legitimate reconfiguration case it exists for,
+is the *highest*-precedence config source — see Configuration).
+
+`wire_elan` cannot distinguish a throwaway `ROOT` from a legitimate
+reconfiguration: from its perspective the environment *is* the configuration
+surface, same as every other `LEAN_CACHE_*` override the CLI honors. Making it
+second-guess `ROOT` would either break the reconfiguration case it exists for,
 or require guessing at what a "real" cache directory looks like, which is
 exactly the kind of heuristic that fails silently on the next unanticipated
-layout. Nothing in `use`'s own contract is unsafe here; the unsafety was
-entirely in a caller (`test.sh`) exercising it against real process state.
+layout. Isolation is therefore the caller's job: anything that points
+`LEAN_CACHE_ROOT` at a temporary tree must isolate `HOME` as well, or
+`wire_elan` repoints the real user's `~/.elan` at a directory about to be
+deleted, leaving every bare `lean`/`lake` broken. `test.sh` exports a throwaway
+`HOME` before the first `use` call in its hermetic section for this reason.
 
 Inside a project the `lean-toolchain` file selects the toolchain, so wiring is
 all a consumer needs. *Outside* any project, bare `lean`/`lake` fall back to
@@ -424,7 +395,7 @@ a Lake project so a recycler can call it unconditionally.
 ## Pre-push build gate
 
 A targeted check (`lake build <submodule>`, `lake env lean <file>`) can report
-green on non-compiling code via stale-olean replay, which once let a
+green on non-compiling code via stale-olean replay, which is enough to let a
 non-compiling commit reach `main`. The `pre-push` hook closes that gap: for any
 project with a lakefile, before allowing a push that changes `*.lean`, it
 
@@ -494,9 +465,9 @@ shim.
 
 ## Host-wide build serialization
 
-Concurrent full `lake build`s from several sessions oversubscribe the host
-(observed: four cold builds stacked on six cores, load ~20, a 10-line check
-taking 24 minutes), and every build crawls instead of a few finishing fast. But
+Concurrent full `lake build`s from several sessions oversubscribe the host —
+four cold builds on six cores drive load to ~20 and stretch a 10-line check to
+24 minutes — and every build crawls instead of a few finishing fast. But
 most builds are *warm* — a fresh worktree seeded from the store, or an
 incremental rebuild after an edit — and serializing those would add pointless
 queueing to the common, cheap case. So the policy serializes **only cold/full
@@ -561,8 +532,8 @@ The policy reads that regime for a cold build:
 A build already riding a parent's slot (`LEAN_CACHE_BUILD_SLOT_HELD`) short-
 circuits all of this and completes in place — the parent already committed to
 building, so a nested build must finish, never bail. `lean-cache build` is an
-explicit alias for the same policy; instances no longer need it, but it stays
-useful (and `--wait` maps to force-wait).
+explicit alias for the same policy, useful where the shim is not installed or
+where `--wait` is wanted (it maps to force-wait).
 
 `use`'s auto-install applies the same foreground bail. `lean-cache use` on a
 not-yet-installed version otherwise launches a multi-minute cold install, which

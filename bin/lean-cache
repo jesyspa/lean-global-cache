@@ -64,7 +64,7 @@ CALLER_PATH="$PATH"          # the caller's PATH, before we prepend the shared e
 PATH="$ELAN_HOME/bin:$PATH"
 
 # Per-user store of warm PROJECT build artifacts (.lake/build), keyed by
-# (repo, commit, toolchain slug). Unlike the mathlib package cache above, this
+# (repo, project-relative path, commit, toolchain slug). Unlike the mathlib cache, this
 # is owned by the invoking user, not the shared cache OWNER: a project's
 # .lake/build is per-worktree and reproducible, and the worktrees that share it
 # all belong to one user. Defaults under the user's cache dir, on the same
@@ -72,7 +72,7 @@ PATH="$ELAN_HOME/bin:$PATH"
 # LEAN_CACHE_BUILDS (or BUILDS in the config file).
 BUILDS="${LEAN_CACHE_BUILDS:-${BUILDS:-${XDG_CACHE_HOME:-$HOME/.cache}/lean-global-cache/builds}}"
 
-# Rotation window for stored builds: the newest build per (repo, toolchain) is
+# Rotation window: the newest build per (repo, project, toolchain) is
 # kept indefinitely (it is "latest main"); any other build published more than
 # this many days ago is pruned. Override with LEAN_CACHE_BUILD_KEEP_DAYS.
 BUILD_KEEP_DAYS="${LEAN_CACHE_BUILD_KEEP_DAYS:-${BUILD_KEEP_DAYS:-7}}"
@@ -112,9 +112,7 @@ have_flock() {
   [[ "$_HAVE_FLOCK" -eq 1 ]]
 }
 
-# One-shot warnings for the flock-missing degradations, so a command that hits
-# the same degraded path more than once (e.g. install's build slot and its own
-# mutex) still warns only once per kind, per process.
+# One-shot warnings for unavailable slot serialization and portable mutexes.
 _WARNED_NO_FLOCK_SLOT=0
 _WARNED_NO_FLOCK_MUTEX=0
 warn_no_flock_slot() {
@@ -122,10 +120,10 @@ warn_no_flock_slot() {
   _WARNED_NO_FLOCK_SLOT=1
   log "WARNING: flock(1) not found (macOS ships none); running unserialized, same as LEAN_CACHE_BUILD_SLOTS=0"
 }
-warn_no_flock_mutex() { # arg: what the skipped mutex normally guards
+warn_no_flock_mutex() { # arg: mutex path
   [[ "$_WARNED_NO_FLOCK_MUTEX" -eq 1 ]] && return 0
   _WARNED_NO_FLOCK_MUTEX=1
-  log "WARNING: flock(1) not found (macOS ships none); $1 is not locked — concurrent lean-cache runs are UNSAFE on this host. Run one lean-cache operation at a time."
+  log "flock(1) not found; using a directory mutex for $1"
 }
 
 # Append one event to this user's log file. Line format (tab-separated):
@@ -142,6 +140,46 @@ log_event() { # args: event [key=value ...]
   [[ -d "$LOG_DIR" ]] || mkdir -p "$LOG_DIR" 2>/dev/null || return 0
   printf '%s\n' "$line" >> "$LOG_DIR/events.$ME.log" 2>/dev/null || true
   return 0
+}
+
+# GNU and BSD userlands expose different stat and SHA-1 commands.
+file_owner() { stat -c '%U' "$1" 2>/dev/null || stat -f '%Su' "$1"; }
+file_mtime() { stat -c '%Y' "$1" 2>/dev/null || stat -f '%m' "$1"; }
+sha1() {
+  if command -v sha1sum >/dev/null 2>&1; then sha1sum
+  else shasum -a 1; fi
+}
+
+MUTEX_DIR=""
+release_mutex() {
+  [[ -z "$MUTEX_DIR" ]] || rmdir "$MUTEX_DIR" 2>/dev/null || true
+}
+acquire_mutex() { # arg: lock-file path
+  if have_flock; then
+    { exec 9>"$1"; } 2>/dev/null || return 1
+    flock -n 9 || { log "lock busy: $1; retry this operation"; return 1; }
+  else
+    warn_no_flock_mutex "$1"
+    mkdir "$1.d" 2>/dev/null || {
+      log "lock busy: $1.d; retry, or remove this directory only after confirming its holder has exited"
+      return 1
+    }
+    MUTEX_DIR="$1.d"
+    trap release_mutex EXIT
+  fi
+}
+
+# Readers, publishers and pruning share one store mutex. Keep the critical
+# section short: builds run before acquiring it. Call in a subshell so fd 9
+# closes on return, including when this command is called from use/refresh.
+lock_build_store() {
+  mkdir -p "$BUILDS" || return 1
+  acquire_mutex "$BUILDS/.store.lock"
+}
+
+lock_version() {
+  mkdir -p "$LAKES" || return 1
+  acquire_mutex "$LAKES/.$SLUG.lock"
 }
 
 # Count non-empty lines in $1 without a printf|grep -c fork.
@@ -226,7 +264,7 @@ Usage: $PROG <command> [args]
                         cleans each of those instead.
   prune-builds [--keep-days N]
                         Rotate the warm-build store: keep the newest build per
-                        (repo, toolchain) indefinitely, drop any other older than
+                        (repo, project, toolchain) indefinitely, drop any other older than
                         N days (default $BUILD_KEEP_DAYS). Runs after each publish,
                         and opportunistically (at most once a day) at the end of
                         \`use\`.
@@ -314,10 +352,8 @@ toolchain_installed() { # arg: toolchain
   return 1
 }
 
-# Stable identity for the repo a worktree belongs to. All worktrees of one repo
-# share a common git dir, so its realpath identifies the repo on this host; we
-# slugify it as "<workdir-basename>-<short-hash>" so two repos that happen to
-# share a basename never collide on one key.
+# Stable identity for one Lake project across worktrees: hash the common git
+# directory and project-relative path. The basename is for display only.
 #
 # Sets $_RI rather than printing, and memoizes per $proj: callers like
 # cmd_seed_build/cmd_publish_build each need this several times per invocation
@@ -339,8 +375,14 @@ repo_identity() {
   local base hash
   base="${gitdir%/*}"; base="${base##*/}"
   [[ -n "$base" && "$base" != "." && "$base" != "/" ]] || base="repo"
-  hash="$(printf '%s' "$gitdir" | sha1sum)"; hash="${hash:0:12}"
-  _RI="$base-$hash"
+  # The relative project path distinguishes sibling Lake projects while
+  # remaining identical across linked worktrees. Namespace v2 accepts only
+  # entries keyed with this project-aware identity.
+  local prefix
+  prefix="$(git -C "$proj" rev-parse --show-prefix 2>/dev/null)" || return 1
+  hash="$(printf '%s\0%s' "$gitdir" "$prefix" | sha1)" || return 1
+  hash="${hash:0:12}"
+  _RI="$base-v2-$hash"
   _REPO_IDENTITY_CACHE_KEYS+=("$proj"); _REPO_IDENTITY_CACHE_VALS+=("$_RI")
 }
 
@@ -359,8 +401,8 @@ build_store_for() { # args: proj commit slug
 normalize_build_store() {
   local dir="$1"
   [[ -d "$dir" ]] || return 0
-  find "$dir" -type d -exec chmod u=rwx,go=rx {} +
-  find "$dir" -type f -exec chmod a=r {} +
+  find "$dir" -type d -exec chmod u=rwx,go=rx {} + || return 1
+  find "$dir" -type f -exec chmod a=r {} + || return 1
 }
 
 # Hardlink (*.olean) or copy (everything else) a build tree from src into dst.
@@ -370,16 +412,19 @@ normalize_build_store() {
 # rewritten *in place* by Lake when it rebuilds a module, so they are copied as
 # writable, worktree-owned files — never linked back to the shared store.
 seed_tree() { # args: src dst
-  local src="$1" dst="$2" f rel
+  local src="$1" dst="$2" f rel files
   [[ -d "$src" ]] || return 0
+  files="$(mktemp "${dst}.files.XXXXXX")" || return 1
+  find "$src" -type f -print0 > "$files" || return 1
   while IFS= read -r -d '' f; do
-    rel="${f#"$src"}"; mkdir -p "$dst${rel%/*}"
+    rel="${f#"$src"}"; mkdir -p "$dst${rel%/*}" || return 1
     if [[ "$f" == *.olean ]]; then
-      ln -f "$f" "$dst$rel" 2>/dev/null || { cp -p "$f" "$dst$rel"; chmod u+w "$dst$rel"; }
+      ln -f "$f" "$dst$rel" 2>/dev/null || { cp -p "$f" "$dst$rel" && chmod u+w "$dst$rel"; } || return 1
     else
-      cp -p "$f" "$dst$rel"; chmod u+w "$dst$rel"
+      cp -p "$f" "$dst$rel" && chmod u+w "$dst$rel" || return 1
     fi
-  done < <(find "$src" -type f -print0)
+  done < "$files"
+  rm -f "$files"
 }
 
 # True when the worktree carries nothing that could make its build differ from
@@ -388,7 +433,8 @@ seed_tree() { # args: src dst
 # cannot enter the build, so they don't count. Only a clean-tree build attests
 # the *commit* itself, which is what a published build's tree_clean records.
 tree_clean_for_build() { # arg: proj
-  local line
+  local line status
+  status="$(git -C "$1" status --porcelain -uall --ignore-submodules 2>/dev/null)" || return 1
   while IFS= read -r line; do
     case "$line" in
       '') ;;
@@ -398,7 +444,7 @@ tree_clean_for_build() { # arg: proj
               esac ;;
       *) return 1 ;;
     esac
-  done < <(git -C "$1" status --porcelain -uall --ignore-submodules 2>/dev/null)
+  done <<<"$status"
   return 0
 }
 
@@ -842,7 +888,7 @@ cmd_check_env() {
   # Consumer git-trust: without it Lake mistakes the OWNER-owned dep repos for a
   # changed URL and re-clones. `use` registers these; the OWNER needs nothing.
   if [[ "$ME" != "$OWNER" ]]; then
-    local anyrepo; anyrepo="$(find "$LAKES" -maxdepth 4 -name .git -printf '%h\n' -quit 2>/dev/null || true)"
+    local anyrepo; anyrepo="$(find "$LAKES" -maxdepth 4 -name .git -exec dirname {} \; -quit 2>/dev/null || true)"
     if [[ -z "$anyrepo" ]]; then :
     elif git -C "$anyrepo" rev-parse --git-dir >/dev/null 2>&1; then pass "cache repos are git-trusted (no re-clone)"
     else warn "cache repos not git-trusted; run 'lean-cache use' in a project, or: git config --global --add safe.directory \"$LAKES/*\""; fi
@@ -956,7 +1002,7 @@ cmd_verify() {
   local now p mtime age; now="$(date +%s)"
   for p in "$LAKES"/.build.* "$LAKES"/*/.packages.incoming.* "$LAKES"/*/.packages.old.*; do
     [[ -e "$p" ]] || continue
-    mtime="$(stat -c '%Y' "$p" 2>/dev/null || echo "$now")"
+    mtime="$(file_mtime "$p" 2>/dev/null || echo "$now")"
     age=$(( now - mtime ))
     [[ "$age" -gt 86400 ]] \
       && warn "stale install scratch: $p (~$(( age / 86400 ))d old; a fresh one may be an in-flight install)"
@@ -1047,6 +1093,7 @@ cmd_fix_perms() {
 _install_exit() {
   local rc=$?
   rm -rf "${build:-}"
+  release_mutex
   local ok=1; [[ "$rc" -eq 0 ]] || ok=0
   log_event install slug="${INSTALL_SLUG:-}" secs="$(( $(date +%s) - ${INSTALL_T0:-0} ))" \
     ok="$ok" forced="${INSTALL_FORCED:-0}"
@@ -1082,15 +1129,8 @@ cmd_install() {
   # every exit path, so a failure (any `die`) records ok=0 as well.
   INSTALL_SLUG="$SLUG"; INSTALL_FORCED="$force"; INSTALL_T0="$(date +%s)"
 
-  # Serialize installs of the same version. No flock(1) (macOS): skip the
-  # mutex and proceed — see warn_no_flock_mutex.
-  mkdir -p "$LAKES"
-  if have_flock; then
-    exec 9>"$LAKES/.$SLUG.lock"
-    flock -n 9 || die "another install of $SLUG is in progress"
-  else
-    warn_no_flock_mutex "the install lock for $SLUG"
-  fi
+  # Serialize installs and uninstalls of the same version.
+  lock_version || return 1
 
   # Clear stale build dirs and half-published trees from a previously-interrupted
   # install of this version (safe under the lock — only this slug's scratch dirs
@@ -1216,12 +1256,13 @@ cmd_uninstall() {
   [[ $# -eq 1 ]] || usage
   normalize_version "$1"
   require_owner uninstall "$1"
+  lock_version || return 1
 
   local removed=0
 
   local dest; dest="$(dest_for "$SLUG")"
   if [[ -d "$dest" ]]; then
-    local dest_owner; dest_owner="$(stat -c '%U' "$dest")"
+    local dest_owner; dest_owner="$(file_owner "$dest")"
     [[ "$dest_owner" == "$OWNER" ]] \
       || die "$dest is owned by $dest_owner, not $OWNER — refusing to remove"
     log "removing $dest"
@@ -1461,7 +1502,7 @@ cmd_use() {
   # nothing, so this never changes `use`'s output on the common day-fresh path.
   if [[ -d "$BUILDS" ]]; then
     local prune_stamp="$BUILDS/.last-prune" prune_stamp_age
-    prune_stamp_age="$(stat -c %Y "$prune_stamp" 2>/dev/null || echo 0)"
+    prune_stamp_age="$(file_mtime "$prune_stamp" 2>/dev/null || echo 0)"
     if [[ $(( $(date +%s) - prune_stamp_age )) -ge 86400 ]]; then
       cmd_prune_builds || true
       touch "$prune_stamp" 2>/dev/null || true
@@ -1551,7 +1592,7 @@ cmd_refresh() {
 # rather than preserving it: the replacement can't be a false green, and
 # preserving a stale build is what forces a needless full rebuild. Safe to call
 # from a hook.
-cmd_seed_build() {
+cmd_seed_build() (
   [[ $# -le 1 ]] || usage
   local proj="${1:-.}"
   proj="$(cd "$proj" 2>/dev/null && pwd)" || return 0
@@ -1567,6 +1608,9 @@ cmd_seed_build() {
 
   build_store_for "$proj" "$commit" "$SLUG" || return 0
   local store="$_BSF"
+  [[ -d "$BUILDS" ]] || { log_event seed hit=0 repo="$_RI" commit="${commit:0:12}" slug="$SLUG"; return 0; }
+  lock_build_store || return 1
+  recover_build_store "$store" || return 1
   if [[ ! -d "$store/lib" ]]; then            # no warm build stored for this exact (commit, slug)
     log_event seed hit=0 repo="$_RI" commit="${commit:0:12}" slug="$SLUG"
     return 0
@@ -1575,7 +1619,7 @@ cmd_seed_build() {
   # Safety: only hardlink out of a store we own and that is not group/other
   # writable — otherwise a hardlinked artifact could be mutated underneath a
   # worktree. On any doubt, skip seeding rather than risk a poisoned link.
-  local owner; owner="$(stat -c '%U' "$store" 2>/dev/null)"
+  local owner; owner="$(file_owner "$store" 2>/dev/null)"
   [[ "$owner" == "$ME" ]] || { log "build store $store not owned by $ME; skipping seed"; return 0; }
   local writable_path
   writable_path="$(find "$store" \( -perm -0020 -o -perm -0002 \) -print -quit 2>/dev/null)"
@@ -1583,15 +1627,21 @@ cmd_seed_build() {
     log "build store $store has group/other-writable files; skipping seed"; return 0
   fi
 
-  # Replace, don't merge: drop any existing lib/ir first so a stale leftover
-  # leaves no orphan oleans behind the seeded tree.
-  mkdir -p "$proj/.lake/build"
-  rm -rf "$proj/.lake/build/lib" "$proj/.lake/build/ir"
-  seed_tree "$store/lib" "$proj/.lake/build/lib"
-  seed_tree "$store/ir"  "$proj/.lake/build/ir"
+  # Finish copying before removing any local artifacts. A failed copy leaves
+  # the current build intact; the store mutex protects the source throughout.
+  mkdir -p "$proj/.lake/build" || return 1
+  local stage
+  stage="$(mktemp -d "$proj/.lake/build/.seed.XXXXXX")" || return 1
+  trap 'rm -rf "$stage"; release_mutex' EXIT
+  mkdir -p "$stage/lib" "$stage/ir" || return 1
+  seed_tree "$store/lib" "$stage/lib" || return 1
+  seed_tree "$store/ir" "$stage/ir" || return 1
+  rm -rf "$proj/.lake/build/lib" "$proj/.lake/build/ir" || return 1
+  mv "$stage/lib" "$proj/.lake/build/lib" || return 1
+  mv "$stage/ir" "$proj/.lake/build/ir" || return 1
   log_event seed hit=1 repo="$_RI" commit="${commit:0:12}" slug="$SLUG"
   log "seeded warm build for $TCVER @ ${commit:0:12} into $proj/.lake/build"
-}
+)
 
 # Reset a worktree to a cold state by removing its project build (.lake/build),
 # so a long-lived worktree reused across tenants does not carry a stale build
@@ -1621,7 +1671,7 @@ cmd_clean() {
 # manifest records that lake exited 0 (a green build). A non-green build is still
 # published (tree_clean=0) to seed future incremental builds, but never
 # overwrites a stored green build of the same commit.
-cmd_publish_build() {
+cmd_publish_build() (
   [[ $# -le 1 ]] || usage
   # Publishing must build synchronously; never take the cold-build bail path.
   export LEAN_CACHE_FORCE_WAIT=1
@@ -1657,21 +1707,13 @@ cmd_publish_build() {
   local green=0
   if run_lake_build "$proj" "$PROG publish-build"; then green=1; fi
   [[ -d "$proj/.lake/build/lib" ]] || die "$proj has no .lake/build/lib to publish"
+  [[ "$(git -C "$proj" rev-parse HEAD)" == "$commit" ]] && tree_clean_for_build "$proj" \
+    || die "project changed during build; refusing to publish"
 
   build_store_for "$proj" "$commit" "$SLUG"
   local store="$_BSF" rid="$_RI"
-  mkdir -p "$BUILDS"
-  # No flock(1) (macOS): skip the mutex and proceed — see warn_no_flock_mutex.
-  if have_flock; then
-    # Brace group, not `exec ... 2>/dev/null`: that would permanently redirect
-    # the script's stderr (killing all later log output), and a failed exec
-    # redirection exits a non-interactive shell before the || fallback runs.
-    { exec 9>"$BUILDS/.$rid-$commit-$SLUG.lock"; } 2>/dev/null \
-      || exec 9>"$BUILDS/.publish.lock"
-    flock -n 9 || die "another publish for this build is in progress"
-  else
-    warn_no_flock_mutex "the publish lock for $rid @ ${commit:0:12}"
-  fi
+  lock_build_store || return 1
+  recover_build_store "$store" || return 1
 
   # Never turn a stored green attestation into a non-green one: an interrupted or
   # failed rebuild at a commit already known green must not stale the entry.
@@ -1682,11 +1724,14 @@ cmd_publish_build() {
     return 0
   fi
 
-  mkdir -p "${store%/*}"
+  mkdir -p "${store%/*}" || return 1
   local incoming="${store}.incoming.$$"
-  rm -rf "$incoming"; mkdir -p "$incoming"
-  cp -a "$proj/.lake/build/lib" "$incoming/lib"
-  [[ -d "$proj/.lake/build/ir" ]] && cp -a "$proj/.lake/build/ir" "$incoming/ir"
+  trap 'rm -rf "$incoming"; release_mutex' EXIT
+  rm -rf "$incoming" && mkdir -p "$incoming" || return 1
+  cp -a "$proj/.lake/build/lib" "$incoming/lib" || return 1
+  if [[ -d "$proj/.lake/build/ir" ]]; then
+    cp -a "$proj/.lake/build/ir" "$incoming/ir" || return 1
+  fi
   local -a oleans=()
   local _olean
   while IFS= read -r _olean; do oleans+=("$_olean"); done \
@@ -1694,17 +1739,36 @@ cmd_publish_build() {
   printf 'repo=%s\ncommit=%s\ntoolchain=%s\nslug=%s\noleans=%s\npublished_by=%s\npublished_at=%s\ntree_clean=%s\n' \
     "$rid" "$commit" "$TOOLCHAIN" "$SLUG" \
     "${#oleans[@]}" "$ME" "$(date +%s)" "$green" \
-    > "$incoming/.seed-manifest"
-  normalize_build_store "$incoming"
+    > "$incoming/.seed-manifest" || return 1
+  normalize_build_store "$incoming" || return 1
+  [[ "$(git -C "$proj" rev-parse HEAD)" == "$commit" ]] && tree_clean_for_build "$proj" \
+    || { rm -rf "$incoming"; die "project changed during snapshot; refusing to publish"; }
 
-  rm -rf "$store"
-  mv "$incoming" "$store"
+  # Preserve the previous entry until replacement succeeds. All readers and
+  # pruning hold the same mutex, so none can observe the rename interval.
+  local old="${store}.old"
+  [[ ! -e "$store" ]] || mv "$store" "$old" || return 1
+  if ! mv "$incoming" "$store"; then
+    [[ ! -e "$old" ]] || mv "$old" "$store"
+    die "could not publish build snapshot"
+  fi
+  rm -rf "$old"
   log_event publish repo="$rid" commit="${commit:0:12}" slug="$SLUG" green="$green" secs=$(( $(date +%s) - pub_t0 ))
   log "published $([[ "$green" -eq 1 ]] && echo green || echo non-green) build for $TCVER @ ${commit:0:12} -> $store"
 
   # Rotate this repo's store: the build just published is now "latest" and is
   # kept; older non-latest builds past the window are dropped.
   prune_builds_under "$BUILDS/$rid" "$BUILD_KEEP_DAYS" || true
+)
+
+# Recover an interrupted replacement while holding the store mutex.
+recover_build_store() {
+  local store="$1" old="$1.old"
+  if [[ -d "$old" ]]; then
+    if [[ -d "$store" ]]; then rm -rf "$old" || return 1
+    else mv "$old" "$store" || return 1; fi
+  fi
+  return 0
 }
 
 # Epoch at which a stored build was published: from the manifest's published_at,
@@ -1712,7 +1776,7 @@ cmd_publish_build() {
 build_published_at() {
   local m="$1/.seed-manifest" t=""
   [[ -f "$m" ]] && t="$(sed -n 's/^published_at=//p' "$m" 2>/dev/null)"
-  [[ -n "$t" ]] || t="$(stat -c '%Y' "$m" 2>/dev/null || stat -c '%Y' "$1" 2>/dev/null || echo 0)"
+  [[ -n "$t" ]] || t="$(file_mtime "$m" 2>/dev/null || file_mtime "$1" 2>/dev/null || echo 0)"
   printf '%s' "$t"
 }
 
@@ -1731,6 +1795,11 @@ build_is_green() { # arg: build store dir
 prune_builds_under() {
   local repo="$1" keep_days="$2"
   [[ -d "$repo" ]] || return 0
+  local backup
+  for backup in "$repo"/*/*.old; do
+    [[ -d "$backup" ]] || continue
+    recover_build_store "${backup%.old}" || return 1
+  done
   local now cutoff; now="$(date +%s)"; cutoff=$(( now - keep_days * 86400 ))
   # bash 3.2 has no associative arrays; each map below is a pair of parallel
   # "keys"/"vals" arrays walked via index_of_key.
@@ -1743,7 +1812,7 @@ prune_builds_under() {
   # re-walking the tree and re-parsing every .seed-manifest a second time.
   local -a dirs=()
   while IFS= read -r -d '' d; do
-    case "$d" in *.incoming.*) continue ;; esac
+    case "$d" in *.incoming.*|*.old) continue ;; esac
     [[ -e "$d/.seed-manifest" || -d "$d/lib" ]] || continue
     dirs+=("$d")
     slug="${d##*/}"; ts="$(build_published_at "$d")"
@@ -1783,7 +1852,7 @@ prune_builds_under() {
 }
 
 # Rotate every repo's store by the policy above. Safe to run from cron.
-cmd_prune_builds() {
+cmd_prune_builds() (
   local keep_days="$BUILD_KEEP_DAYS"
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1794,12 +1863,13 @@ cmd_prune_builds() {
   done
   [[ "$keep_days" =~ ^[0-9]+$ ]] || die "--keep-days must be a non-negative integer"
   [[ -d "$BUILDS" ]] || return 0
+  lock_build_store || return 1
   local repo
   for repo in "$BUILDS"/*/; do
     [[ -d "$repo" ]] || continue
     prune_builds_under "${repo%/}" "$keep_days"
   done
-}
+)
 
 # Marker on every hook this CLI writes, so a later `use` may regenerate its own
 # hooks while never touching a hook some other tool installed.
@@ -1975,7 +2045,7 @@ cmd_commit_hint() {
   changed="$(git -C "$root" diff-tree --no-commit-id --name-only -r --root HEAD -- '*.lean' 2>/dev/null)" || return 0
   n="$(count_nonempty_lines "$changed")"
   [[ "$n" -gt 0 ]] || return 0
-  echo "lean-cache: committed changes to $n .lean file(s); run 'lean-cache publish-build' to store the warm build for reuse (a clean push publishes it automatically)." >&2
+  echo "lean-cache: committed changes to $n .lean file(s); run 'lean-cache publish-build' to store the warm build for reuse." >&2
 }
 
 cmd_config() {

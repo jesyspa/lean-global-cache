@@ -68,7 +68,7 @@ lean-cache's marker: pushing never waits on a build.
 
 `.lake/build` is per-worktree, so a fresh worktree cold-builds the whole project
 even when an identical build sits next door. `lean-cache` keeps a per-user
-store of warm builds keyed by repo, exact commit, and toolchain:
+store of warm builds keyed by repo, project-relative path, exact commit, and toolchain:
 
 ```bash
 lean-cache publish-build   # store this worktree's warm build
@@ -76,8 +76,8 @@ lean-cache publish-build   # store this worktree's warm build
 lean-cache use             # overlays packages AND seeds .lake/build
 ```
 
-Seeding requires an exact commit and toolchain match, so a stale build can
-never replay as a false green. The store lives under
+Seeding requires an exact project, commit, and toolchain match. Lake checks
+source and dependency changes when rebuilding seeded artifacts. The store lives under
 `~/.cache/lean-global-cache/builds` (`LEAN_CACHE_BUILDS`) and rotates itself;
 `lean-cache prune-builds` prunes it on demand.
 
@@ -90,12 +90,13 @@ sessions don't stack several thrashing builds onto the same cores;
 `lean-cache slots` shows which are held. `LEAN_CACHE_BUILD_SLOTS=0` turns
 serialization off.
 
-macOS ships no `flock(1)`, which this serialization needs. There, every
-affected command warns once to stderr and degrades instead of failing: build
-slots run unserialized (same as `LEAN_CACHE_BUILD_SLOTS=0`), `lean-cache
-slots` reports serialization unavailable, and the install/publish mutexes
-that guard the shared cache against concurrent writers are skipped — so on
-such a host, only run one `lean-cache` operation at a time.
+Without `flock(1)` (including stock macOS), build slots run unserialized and
+`lean-cache slots` reports serialization unavailable. Cache operations still
+lock: install/uninstall share a version mutex, and publishing, seeding, and
+pruning share a build-store mutex. Contention returns an error; retry afterward.
+The portable fallback uses lock directories and removes them on normal exit.
+After a killed process, remove a leftover lock directory only after confirming
+its holder has exited.
 
 A cold build cannot finish inside a bounded foreground Claude Code call, so
 there the policy prints the command to re-run and exits 75 — re-run it

@@ -101,7 +101,7 @@ no_flock_path() {
       mkdir -p "$stub"
       for f in "$d"/*; do
         base="$(basename "$f")"
-        [[ "$base" == flock ]] || ln -sf "$f" "$stub/$base" 2>/dev/null
+        [[ "$base" == flock || "$base" == sha1sum ]] || ln -sf "$f" "$stub/$base" 2>/dev/null
       done
       out+="${out:+:}$stub"
     else
@@ -840,6 +840,20 @@ group_noflock() {
 new_cache
 echo "== no flock(1) on PATH: degrade with a warning, never fail (hermetic) =="
 NFPATH="$(no_flock_path)"
+# Emulate BSD stat's interface while retaining hermetic GNU-host fixtures.
+BSD="$TMP/bsd"; mkdir -p "$BSD"
+REAL_STAT="$(command -v stat)"; export REAL_STAT
+cat > "$BSD/stat" <<'ST'
+#!/usr/bin/env bash
+[[ "$1" == -f ]] || exit 1
+case "$2" in
+  %Su) exec "$REAL_STAT" -c %U "$3" ;;
+  %m) exec "$REAL_STAT" -c %Y "$3" ;;
+  *) exit 1 ;;
+esac
+ST
+chmod +x "$BSD/stat"
+NFPATH="$BSD:$NFPATH"
 
 # cmd_slots: reports serialization unavailable instead of probing locks.
 out="$(PATH="$NFPATH" "$CLI" slots 2>&1)"; rc=$?
@@ -859,8 +873,7 @@ check "build warns flock missing and runs unserialized" "yes" \
   "$(printf '%s' "$out" | grep -q 'flock(1) not found' \
       && printf '%s' "$out" | grep -q 'unserialized' && echo yes || echo no)"
 
-# install: the per-version mutex is skipped — a safety warning, since it
-# normally guards the shared cache against a concurrent writer, not just speed.
+# install: the portable directory mutex guards the version without flock.
 export LEAN_CACHE_OWNER="$(id -un)"
 ISTUB="$TMP/istub"; mkdir -p "$ISTUB"
 cat > "$ISTUB/elan" <<'EL'
@@ -880,19 +893,107 @@ chmod +x "$ISTUB/lake"
 out="$(PATH="$ISTUB:$NFPATH" "$CLI" install 4.55.0 2>&1)"; rc=$?
 check "install succeeds with no flock on PATH"      "0"   "$rc"
 check "install published the version"               "yes" "$(has_dir "$TMP/cache/lakes/v4-55-0/packages")"
-check "install warns concurrent runs are unsafe"    "yes" \
-  "$(printf '%s' "$out" | grep -qi 'concurrent lean-cache runs are unsafe' && echo yes || echo no)"
+check "install used the portable mutex"    "yes" \
+  "$(printf '%s' "$out" | grep -q 'directory mutex' && echo yes || echo no)"
+check "install released the portable mutex" "no" "$(has_dir "$LEAN_CACHE_ROOT/lakes/.v4-55-0.lock.d")"
+mkdir "$LEAN_CACHE_ROOT/lakes/.v4-55-0.lock.d"
+rc=0; PATH="$ISTUB:$NFPATH" "$CLI" uninstall 4.55.0 >/dev/null 2>&1 || rc=$?
+check "portable version mutex blocks uninstall" "1" "$rc"
+rmdir "$LEAN_CACHE_ROOT/lakes/.v4-55-0.lock.d"
+PATH="$ISTUB:$NFPATH" "$CLI" uninstall 4.55.0 >/dev/null 2>&1
+check "uninstall supports BSD stat" "no" "$(has_dir "$LEAN_CACHE_ROOT/lakes/v4-55-0")"
 
-# publish-build: the per-build mutex is skipped the same way, and the build is
-# still stored.
+# publish-build uses the same portable mutex as seeding and pruning.
 P="$TMP/proj"; new_hooked_project "$P"
 rm -rf "$P/.lake/build"; mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE' > "$P/.lake/build/lib/lean/Proj/A.olean"
 c="$(gitc "$P" rev-parse HEAD)"
 out="$(PATH="$STUB:$NFPATH" "$CLI" publish-build "$P" 2>&1)"; rc=$?
 check "publish-build succeeds with no flock on PATH"  "0"   "$rc"
 check "publish-build still stores the build"          "yes" "$(haspub "$c")"
-check "publish-build warns concurrent runs are unsafe" "yes" \
-  "$(printf '%s' "$out" | grep -qi 'concurrent lean-cache runs are unsafe' && echo yes || echo no)"
+check "publish-build used the portable mutex" "yes" \
+  "$(printf '%s' "$out" | grep -q 'directory mutex' && echo yes || echo no)"
+check "publish released the portable mutex" "no" "$(has_dir "$LEAN_CACHE_BUILDS/.store.lock.d")"
+mkdir "$LEAN_CACHE_BUILDS/.store.lock.d"
+rc=0; PATH="$NFPATH" "$CLI" seed-build "$P" >/dev/null 2>&1 || rc=$?
+check "portable mutex blocks seed" "1" "$rc"
+rc=0; PATH="$NFPATH" "$CLI" prune-builds >/dev/null 2>&1 || rc=$?
+check "portable mutex blocks prune" "1" "$rc"
+rmdir "$LEAN_CACHE_BUILDS/.store.lock.d"
+PATH="$NFPATH" "$CLI" seed-build "$P" >/dev/null 2>&1
+check "seed released the portable mutex" "no" "$(has_dir "$LEAN_CACHE_BUILDS/.store.lock.d")"
+}
+
+group_review_regressions() {
+new_cache
+STUB="$TMP/stub"; write_lake_stub "$STUB"
+export LEAN_CACHE_BUILD_SLOTS=0
+M="$TMP/mono"; new_lake_project "$M" v4.30.0 A 'def a := 1'
+for p in a b; do
+  mkdir -p "$M/$p"
+  cp "$M/lean-toolchain" "$M/lakefile.toml" "$M/$p/"
+  mkdir -p "$M/$p/.lake/build/lib"
+  printf '%s' "$p" > "$M/$p/.lake/build/lib/$p.olean"
+done
+rm "$M/lean-toolchain" "$M/lakefile.toml"
+gitq "$M" add -A; gitq "$M" commit -qm subprojects
+PATH="$STUB:$PATH" "$CLI" publish-build "$M" >/dev/null 2>&1
+check "subprojects get separate stores" "2" "$(find "$LEAN_CACHE_BUILDS" -name .seed-manifest | wc -l | tr -d ' ')"
+"$CLI" seed-build "$M" >/dev/null 2>&1
+check "a seeds its own artifact" "a" "$(cat "$M/a/.lake/build/lib/a.olean")"
+check "a never receives b artifact" "no" "$([[ -e "$M/a/.lake/build/lib/b.olean" ]] && echo yes || echo no)"
+Q="$TMP/sibling"; gitq "$M" worktree add -q "$Q" HEAD
+"$CLI" seed-build "$Q" >/dev/null 2>&1
+check "subproject key is stable across worktrees" "b" "$(cat "$Q/b/.lake/build/lib/b.olean")"
+store="$(find "$LEAN_CACHE_BUILDS" -name a.olean)"; store="${store%/lib/a.olean}"
+
+# Every store operation must respect a reader/writer's lock.
+exec 7>"$LEAN_CACHE_BUILDS/.store.lock"; flock 7
+for op in seed-build publish-build; do
+  rc=0; PATH="$STUB:$PATH" "$CLI" "$op" "$M/a" >/dev/null 2>&1 || rc=$?
+  check "$op respects store mutex" "1" "$rc"
+done
+rc=0; "$CLI" prune-builds --keep-days 0 >/dev/null 2>&1 || rc=$?
+check "pruning respects store mutex" "1" "$rc"
+flock -u 7; exec 7>&-
+
+# A crashed replacement retains a recoverable prior snapshot.
+mv "$store" "$store.old"
+"$CLI" seed-build "$M/a" >/dev/null 2>&1
+check "seed recovers interrupted replacement" "a" "$(cat "$store/lib/a.olean")"
+
+# Copy failure must leave local artifacts intact, including in a sweep where
+# Bash disables errexit inside the dispatched functions.
+printf 'trace' > "$store/lib/a.trace"
+printf 'local' > "$M/a/.lake/build/lib/local.txt"
+mkdir "$TMP/badcopy"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/badcopy/cp"; chmod +x "$TMP/badcopy/cp"
+rc=0; PATH="$TMP/badcopy:$PATH" "$CLI" seed-build "$M" >/dev/null 2>&1 || rc=$?
+check "seed reports failed copy in sweep" "1" "$rc"
+check "failed seed preserves existing build" "local" "$(cat "$M/a/.lake/build/lib/local.txt")"
+
+# Use a build stub that edits tracked input or advances HEAD during the build.
+cat > "$STUB/lake" <<'LK'
+#!/usr/bin/env bash
+if [[ "$REVIEW_CHANGE" == dirty ]]; then
+  printf '\n# changed\n' >> lakefile.toml
+else
+  git -c core.hooksPath=/dev/null -c user.name=t -c user.email=t@t commit --allow-empty -qm advanced
+fi
+LK
+chmod +x "$STUB/lake"
+for change in dirty head; do
+  rc=0; PATH="$STUB:$PATH" REVIEW_CHANGE="$change" "$CLI" publish-build "$M/a" >/dev/null 2>&1 || rc=$?
+  check "publish rejects $change change during build" "1" "$rc"
+  gitq "$M" checkout -- a/lakefile.toml
+  check "rejected publish preserves stored build" "a" "$(cat "$store/lib/a.olean")"
+done
+
+# Uninstall must not remove a version another install holds.
+exec 7>"$LEAN_CACHE_ROOT/lakes/.v4-30-0.lock"; flock 7
+rc=0; "$CLI" uninstall 4.30.0 >/dev/null 2>&1 || rc=$?
+check "uninstall respects install mutex" "1" "$rc"
+check "blocked uninstall retains packages" "yes" "$(has_dir "$LEAN_CACHE_ROOT/lakes/v4-30-0/packages")"
+flock -u 7; exec 7>&-
 }
 
 group_seed() {
@@ -996,6 +1097,8 @@ echo "== commit reminder (hermetic) =="
 
 # commit-hint: reminds on a *.lean commit, silent when no *.lean changed.
 printf 'def a := 4\n' > "$P/Proj/A.lean"; gitq "$P" add Proj/A.lean; gitq "$P" commit -qm edit2
+check "commit-hint does not promise automatic publication" "no" \
+  "$("$CLI" commit-hint "$P" 2>&1 | grep -q 'automatically' && echo yes || echo no)"
 check "commit-hint reminds on .lean commit"       "yes" \
   "$("$CLI" commit-hint "$P" 2>&1 | grep -q 'publish-build' && echo yes || echo no)"
 printf 'y\n' >> "$P/README.md"; gitq "$P" add README.md; gitq "$P" commit -qm doc3
@@ -1585,7 +1688,7 @@ check "fix-perms of an uninstalled version fails"    "1" "$rc"
 # ------------------------------------------------------------------ runner ---
 # Groups are hermetic, so they run concurrently; their output is buffered and
 # replayed in declaration order so a parallel run reads like a serial one.
-SUITES=(static overlay_reset overlay_pick overlay_file overlay_hooks overlay_uninst multiproj hookmono pinnedroot elanwire elancmds install slots noflock seed commithint greenguard store hostslot policy shim selfheal events verify)
+SUITES=(review_regressions static overlay_reset overlay_pick overlay_file overlay_hooks overlay_uninst multiproj hookmono pinnedroot elanwire elancmds install slots noflock seed commithint greenguard store hostslot policy shim selfheal events verify)
 # Deferred to the nightly tier: end-to-end round-trips whose core behaviour a
 # fast-tier group already covers, and which the deploy gate should not pay for.
 # No whole group currently qualifies; see the `if slow ...` cases for the

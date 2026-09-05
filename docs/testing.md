@@ -43,3 +43,13 @@ for every build. No case runs a real Lean build or touches the network.
 Fixture plumbing goes through `gitq` — a commit or checkout in a `use`d repo
 re-enters the CLI through the hooks, which costs more than the git call itself.
 Use `gitc` where the hook firing is the thing under test.
+
+## Real Lean integration
+
+Run `bash test-real-lean.sh /path/to/installed/toolchain` to exercise a real
+Lake build without downloads. The script isolates HOME, the cache, and both
+worktrees. It checks warm replay, hardlinked olean replacement during an edit,
+store immutability, and rejection of an invalid proof after seeding.
+
+The stub suite emulates BSD stat and missing `sha1sum`/`flock` to cover the
+portable helpers. This does not replace running on native macOS.

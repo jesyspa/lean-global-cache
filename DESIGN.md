@@ -100,7 +100,7 @@ Idempotent: a version that already exists is a no-op.
 
 `lean-cache uninstall <version>`:
 
-1. Re-exec as `hostbot` if needed.
+1. Re-exec as `hostbot` if needed and acquire the same version mutex as install.
 2. Remove `lakes/<slug>/packages` if present (refusing if it's not
    owner-owned, same as `install`).
 3. Remove the elan toolchain if present — unless it's elan's *default*
@@ -293,16 +293,17 @@ compiles and memory pressure. Seeding eliminates the redundant work.
 ### Store
 
 A per-user store under `BUILDS` (default `~/.cache/lean-global-cache/builds`)
-holds warm `.lake/build` trees keyed by **(repo identity, exact commit,
-toolchain slug)**:
+holds warm `.lake/build` trees keyed by (repo identity, project-relative path,
+exact commit, toolchain slug):
 
 ```
-<BUILDS>/<repo>-<hash>/<full-commit-sha>/<slug>/{lib,ir,.seed-manifest}
+<BUILDS>/<repo>-v2-<hash>/<full-commit-sha>/<slug>/{lib,ir,.seed-manifest}
 ```
 
-`<repo>-<hash>` is the basename of the repo's shared git dir plus a short hash of
-its realpath, so all worktrees of one repo share a key while distinct repos
-never collide. The store is **single-writer, owner-owned, read-only**: dirs
+`<repo>-v2-<hash>` contains the repository basename and a short hash of its
+shared git directory's realpath plus the project's repository-relative path.
+The same project in linked worktrees shares a key; sibling projects have
+separate entries and retention groups. Only v2 keys are used for lookup. The store is **single-writer, owner-owned, read-only**: dirs
 `755`, files `444`, owned by the publishing user.
 
 Unlike the mathlib package cache, this store is **per-user**, not owned by a
@@ -317,12 +318,18 @@ owner-owned store with an owner-path publish remains possible if ever needed.)
 
 ### `publish-build`
 
-`lean-cache publish-build [path]` runs `lake build` to completion first — so a
-partial or stale tree is never stored (which would later replay as a false
-green) — then snapshots `.lake/build/{lib,ir}` into the store under a per-build
-`flock`, normalizes permissions, and atomically swaps it into place (an existing
-entry is replaced, so it doubles as "refresh after main advances"). It records a
-`published_at` epoch in the manifest and then rotates the store (below).
+`lean-cache publish-build [path]` runs `lake build` to completion, then
+snapshots `.lake/build/{lib,ir}` under the build-store mutex shared with seeding
+and pruning. It checks HEAD and tree cleanliness before building, after
+building, and after copying. A detected change refuses publication. These
+checks are not an isolated build: callers must avoid concurrent source edits
+and builds in the publishing worktree.
+
+Replacement retains the previous entry in a `.old` directory until the new
+entry is installed. Readers cannot observe the rename interval because they
+hold the same mutex. A failed rename restores the previous entry; seeding,
+publishing, and pruning recover a backup left by an interrupted replacement.
+The manifest records `published_at` for rotation.
 
 The manifest also records `tree_clean`: 1 when `lake` exited 0 over a tree
 carrying nothing that could make its build differ from a fresh checkout of HEAD
@@ -335,7 +342,7 @@ so an interrupted or failed rebuild cannot demote an entry already known green.
 ### Rotation
 
 The store would otherwise grow unbounded as `main` advances. The policy: keep
-the **newest build per (repo, toolchain) indefinitely** — that is "latest main",
+the **newest build per (repo, project, toolchain) indefinitely** — that is "latest main",
 the build fresh worktrees will actually seed from — plus the newest *green* build
 per toolchain, so a stream of non-green WIP publishes cannot wash out the
 attestation that a commit compiles; drop any *other* build published more than
@@ -354,12 +361,15 @@ overlay slug is unchanged. It seeds a worktree's `.lake/build` from the store
 **only** when the worktree's HEAD exactly matches a stored build's commit **and**
 the toolchain slug matches. On any mismatch — or no stored build — it seeds
 nothing and lets the normal cold/incremental build run. It never approximates, so
-it can never make Lake replay a stale olean as a false green. The exact-(commit,
-slug) gate is the whole safety argument: identical commit ⇒ byte-identical
-sources ⇒ every module legitimately replays.
+project entries do not cross commit or toolchain boundaries. Lake still checks
+source and dependency freshness when building; matching HEAD alone does not
+imply an unmodified working tree.
 
-When HEAD does match, seeding **replaces** whatever `.lake/build` already holds
-(clearing `lib`/`ir` first, so a stale leftover leaves no orphan oleans). It does
+When HEAD does match, seeding copies into a temporary directory under
+`.lake/build` while holding the store mutex. Only after copying succeeds does
+it replace local `lib`/`ir`, dropping orphan artifacts. A copy failure leaves
+the existing local build intact. Callers must avoid concurrent builds in the
+same worktree while seeding. It does
 not preserve an existing build: the worktrees this targets are long-lived and
 reused across tenants, so they typically carry a `.lake/build` from an earlier
 commit, and preserving it is exactly what forces the full rebuild seeding exists
@@ -446,14 +456,14 @@ held (fd 8) until the process exits; a child build inherits
 `LEAN_CACHE_BUILD_SLOT_HELD` and rides the parent's slot rather than deadlocking
 on it. `LEAN_CACHE_BUILD_SLOTS=0` disables serialization.
 
-macOS ships no `flock(1)`, which every lock described above is built on
-(`have_flock` checks for it once per process). On such a host the build slot
-degrades the same way as
-`LEAN_CACHE_BUILD_SLOTS=0`: unserialized, with a one-time warning to stderr.
-The install and publish mutexes below degrade too, but they are not just a
-speed concession — they guard the shared cache against concurrent writers —
-so on macOS `lean-cache` prints a warning that concurrent runs are unsafe and
-proceeds unlocked; the operator must run one `lean-cache` operation at a time.
+Without `flock(1)`, build slots run unserialized with a warning. Correctness
+mutexes use atomic `mkdir` instead: install and uninstall share a version lock,
+and publishers, seeders, and pruning share `$BUILDS/.store.lock.d`. With flock,
+the latter uses `$BUILDS/.store.lock`. Both mutex backends fail promptly on
+contention, allowing the caller to retry; hook callers skip a busy seed.
+Directory mutexes are removed on normal exit. A killed holder can leave one
+behind; remove it only after confirming no operation still holds it. Keep the
+available lock backend consistent across concurrent invocations.
 
 ### Foreground bail on a cold build
 
@@ -705,7 +715,7 @@ step.
   `admin/migrate-ownership.sh` (no corresponding lake cache).
 - **Disk.** Each version is ~7–9 GB. No automatic GC; `uninstall` is manual.
 - **Build store rotation.** The warm-build store keeps the newest build per
-  (repo, toolchain) indefinitely and drops other builds past `BUILD_KEEP_DAYS`
+  (repo, project, toolchain) indefinitely and drops other builds past `BUILD_KEEP_DAYS`
   (default 7), rotated after each `publish-build`, on demand via `prune-builds`,
   and opportunistically at the end of `use` (at most once a day, guarded by a
   `$BUILDS/.last-prune` stamp file) — so a repo that stops being published to

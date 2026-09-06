@@ -860,6 +860,17 @@ case "$2" in
 esac
 ST
 chmod +x "$BSD/stat"
+# no_flock_path hides sha1sum along with flock, so the CLI takes its BSD branch
+# and calls `shasum -a 1`. On this host shasum ships in perl's core_perl dir,
+# which is not on every caller's PATH, so stand it up here instead of depending
+# on the ambient one.
+REAL_SHA1SUM="$(command -v sha1sum)"; export REAL_SHA1SUM
+cat > "$BSD/shasum" <<'SH'
+#!/usr/bin/env bash
+[[ "$1 $2" == "-a 1" ]] || exit 1
+exec "$REAL_SHA1SUM"
+SH
+chmod +x "$BSD/shasum"
 NFPATH="$BSD:$NFPATH"
 
 # cmd_slots: reports serialization unavailable instead of probing locks.

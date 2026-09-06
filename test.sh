@@ -22,6 +22,13 @@ CLI="$REPO_DIR/bin/lean-cache"
 # on who ran it. Clear them once here; the cases that care set both explicitly.
 unset CLAUDE_BASH_MODE CLAUDECODE
 
+# Fixtures that write straight into a build store (rather than through the CLI,
+# which normalizes what it writes) inherit the caller's umask. A group-writable
+# umask makes those files trip the seed-time group/other-writable guard, so the
+# case under test never runs. Pin the umask so a run means the same thing under
+# every caller's.
+umask 022
+
 RUN_SLOW="${BOTS_RUN_SLOW:-0}"
 fail=0
 note() { echo "  $*"; }

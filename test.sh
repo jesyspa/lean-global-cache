@@ -1703,10 +1703,63 @@ rc=0; LEAN_CACHE_OWNER="$(id -un)" LEAN_CACHE_ROOT="$VROOT" "$CLI" fix-perms v9.
 check "fix-perms of an uninstalled version fails"    "1" "$rc"
 }
 
+group_deploy() {
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+DROOT="$TMP/cache"; DBIN="$TMP/bin/lean-cache"; DCONF="$TMP/lean-cache.conf"
+cat > "$DCONF" <<EOF
+OWNER=$(id -un)
+GROUP=$(id -gn)
+ROOT=$DROOT
+BIN=$DBIN
+INSTALL_LAKE_SHIM=1
+EOF
+
+run_deploy() { LEAN_CACHE_CONF="$DCONF" "$REPO_DIR/deploy.sh" >/dev/null 2>&1; }
+echo "== deployment (hermetic) =="
+rc=0; run_deploy || rc=$?
+check "deploy exits 0"                              "0" "$rc"
+check "deploy installs the complete CLI"            "yes" "$(cmp -s "$CLI" "$DBIN" && echo yes || echo no)"
+check "deploy installs the complete lake shim"      "yes" "$(cmp -s "$REPO_DIR/bin/lake-shim" "$TMP/bin/lake" && echo yes || echo no)"
+check "installed CLI is executable"                 "755" "$(mode "$DBIN")"
+check "installed shim is executable"                "755" "$(mode "$TMP/bin/lake")"
+check "deploy creates cache root with required mode" "2755" "$(mode "$DROOT")"
+check "deploy creates lakes with required mode"     "2755" "$(mode "$DROOT/lakes")"
+check "deploy creates elan with required mode"      "2755" "$(mode "$DROOT/elan")"
+check "deploy creates log dir setgid+sticky"        "3775" "$(mode "$DROOT/log")"
+check "deployed CLI reads the deployment config"    "$DROOT" \
+  "$(LEAN_CACHE_CONF="$DCONF" "$DBIN" config | awk '$1=="root:"{print $2}')"
+check "deploy provisions no cache versions"         "0" \
+  "$(find "$DROOT/lakes" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
+
+# A repeat must repair executable contents and modes without changing behavior.
+printf 'damaged\n' >> "$DBIN"; chmod 0700 "$DBIN"
+rc=0; run_deploy || rc=$?
+check "deploy is safely rerunnable"                  "0" "$rc"
+check "rerun repairs CLI contents"                   "yes" "$(cmp -s "$CLI" "$DBIN" && echo yes || echo no)"
+check "rerun repairs CLI mode"                       "755" "$(mode "$DBIN")"
+
+# Turning the shim off removes only our marked shim. A foreign executable in
+# the same slot is never deleted.
+printf 'INSTALL_LAKE_SHIM=0\n' >> "$DCONF"
+run_deploy
+check "disabling shim removes managed shim"          "no" "$([[ -e "$TMP/bin/lake" ]] && echo yes || echo no)"
+printf '#!/usr/bin/env bash\necho foreign\n' > "$TMP/bin/lake"; chmod +x "$TMP/bin/lake"
+run_deploy
+check "disabling shim preserves foreign lake"       "foreign" "$("$TMP/bin/lake")"
+
+# The owner guard must fire before creating any destination.
+BADROOT="$TMP/bad-cache"; BADBIN="$TMP/bad-bin/lean-cache"
+rc=0; LEAN_CACHE_CONF=/nonexistent LEAN_CACHE_OWNER=not-the-current-user \
+  LEAN_CACHE_GROUP="$(id -gn)" LEAN_CACHE_ROOT="$BADROOT" LEAN_CACHE_BIN="$BADBIN" \
+  "$REPO_DIR/deploy.sh" >/dev/null 2>&1 || rc=$?
+check "deploy rejects the wrong owner"               "1" "$rc"
+check "wrong-owner deploy writes nothing"            "no" "$([[ -e "$BADROOT" || -e "$BADBIN" ]] && echo yes || echo no)"
+}
+
 # ------------------------------------------------------------------ runner ---
 # Groups are hermetic, so they run concurrently; their output is buffered and
 # replayed in declaration order so a parallel run reads like a serial one.
-SUITES=(review_regressions static overlay_reset overlay_pick overlay_file overlay_hooks overlay_uninst multiproj hookmono pinnedroot elanwire elancmds install slots noflock seed commithint greenguard store hostslot policy shim selfheal events verify)
+SUITES=(review_regressions static deploy overlay_reset overlay_pick overlay_file overlay_hooks overlay_uninst multiproj hookmono pinnedroot elanwire elancmds install slots noflock seed commithint greenguard store hostslot policy shim selfheal events verify)
 # Deferred to the nightly tier: end-to-end round-trips whose core behaviour a
 # fast-tier group already covers, and which the deploy gate should not pay for.
 # No whole group currently qualifies; see the `if slow ...` cases for the

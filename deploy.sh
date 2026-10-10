@@ -2,7 +2,9 @@
 # deploy.sh — install the lean-cache CLI and provision the shared cache tree.
 #
 # Installs the CLI to BIN (default: $HOME/.local/bin/lean-cache on a single-user
-# host; a shared path on a multi-user host via the config file). Versions are
+# host; a shared path on a multi-user host via the config file). On a bots host
+# it also installs the `lean` agent skill through bots-host's install-config.
+# Versions are
 # not provisioned here: `lean-cache use` installs the toolchain a project pins
 # the first time it is needed, and `lean-cache list` reports what a host holds.
 # All cache files end up OWNER-owned and not group-writable.
@@ -77,5 +79,24 @@ log "ensuring event log dir $LOG_DIR"
 mkdir -p "$LOG_DIR"
 chgrp "$GROUP" "$LOG_DIR"
 chmod 3775 "$LOG_DIR"
+
+# --- 3. The `lean` agent skill ------------------------------------------------
+# bots-host owns skill rendering, modes and ownership markers, so the skill goes
+# through its installer, with a source that holds only skills/lean/. A host
+# without bots-host has no installer and gets no skill. bots-host keeps the
+# skills root writable by its own user only, so an OWNER that cannot write there
+# skips the skill with a warning rather than failing the CLI deploy.
+BOTS_DIR="${BOTS_ROOT:-/opt/bots}"
+SKILL_INSTALLER="$BOTS_DIR/bin/install-config"
+SKILLS_DIR="${BOTS_SKILLS_DIR:-$BOTS_DIR/skills}"
+if [[ ! -x "$SKILL_INSTALLER" ]]; then
+  log "no $SKILL_INSTALLER; skipping the lean skill"
+elif [[ -d "$SKILLS_DIR/lean" && ! -w "$SKILLS_DIR/lean" ]] ||
+     [[ ! -d "$SKILLS_DIR/lean" && ! -w "$SKILLS_DIR" ]]; then
+  echo "WARNING: $OWNER cannot write $SKILLS_DIR/lean; skipping the lean skill" >&2
+else
+  log "installing the lean skill into $SKILLS_DIR"
+  "$SKILL_INSTALLER" --source "$REPO_DIR/bots" --owner lean-global-cache
+fi
 
 log "deploy complete"

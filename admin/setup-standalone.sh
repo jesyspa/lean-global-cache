@@ -126,6 +126,9 @@ trap 'rm -f "$SUDO_TMP"' EXIT
 cat > "$SUDO_TMP" <<EOF
 # Managed by lean-global-cache (admin/setup-standalone.sh).
 # Any local user may manage the shared Lean cache as its owner, $OWNER.
+# Run it with a clean environment and a fixed PATH: the CLI calls git, lake and
+# coreutils by name, and env_reset alone keeps the caller's PATH.
+Defaults!$BIN env_reset, secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ALL ALL=($OWNER) NOPASSWD: $BIN install *, $BIN uninstall *, $BIN fix-filemode
 EOF
 visudo -cf "$SUDO_TMP" >/dev/null || { echo "sudoers syntax check failed" >&2; exit 1; }

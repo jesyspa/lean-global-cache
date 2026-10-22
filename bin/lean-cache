@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # lean-cache — manage the shared Lean/mathlib package cache.
 #
 # The cache is single-writer: every file is owned by OWNER and is NOT
@@ -54,6 +54,14 @@ ROOT="${LEAN_CACHE_ROOT:-${ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/lean-globa
 # The calling user, resolved once and reused everywhere a function would
 # otherwise re-run `id -un` (log_event, require_owner, register_safe_dirs, ...).
 ME="$(id -un)"
+
+# Under the sudoers rule this runs as OWNER on another user's behalf. sudo's
+# env_reset keeps the caller's PATH unless sudoers sets secure_path, so never
+# resolve commands through it there. (The shebang is absolute for the same
+# reason.)
+if [[ -n "${SUDO_USER:-}" ]]; then
+  PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+fi
 
 SELF="$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 BIN="${LEAN_CACHE_BIN:-${BIN:-$SELF}}"
@@ -138,7 +146,14 @@ log_event() { # args: event [key=value ...]
   local line="$(date +%s)"$'\t'"$ME"$'\t'"$event" kv
   for kv in "$@"; do line+=$'\t'"$kv"; done
   [[ -d "$LOG_DIR" ]] || mkdir -p "$LOG_DIR" 2>/dev/null || return 0
-  printf '%s\n' "$line" >> "$LOG_DIR/events.$ME.log" 2>/dev/null || true
+  # LOG_DIR is group-writable, and the kernel's symlink protection only covers
+  # world-writable sticky dirs: another member could plant events.$ME.log as a
+  # symlink to a file we can write. Create it exclusively (noclobber refuses an
+  # existing path, symlinks included), then append only to a regular file we own.
+  local f="$LOG_DIR/events.$ME.log"
+  [[ -e "$f" || -L "$f" ]] || (set -C; : > "$f") 2>/dev/null || true
+  [[ ! -L "$f" && -f "$f" && -O "$f" ]] || return 0
+  printf '%s\n' "$line" >> "$f" 2>/dev/null || true
   return 0
 }
 
@@ -1099,6 +1114,16 @@ _install_exit() {
     ok="$ok" forced="${INSTALL_FORCED:-0}"
 }
 
+MATHLIB_URL="https://github.com/leanprover-community/mathlib4"
+
+# True when $1 names a tag in mathlib4 and no branch of the same name exists.
+mathlib_rev_is_tag() { # arg: rev
+  local refs
+  refs="$(git ls-remote --tags --heads "$MATHLIB_URL" "$1")" || return 1
+  [[ $'\n'"$refs"$'\n' == *$'\t'"refs/tags/$1"$'\n'* ]] || return 1
+  [[ $'\n'"$refs"$'\n' != *$'\t'"refs/heads/$1"$'\n'* ]]
+}
+
 cmd_install() {
   local force=0 rest=()
   for a in "$@"; do
@@ -1172,9 +1197,15 @@ defaultTargets = []
 
 [[require]]
 name = "mathlib"
-git = "https://github.com/leanprover-community/mathlib4"
+git = "$MATHLIB_URL"
 rev = "$REV"
 EOF
+
+  # `lake update` runs mathlib's lakefile as OWNER, so the rev must be one of
+  # mathlib's release tags. Lake would also resolve a branch of that name, and
+  # many contributors can push branches to mathlib4.
+  mathlib_rev_is_tag "$REV" \
+    || die "$REV is not a mathlib release tag (or a branch shares its name) — refusing to build it as $OWNER"
 
   log "resolving mathlib $REV and its dependency closure (lake update)"
   ( cd "$build" && lake update mathlib )

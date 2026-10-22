@@ -1,0 +1,27 @@
+# Blocks direct pushes to the target branch so changes land through the land
+# gate, and names the authoring session on each commit. See `request-land
+# init` and /opt/bots/docs/bots-host/landing.md.
+# Why attribution hooks may skip: see RequiredHook.deployed_entry in bots_host/precommit_hooks.py.
+default_install_hook_types: [pre-push, prepare-commit-msg, commit-msg]
+repos:
+  - repo: local
+    hooks:
+      - id: guard-main-push
+        name: block direct pushes to main (land through the land gate)
+        entry: sh -c 'g="${BOTS_ROOT:-/opt/bots}/bin/guard-main-push"; [ -x "$g" ] && exec "$g"; echo "guard-main-push unavailable at $g" >&2; exit 1'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+      - id: instance-trailer
+        name: append instance-id trailer
+        entry: sh -c 'g="${BOTS_ROOT:-/opt/bots}/bin/append-instance-trailer"; [ -x "$g" ] && exec "$g" "$@"; echo "append-instance-trailer skipped (no bots-host deployment at $g)" >&2' --
+        language: system
+        stages:
+        - prepare-commit-msg
+      - id: instance-attribution
+        name: fail a managed session's commit that names no author
+        entry: sh -c 'g="${BOTS_ROOT:-/opt/bots}/bin/check-instance-attribution"; [ -x "$g" ] && exec "$g" "$@"; echo "check-instance-attribution skipped (no bots-host deployment at $g)" >&2' --
+        language: system
+        stages:
+        - commit-msg

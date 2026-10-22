@@ -50,6 +50,18 @@ can still *invoke* them, but the resulting files are always OWNER-owned.
 Read-only subcommands run unprivileged. On a single-user host where the caller
 IS already `OWNER`, the re-exec is skipped entirely.
 
+The re-exec runs commands as `OWNER` on a caller's behalf, so the caller must
+not be able to choose what runs:
+
+- The sudoers file pins `env_reset` and a `secure_path` for the binary. sudo's
+  `env_reset` alone keeps the caller's `PATH`.
+- The CLI has an absolute `#!/bin/bash` shebang, and under sudo it resets `PATH`
+  itself. This covers hosts whose sudoers file predates the `Defaults` line.
+- `install` runs mathlib's lakefile as `OWNER`. It first checks with
+  `git ls-remote` that `REV` is a mathlib4 tag and that no branch has the same
+  name, since Lake would also resolve a branch and many contributors can push
+  branches.
+
 ### Why read-only is enough for consumers
 
 A consuming project overlays its `.lake/packages` onto the shared
@@ -602,6 +614,11 @@ The log dir is shared like the cache, but the file name embeds the writer
 (`events.<user>.log`), so every file has exactly one writer. This preserves the
 single-writer model that governs the rest of the tree — no file is ever written
 by two users — without a lock: concurrent writers touch disjoint files.
+Because any group member can create files in the dir, a user could plant
+`events.<other>.log` as a symlink before `<other>` first logs. The kernel's
+symlink protection does not cover it, since the dir is not world-writable.
+`log_event` therefore creates its file with noclobber and appends only to a
+regular file it owns.
 `deploy.sh` provisions the dir mode `3775` (setgid so files inherit `$GROUP`,
 sticky so a group member cannot remove another's file), the first real consumer
 of the `GROUP` setting. On a single-user host the dir sits under the user's own

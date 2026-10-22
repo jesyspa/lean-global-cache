@@ -1,0 +1,9 @@
+# land-gate.yaml — gates this repo through the bots-host land gate.
+# The gate runs test_cmd on each rebased candidate and lands it only if
+# that passes. See `request-land init` and
+# /opt/bots/docs/bots-host/landing.md.
+test_cmd: ["./test.sh"]
+# target_branch: main          # default: origin/HEAD
+# review:
+#   extra_standards: |
+#     - <repo-specific review rules, appended to the packaged brief>

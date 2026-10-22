@@ -27,6 +27,8 @@ Order:
 3. `sudo ./admin/install-sudoers.sh` — install `/etc/sudoers.d/lean-cache`
    so any GROUP-member user can run `lean-cache install`/`uninstall`/
    `set-default-toolchain`/`fix-filemode`/`fix-perms` as OWNER.
+   The file also sets `env_reset` and `secure_path` for the binary. Re-run this
+   step on hosts whose sudoers file predates that `Defaults` line.
 
 After all three, deploy the repo through the hostbot deploy-handler as usual;
 `deploy.sh` installs the CLI.

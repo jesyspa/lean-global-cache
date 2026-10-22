@@ -94,6 +94,24 @@ LK
   chmod +x "$1/lake"
 }
 
+# install checks mathlib's refs with `git ls-remote` before building. This stub
+# answers that offline: every requested rev is a tag, and also a branch when
+# LSREMOTE_BRANCH=1. Any other git call goes to the real git.
+write_git_stub() { # write_git_stub <dir>  (caller uses $1/git)
+  mkdir -p "$1"
+  cat > "$1/git" <<GS
+#!/usr/bin/env bash
+if [[ "\$1" == ls-remote ]]; then
+  rev="\${!#}"
+  printf '0000000000000000000000000000000000000001\trefs/tags/%s\n' "\$rev"
+  [[ "\${LSREMOTE_BRANCH:-0}" == 1 ]] && printf '0000000000000000000000000000000000000002\trefs/heads/%s\n' "\$rev"
+  exit 0
+fi
+exec $(command -v git) "\$@"
+GS
+  chmod +x "$1/git"
+}
+
 # A copy of $PATH with every `flock` executable hidden, so the have_flock
 # degrade paths (the macOS case: no flock(1) at all) can be exercised on a
 # host that does have it. Any PATH directory holding a flock executable is
@@ -689,6 +707,7 @@ fi
 exit "${LAKE_RC:-0}"
 LK
 chmod +x "$ISTUB/lake"
+write_git_stub "$ISTUB"
 
 # (a) Contend the only slot with zero wait: install must still complete AND
 # announce it degraded to unserialized — proving it tried to take a slot.
@@ -731,6 +750,14 @@ check "force rebuild replaced the packages tree"  "NEW" \
   "$(cat "$TMP/cache/lakes/v4-55-0/packages/mathlib/.lake/build/lib/M.olean" 2>/dev/null)"
 check "force rebuild left no scratch dirs"        "0" \
   "$(find "$TMP/cache/lakes/v4-55-0" -maxdepth 1 -name '.packages.*' 2>/dev/null | wc -l)"
+
+# A rev that is also a mathlib4 branch is refused before lake runs mathlib's
+# lakefile as OWNER: Lake could resolve the branch instead of the tag.
+: > "$TMP/i.log"
+rc=0; PATH="$ISTUB:$PATH" LEAN_CACHE_BUILD_LOCK_DIR="$TMP" LSREMOTE_BRANCH=1 \
+  LAKE_LOG="$TMP/i.log" "$CLI" install 4.57.0 >/dev/null 2>&1 || rc=$?
+check "install refuses a rev that is also a branch" "1" "$rc"
+check "refused install never ran lake"             "0" "$(grep -c . "$TMP/i.log")"
 
 # (d) `use`'s foreground auto-install bail (fix in cmd_use) and its overrides,
 # exercised offline via the stubs: a plain foreground call bails (75) and
@@ -908,6 +935,7 @@ fi
 exit 0
 LK
 chmod +x "$ISTUB/lake"
+write_git_stub "$ISTUB"
 out="$(PATH="$ISTUB:$NFPATH" "$CLI" install 4.55.0 2>&1)"; rc=$?
 check "install succeeds with no flock on PATH"      "0"   "$rc"
 check "install published the version"               "yes" "$(has_dir "$TMP/cache/lakes/v4-55-0/packages")"
@@ -1515,6 +1543,13 @@ check "use created this user's log file"       "yes" "$([[ -f "$evlog" ]] && ech
 check "use event records the slug"             "v4-30-0" "$(ev_field "$evlog" use slug)"
 check "use event auto_install=0"               "0" "$(ev_field "$evlog" use auto_install)"
 check "seed miss logged on first use"          "0" "$(ev_field "$evlog" seed hit)"
+
+# Another group member can create files in the shared log dir. A planted
+# events.<user>.log symlink must not redirect that user's appends.
+PL="$TMP/plantlog"; mkdir -p "$PL"; : > "$TMP/victim"
+ln -s "$TMP/victim" "$PL/events.$(id -un).log"
+LEAN_CACHE_LOG_DIR="$PL" "$CLI" use "$EV" >/dev/null 2>&1
+check "log_event does not follow a planted symlink" "0" "$(wc -c < "$TMP/victim")"
 
 # publish: build (stub) to completion and store, logging a publish event.
 mkdir -p "$EV/.lake/build/lib/lean/Proj"

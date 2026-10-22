@@ -27,6 +27,9 @@ trap 'rm -f "$TMP"' EXIT
 cat > "$TMP" <<EOF
 # Managed by lean-global-cache (admin/install-sudoers.sh).
 # Allow $GROUP-group users to manage the shared Lean cache as its owner, $OWNER.
+# Run it with a clean environment and a fixed PATH: the CLI calls git, lake and
+# coreutils by name, and env_reset alone keeps the caller's PATH.
+Defaults!$BIN env_reset, secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 %$GROUP ALL=($OWNER) NOPASSWD: $BIN install *, \\
 $(printf '%*s' ${#GROUP} '')            $BIN uninstall *, \\
 $(printf '%*s' ${#GROUP} '')            $BIN set-default-toolchain *, \\

@@ -125,8 +125,8 @@ completion regardless.
 an RC like `4.30.0-rc2`. Bare `major.minor` expands to `major.minor.0`;
 otherwise the version is exact — there is no "latest patch" resolution.
 
-`install`, `uninstall`, and `set-default-toolchain` re-exec as the cache owner
-via sudo on a multi-user host. Everything else needs no privilege.
+For multi-user sudo entry points, trusted inputs, and enforcement limits, see
+[Security boundary on shared hosts](DESIGN.md#security-boundary-on-shared-hosts).
 
 `stats` reads the event log the CLI appends to at
 `$LOG_DIR/events.<user>.log`, one line per mutating or build-policy operation.

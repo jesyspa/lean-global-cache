@@ -44,23 +44,72 @@ only read. This is enforced two ways:
   dirs) on everything it writes, so readability does not depend on the caller's
   environment.
 
-Mutating subcommands (`install`/`uninstall`) re-exec as `OWNER` via a
-tightly-scoped sudoers rule (`admin/install-sudoers.sh`), so any group member
-can still *invoke* them, but the resulting files are always OWNER-owned.
-Read-only subcommands run unprivileged. On a single-user host where the caller
-IS already `OWNER`, the re-exec is skipped entirely.
+### Security boundary on shared hosts
 
-The re-exec runs commands as `OWNER` on a caller's behalf, so the caller must
-not be able to choose what runs:
+Use this section when granting sudo access or changing owner-side execution.
+The privileged identity here is the cache `OWNER`, with that account's file
+and execution permissions; the CLI does not request root execution.
 
-- The sudoers file pins `env_reset` and a `secure_path` for the binary. sudo's
-  `env_reset` alone keeps the caller's `PATH`.
-- The CLI has an absolute `#!/bin/bash` shebang, and under sudo it resets `PATH`
-  itself. This covers hosts whose sudoers file predates the `Defaults` line.
-- `install` runs mathlib's lakefile as `OWNER`. It first checks with
-  `git ls-remote` that `REV` is a mathlib4 tag and that no branch has the same
-  name, since Lake would also resolve a branch and many contributors can push
-  branches.
+`bin/lean-cache::require_owner` re-execs the installed `BIN` using
+`sudo -n -u "$OWNER"` for these entry points:
+
+| Command / entry point | Owner-side work |
+|---|---|
+| `install` / `cmd_install` | provision a toolchain, execute mathlib's Lake code, publish packages |
+| `uninstall` / `cmd_uninstall` | remove packages and toolchain |
+| `set-default-toolchain` / `cmd_set_default` | write elan's default toolchain setting |
+| `fix-filemode` / `cmd_fix_filemode` | change cached repositories' Git configuration |
+| `fix-perms` / `cmd_fix_perms` | normalize cached package permissions |
+
+When the caller is already `OWNER`, `require_owner` returns without sudo.
+Other commands run as the caller; `use` can invoke `install` when a pinned
+version is missing. `admin/install-sudoers.sh` grants group members passwordless access to
+the table's commands at the configured `BIN`. The separate
+`admin/setup-standalone.sh` grants all local users access to `install`,
+`uninstall`, and `fix-filemode`; its rule does not grant the other entries.
+
+Required invariant: caller-controlled `PATH`, environment, revision arguments,
+and writable log paths must not select code executed as `OWNER`. Trust the
+installed CLI and its parent directories, owner-side shell configuration,
+command search directories (including `$ROOT/elan/bin`), toolchains, and
+mathlib release code only when unprivileged consumers cannot replace them.
+Configuration is executable shell code. The owner account and administrators
+are inside this trust boundary; consuming project code is outside it.
+
+Source-verified controls and limits:
+
+- Both sudoers generators pin the executable path and set `env_reset` and
+  `secure_path`. `bin/lean-cache` uses `#!/bin/bash`, resets `PATH` when
+  `SUDO_USER` is present, and prepends the shared elan bin directory. The
+  re-exec changes directory to `/` and forwards command arguments without
+  explicitly forwarding environment overrides.
+- Config resolution at CLI startup sources a shell file and resolves `OWNER`,
+  `GROUP`, and `ME` with external `id` calls before the CLI's `PATH` reset.
+  Therefore that reset alone does not enforce the invariant: without the
+  sudoers `secure_path`, an inherited caller `PATH` can select early `id`
+  execution as `OWNER`. The generated rule supplies this protection; the CLI
+  fallback is insufficient on its own.
+- Owner-side config selection and environment overrides use the normal
+  [configuration mechanism](README.md#configuration). The CLI does not
+  independently check their provenance or permissions. Effective sudo policy
+  must prevent caller overrides from selecting owner-side configuration or
+  executable search paths; inspect local environment-preservation rules and
+  the owner account's config as part of granting access.
+- `normalize_version` restricts version syntax. Before `lake update`,
+  `cmd_install` calls `mathlib_rev_is_tag` against the fixed mathlib4 URL,
+  requiring a tag with no same-named branch. Lake then resolves that name;
+  the check does not pin an immutable commit across the lookup and fetch.
+  Release tags, upstream code, and owner-side Git configuration remain trusted.
+- `log_event` treats telemetry as best-effort data: it creates a missing file
+  with noclobber and appends only after checking that the path is a regular,
+  non-symlink file owned by the executing user. These are pathname checks
+  followed by a separate open, not an atomic guarantee against replacement.
+  Safety depends on directory ownership and permissions preventing callers
+  from replacing an accepted file or its parent directories. Log contents are
+  read by `cmd_stats`, not executed.
+
+These observations describe repository code, not an audit of a host's active
+sudo policy, environment filtering, filesystem permissions, or upstream code.
 
 ### Why read-only is enough for consumers
 

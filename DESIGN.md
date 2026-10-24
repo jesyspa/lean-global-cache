@@ -740,14 +740,7 @@ Standard hostbot deploy-handler repo. `deploy.sh` (as `OWNER`):
 3. ensures `ROOT/{lakes,elan}` exist `2755`,
 4. ensures the event-log dir (`LOG_DIR`, default `ROOT/log`) exists `3775`
    (setgid+sticky, group `GROUP`), so any group member writes its own
-   `events.<user>.log` but cannot remove another's,
-5. installs the `lean` agent skill (`bots/skills/lean/`) with bots-host's
-   `$BOTS_ROOT/bin/install-config --source bots --owner lean-global-cache`.
-   bots-host renders the skill and owns its modes and the
-   `.installed-by-lean-global-cache` marker. A host without that installer
-   gets no skill. bots-host keeps the skills root writable by its own user, so
-   an `OWNER` that cannot write `skills/lean` gets a warning and no skill
-   while the rest of the deploy proceeds.
+   `events.<user>.log` but cannot remove another's.
 
 It provisions no versions. Which versions a host holds is host state, and the
 cache tree already records it: `lakes/<slug>/packages/` exists for exactly the

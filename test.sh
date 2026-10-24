@@ -1749,17 +1749,10 @@ BIN=$DBIN
 INSTALL_LAKE_SHIM=1
 EOF
 
-# A stub bots-host installer records how deploy.sh calls it, so no run of this
-# suite reaches the host's real skills tree.
-DBOTS="$TMP/bots"; mkdir -p "$DBOTS/bin" "$DBOTS/skills"
-printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\n' "$TMP/install-config.calls" \
-  > "$DBOTS/bin/install-config"
-chmod +x "$DBOTS/bin/install-config"
 run_deploy() {
-  BOTS_ROOT="$DBOTS" BOTS_SKILLS_DIR="" LEAN_CACHE_CONF="$DCONF" \
+  LEAN_CACHE_CONF="$DCONF" \
     "$REPO_DIR/deploy.sh" >/dev/null 2>&1
 }
-calls() { cat "$TMP/install-config.calls" 2>/dev/null || true; }
 echo "== deployment (hermetic) =="
 rc=0; run_deploy || rc=$?
 check "deploy exits 0"                              "0" "$rc"
@@ -1775,26 +1768,6 @@ check "deployed CLI reads the deployment config"    "$DROOT" \
   "$(LEAN_CACHE_CONF="$DCONF" "$DBIN" config | awk '$1=="root:"{print $2}')"
 check "deploy provisions no cache versions"         "0" \
   "$(find "$DROOT/lakes" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
-check "deploy installs the lean skill"              "--source $REPO_DIR/bots --owner lean-global-cache" \
-  "$(calls)"
-check "skill source holds only skills/lean"         "skills/lean/SKILL.md" \
-  "$(cd "$REPO_DIR/bots" && find . -type f | sed 's|^\./||')"
-
-# An owner that cannot write the skills tree skips the skill, not the deploy;
-# a host without the installer has no skill to install.
-rm -f "$TMP/install-config.calls"
-if [[ "$(id -u)" != 0 ]]; then
-  chmod 0555 "$DBOTS/skills"
-  rc=0; run_deploy || rc=$?
-  chmod 0755 "$DBOTS/skills"
-  check "unwritable skills tree still deploys"        "0" "$rc"
-  check "unwritable skills tree skips the installer"  "" "$(calls)"
-fi
-chmod -x "$DBOTS/bin/install-config"
-rc=0; run_deploy || rc=$?
-chmod +x "$DBOTS/bin/install-config"
-check "deploy without an installer exits 0"         "0" "$rc"
-check "deploy without an installer skips the skill" "" "$(calls)"
 
 # A repeat must repair executable contents and modes without changing behavior.
 printf 'damaged\n' >> "$DBIN"; chmod 0700 "$DBIN"

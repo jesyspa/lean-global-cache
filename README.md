@@ -23,8 +23,7 @@ bare install it correctly reports both as missing.
 **Multi-user host** — copy [`lean-cache.conf.example`](lean-cache.conf.example)
 to `/etc/lean-cache/lean-cache.conf` and edit it, do the one-time root setup in
 [admin/README.md](admin/README.md), then run `deploy.sh`. That installs the CLI
-to `BIN` and the `lake` shim beside it. On a bots host it also installs the
-`lean` agent skill through bots-host's `install-config`. It provisions no versions — `use`
+to `BIN` and the `lake` shim beside it. It provisions no versions — `use`
 installs a project's pinned toolchain the first time it is needed.
 
 ## Use it in a project

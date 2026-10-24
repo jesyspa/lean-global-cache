@@ -79,7 +79,7 @@ chgrp "$GROUP" "$LOG_DIR"
 chmod 3775 "$LOG_DIR"
 
 # --- 3. Retire the `lean` agent skill ownership ------------------------------
-# Policy: DESIGN.md#deployment. Removable once every host has deployed.
+# See DESIGN.md#deployment.
 BOTS_DIR="${BOTS_ROOT:-/opt/bots}"
 SKILL_INSTALLER="$BOTS_DIR/bin/install-config"
 SKILLS_DIR="${BOTS_SKILLS_DIR:-$BOTS_DIR/skills}"

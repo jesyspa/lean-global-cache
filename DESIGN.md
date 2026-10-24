@@ -743,11 +743,13 @@ Standard hostbot deploy-handler repo. `deploy.sh` (as `OWNER`):
    `events.<user>.log` but cannot remove another's,
 5. retires any `lean` agent skill ownership it holds: when
    `skills/lean/.installed-by-lean-global-cache` exists and
-   `$BOTS_ROOT/bin/install-config` is executable, it runs the installer with an
+   `$BOTS_ROOT/bin/install-config` is executable, it runs the installer with a
    source holding an empty `skills/` directory and `--owner lean-global-cache`.
    When another owner also marks `skills/lean`, only this owner's marker is
-   removed; when none does, the `skills/lean` directory is deleted. An `OWNER` that cannot write `skills/lean` gets a warning
-   while the rest of the deploy proceeds.
+   removed and the directory stays; when this owner is the sole owner,
+   install-config deletes the `skills/lean` directory. An `OWNER` that cannot
+   write `skills/lean` gets a warning while the rest of the deploy proceeds.
+   This step can be removed once every host has deployed.
 
 It provisions no versions. Which versions a host holds is host state, and the
 cache tree already records it: `lakes/<slug>/packages/` exists for exactly the

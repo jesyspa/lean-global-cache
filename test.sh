@@ -1781,7 +1781,7 @@ check "deployed CLI reads the deployment config"    "$DROOT" \
 check "deploy provisions no cache versions"         "0" \
   "$(find "$DROOT/lakes" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
 
-# Skill retirement: DESIGN.md#deployment.
+# See DESIGN.md#deployment.
 check "deploy without a skill marker skips the installer" "" "$(calls)"
 mkdir -p "$DBOTS/skills/lean"; : > "$DBOTS/skills/lean/.installed-by-lean-global-cache"
 rc=0; run_deploy || rc=$?

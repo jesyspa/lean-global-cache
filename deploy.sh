@@ -78,4 +78,22 @@ mkdir -p "$LOG_DIR"
 chgrp "$GROUP" "$LOG_DIR"
 chmod 3775 "$LOG_DIR"
 
+# --- 3. Retire the `lean` agent skill ownership ------------------------------
+# Policy: DESIGN.md#deployment. Removable once every host has deployed.
+BOTS_DIR="${BOTS_ROOT:-/opt/bots}"
+SKILL_INSTALLER="$BOTS_DIR/bin/install-config"
+SKILLS_DIR="${BOTS_SKILLS_DIR:-$BOTS_DIR/skills}"
+if [[ -x "$SKILL_INSTALLER" && -e "$SKILLS_DIR/lean/.installed-by-lean-global-cache" ]]; then
+  if [[ ! -w "$SKILLS_DIR/lean" ]]; then
+    echo "WARNING: $OWNER cannot write $SKILLS_DIR/lean; skipping the lean skill retirement" >&2
+  else
+    log "retiring lean-global-cache ownership of $SKILLS_DIR/lean"
+    EMPTY_SRC="$(mktemp -d)"
+    mkdir "$EMPTY_SRC/skills"
+    "$SKILL_INSTALLER" --source "$EMPTY_SRC" --owner lean-global-cache || {
+      rm -rf "$EMPTY_SRC"; exit 1; }
+    rm -rf "$EMPTY_SRC"
+  fi
+fi
+
 log "deploy complete"

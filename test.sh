@@ -1749,8 +1749,20 @@ BIN=$DBIN
 INSTALL_LAKE_SHIM=1
 EOF
 
+# A stub bots-host installer records how deploy.sh calls it, so no run of this
+# suite reaches the host's real skills tree.
+DBOTS="$TMP/bots"; mkdir -p "$DBOTS/bin" "$DBOTS/skills"
+cat > "$DBOTS/bin/install-config" <<STUB
+#!/usr/bin/env bash
+# install-config prunes only when the source ships a skills directory.
+empty=no
+[[ -d "\$2/skills" && -z "\$(ls -A "\$2/skills")" ]] && empty=yes
+printf '%s skills-empty=%s\n' "\$*" "\$empty" >> "$TMP/install-config.calls"
+STUB
+chmod +x "$DBOTS/bin/install-config"
+calls() { cat "$TMP/install-config.calls" 2>/dev/null || true; }
 run_deploy() {
-  LEAN_CACHE_CONF="$DCONF" \
+  BOTS_ROOT="$DBOTS" BOTS_SKILLS_DIR="" LEAN_CACHE_CONF="$DCONF" \
     "$REPO_DIR/deploy.sh" >/dev/null 2>&1
 }
 echo "== deployment (hermetic) =="
@@ -1768,6 +1780,14 @@ check "deployed CLI reads the deployment config"    "$DROOT" \
   "$(LEAN_CACHE_CONF="$DCONF" "$DBIN" config | awk '$1=="root:"{print $2}')"
 check "deploy provisions no cache versions"         "0" \
   "$(find "$DROOT/lakes" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
+
+# Skill retirement: DESIGN.md#deployment.
+check "deploy without a skill marker skips the installer" "" "$(calls)"
+mkdir -p "$DBOTS/skills/lean"; : > "$DBOTS/skills/lean/.installed-by-lean-global-cache"
+rc=0; run_deploy || rc=$?
+check "deploy with a skill marker exits 0"          "0" "$rc"
+check "deploy retires the skill with an empty source" "yes" \
+  "$(calls | grep -qE -- '^--source /[^ ]+ --owner lean-global-cache skills-empty=yes$' && ! calls | grep -q "$REPO_DIR" && echo yes || echo no)"
 
 # A repeat must repair executable contents and modes without changing behavior.
 printf 'damaged\n' >> "$DBIN"; chmod 0700 "$DBIN"

@@ -2,7 +2,14 @@
 # Optional offline integration test. Pass an installed Lean toolchain directory.
 # Runs real Lake/Lean with isolated HOME, cache and projects; downloads nothing.
 set -euo pipefail
-CLI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bin/lean-cache"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_scratch_lib="${BOTS_HOST_SOURCE_ROOT:-${BOTS_LIB:-/opt/bots/lib}}"
+if [[ -z "${BOTS_PRIVATE_SCRATCH:-}" ]]; then
+    exec python3 -I "$_scratch_lib/substrate/testkit/private_scratch.py" run -- bash "$SCRIPT_DIR/test-real-lean.sh" "$@"
+fi
+python3 -I "$_scratch_lib/substrate/testkit/private_scratch.py" verify
+unset _scratch_lib
+CLI="$SCRIPT_DIR/bin/lean-cache"
 TC="$(cd "${1:?usage: bash test-real-lean.sh /path/to/toolchain}" && pwd)"
 [[ -x "$TC/bin/lake" && -x "$TC/bin/lean" ]] || exit 2
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT

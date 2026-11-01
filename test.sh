@@ -13,6 +13,12 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_scratch_lib="${BOTS_HOST_SOURCE_ROOT:-${BOTS_LIB:-/opt/bots/lib}}"
+if [[ -z "${BOTS_PRIVATE_SCRATCH:-}" ]]; then
+    exec python3 -I "$_scratch_lib/substrate/testkit/private_scratch.py" run -- bash "$REPO_DIR/test.sh" "$@"
+fi
+python3 -I "$_scratch_lib/substrate/testkit/private_scratch.py" verify
+unset _scratch_lib
 CLI="$REPO_DIR/bin/lean-cache"
 
 # The cold-build policy reads CLAUDE_BASH_MODE *and* CLAUDECODE (see

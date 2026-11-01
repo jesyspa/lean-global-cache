@@ -13,15 +13,15 @@ repos:
         pass_filenames: false
         always_run: true
         stages: [pre-push]
-      - id: instance-trailer
-        name: append instance-id trailer
-        entry: sh -c 'g="${BOTS_ROOT:-/opt/bots}/bin/append-instance-trailer"; [ -x "$g" ] && exec "$g" "$@"; echo "append-instance-trailer skipped (no bots-host deployment at $g)" >&2' --
+      - id: wisp-trailer
+        name: append authoring-session trailer
+        entry: sh -c 'g="${BOTS_ROOT:-/opt/bots}/bin/append-wisp-trailer"; [ -x "$g" ] && exec "$g" "$@"; echo "append-wisp-trailer skipped (no bots-host deployment at $g)" >&2' --
         language: system
         stages:
         - prepare-commit-msg
-      - id: instance-attribution
+      - id: wisp-attribution
         name: fail a managed session's commit that names no author
-        entry: sh -c 'g="${BOTS_ROOT:-/opt/bots}/bin/check-instance-attribution"; [ -x "$g" ] && exec "$g" "$@"; echo "check-instance-attribution skipped (no bots-host deployment at $g)" >&2' --
+        entry: sh -c 'g="${BOTS_ROOT:-/opt/bots}/bin/check-wisp-attribution"; [ -x "$g" ] && exec "$g" "$@"; echo "check-wisp-attribution skipped (no bots-host deployment at $g)" >&2' --
         language: system
         stages:
         - commit-msg

@@ -20,7 +20,16 @@ if [[ "$(id -un)" != "$OWNER" ]]; then
   exit 1
 fi
 
+# A handler deploy (BOTS_DEPLOY_OUT set) writes shared-bin entries into the
+# output tree, which the handler publishes into the host stage; the live
+# /opt/bots/bin is never written. Entries absent from the tree are removed on
+# publish, so the shim-removal step below only acts on the single-user path.
 BIN_DST="$BIN"
+HANDLER_DEPLOY=0
+if [[ -n "${BOTS_DEPLOY_OUT:-}" && "$BIN" == /opt/bots/bin/* ]]; then
+  HANDLER_DEPLOY=1
+  BIN_DST="$BOTS_DEPLOY_OUT/bin/${BIN#/opt/bots/bin/}"
+fi
 
 umask 022
 log() { echo "==> $*"; }
@@ -54,7 +63,7 @@ LAKE_SHIM_DST="$(dirname "$BIN_DST")/lake"
 if [[ "$INSTALL_LAKE_SHIM" == 1 ]]; then
   log "installing $LAKE_SHIM_DST"
   install_atomic "$REPO_DIR/bin/lake-shim" "$LAKE_SHIM_DST"
-elif grep -q 'LEAN_CACHE_LAKE_SHIM' "$LAKE_SHIM_DST" 2>/dev/null; then
+elif [[ "$HANDLER_DEPLOY" == 0 ]] && grep -q 'LEAN_CACHE_LAKE_SHIM' "$LAKE_SHIM_DST" 2>/dev/null; then
   log "removing $LAKE_SHIM_DST (INSTALL_LAKE_SHIM off)"
   rm -f "$LAKE_SHIM_DST"
 fi

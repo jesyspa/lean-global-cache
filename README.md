@@ -11,20 +11,43 @@ limitations.
 
 ## Install
 
-**Single-user host** — get `elan` on your PATH first; the CLI drives it but does
-not install it (`elan-init.sh` from elan.lean-lang.org). Then put
-`bin/lean-cache` on your PATH. The cache lands in
-`~/.local/share/lean-global-cache`, you own it, and no config file or sudo is
-involved. The cache and the shared toolchain dir stay empty until the first
-`lean-cache use` in a project, which creates them and installs that project's
-pinned toolchain. `lean-cache check-env` reports the wiring after that; on a
-bare install it correctly reports both as missing.
+### Standalone install
 
-**Multi-user host** — copy [`lean-cache.conf.example`](lean-cache.conf.example)
+The executable install is just two self-contained Bash scripts: `bin/lean-cache`
+and the optional `bin/lake-shim`. No build step or hostbot deployment machinery
+is required. Get `elan` on your PATH first; the CLI drives it but does not
+install it (`elan-init.sh` from elan.lean-lang.org).
+
+For a single-user install, run from this checkout:
+
+```bash
+mkdir -p "$HOME/.local/bin"
+install -m 0755 bin/lean-cache "$HOME/.local/bin/lean-cache"
+# Optional: route bare lake build through the shared build policy.
+install -m 0755 bin/lake-shim "$HOME/.local/bin/lake"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Keep the shim beside `lean-cache` and its directory ahead of the real `lake` on
+PATH. Add the PATH setting to your shell configuration to keep it across sessions.
+
+The cache lands in `~/.local/share/lean-global-cache`, you own it, and no config
+file or sudo is involved. The cache and the shared toolchain dir stay empty
+until the first `lean-cache use` in a project, which creates them and installs
+that project's pinned toolchain. `lean-cache check-env` reports the wiring
+after that; on a bare install it correctly reports both as missing.
+
+### Shared hosts and managed deployment
+
+For a multi-user host, copy [`lean-cache.conf.example`](lean-cache.conf.example)
 to `/etc/lean-cache/lean-cache.conf` and edit it, do the one-time root setup in
-[admin/README.md](admin/README.md), then run `deploy.sh`. That installs the CLI
-to `BIN` and the `lake` shim beside it, and performs the [deployment steps](DESIGN.md#deployment). It provisions no versions — `use`
-installs a project's pinned toolchain the first time it is needed.
+[admin/README.md](admin/README.md), then run `deploy.sh` as the configured owner.
+It installs the scripts and provisions shared directories; see
+[Deployment](DESIGN.md#deployment) for the steps.
+
+On hostbot-managed hosts, use the deploy handler and the
+[shared-bin deployment contract](DESIGN.md#deployment). Direct standalone
+installation belongs in a directory you manage, such as `~/.local/bin`.
 
 ## Use it in a project
 

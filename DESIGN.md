@@ -733,10 +733,18 @@ rejected — this is also what keeps the sudoers wildcard safe.
 
 ## Deployment
 
-Standard hostbot deploy-handler repo. `deploy.sh` (as `OWNER`):
+`deploy.sh` runs as `OWNER`. On a hostbot handler deployment with `BIN` under
+`/opt/bots/bin`, it writes the scripts into `$BOTS_DEPLOY_OUT/bin` for the
+handler to publish under substrate's
+[host-stage deployment contract](https://github.com/jesyspa-bots/substrate/blob/main/docs/substrate/library-release.md#host-stage-generations).
+The handler owns the live shared-bin entries. For standalone installation,
+see [Install](README.md#install).
 
-1. installs `bin/lean-cache` to `BIN`,
-2. installs the transparent `lake` shim (`bin/lake-shim`) as `$(dirname BIN)/lake`,
+The deployment steps are:
+
+1. installs `bin/lean-cache` to `BIN` (redirected to the handler output when applicable),
+2. when `INSTALL_LAKE_SHIM=1`, installs the transparent `lake` shim
+   (`bin/lake-shim`) beside the CLI as `lake`,
 3. ensures `ROOT/{lakes,elan}` exist `2755`,
 4. ensures the event-log dir (`LOG_DIR`, default `ROOT/log`) exists `3775`
    (setgid+sticky, group `GROUP`), so any group member writes its own

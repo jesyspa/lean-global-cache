@@ -1,0 +1,16 @@
+version = 1
+
+[[extension]]
+point = "substrate.config_tree"
+name = "lean-tag-prompts"
+object = "lean_global_cache.config_trees:tag_prompts"
+
+[[extension]]
+point = "substrate.config_tree"
+name = "lean-tag-setup"
+object = "lean_global_cache.config_trees:tag_setup"
+
+[[extension]]
+point = "substrate.config_tree"
+name = "lean-tag-teardown"
+object = "lean_global_cache.config_trees:tag_teardown"

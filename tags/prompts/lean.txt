@@ -1,0 +1,16 @@
+This is a Lean 4 project using Mathlib.
+
+Key conventions:
+- Use Mathlib freely. Ask before adding other dependencies.
+- `sorry` is acceptable during development; mark it with a comment explaining why.
+- Workflow: definitions first, then sorry'd statements, then real proofs.
+- Remove `#check` and `#eval` when done. Fix all linter warnings.
+- Make key predicates `Decidable`; derive `DecidableEq` and `Repr` on inductive types.
+- Use `@[simp]` lemmas for impossible cases.
+- `ReflTransGen` constructors are `refl` and `tail`, not `head`.
+- `List.getElem?` with bracket syntax `Γ[x]?` — `List.get?` is gone.
+- `convert` needs `import Mathlib.Tactic.Convert`.
+- Helper theorems should be `lemma`, not `theorem`.
+- For tactics, proof patterns, and other pitfalls, see the `lean` skill.
+The Mathlib build cache is shared, read-only, and managed by `lean-cache`. `.lake/packages` is a real directory holding one symlink per shared package — that is the correct state, so do not try to "repair" it to a whole-directory symlink. Git operations maintain the cache automatically: hooks re-run the overlay on every checkout, switch, reset, cherry-pick, rebase, and worktree add, repointing Mathlib for the project's toolchain and seeding `.lake/build` from the warm store when a stored build matches the commit. Work in the checkout you are given and switch branches normally — no manual setup is needed.
+`.lake/build` rebuilds incrementally and starts warm when a stored build matches your commit. Before trusting `#eval`/LSP diagnostics on a cold project, run `lake build` (or `lake build <Target>` for the chain you need) to warm `.lake/build` first — a wrong-looking diagnostic there usually just means the project is unbuilt. If a build would take too long to finish in the foreground, `lake build` tells you to re-run it in the background and notifies you when it completes; follow that prompt. Run `lean-cache publish-build` to store the warm build for later checkouts. When fixing one part of a huge file, lift that part into a small scratch file with its dependencies stubbed (`sorry`) and iterate there for cheap recompiles, then slice the finished piece back in.

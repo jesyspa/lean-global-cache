@@ -31,6 +31,11 @@ if [[ -n "${BOTS_DEPLOY_OUT:-}" && "$BIN" == /opt/bots/bin/* ]]; then
   BIN_DST="$BOTS_DEPLOY_OUT/bin/${BIN#/opt/bots/bin/}"
 fi
 
+if [[ -n "${BOTS_DEPLOY_OUT:-}" ]]; then
+  python3 -m substrate.repo_output "$REPO_DIR" "$BOTS_DEPLOY_OUT"
+  python3 -B -P -m substrate.config_install install --source "$REPO_DIR" --owner lean-global-cache
+fi
+
 umask 022
 log() { echo "==> $*"; }
 

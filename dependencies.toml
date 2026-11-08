@@ -1,3 +1,6 @@
 version = 1
 repo = "lean-global-cache"
-requires = []
+requires = ["substrate", "wisp-api"]
+
+[python]
+packages = ["lean_global_cache"]

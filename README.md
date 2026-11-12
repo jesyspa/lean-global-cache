@@ -113,6 +113,12 @@ sessions don't stack several thrashing builds onto the same cores;
 `lean-cache slots` shows which are held. `LEAN_CACHE_BUILD_SLOTS=0` turns
 serialization off.
 
+Every build the policy runs (warm, incremental or cold) can be confined with
+`LEAN_CACHE_BUILD_CPUS` (a `taskset -c` CPU list such as `0,1,4,5`) and
+`LEAN_CACHE_BUILD_NICE` (an integer for `nice -n`), so builds on a shared host
+leave other cores alone. A malformed value fails the build. Without
+`taskset(1)` the CPU list is ignored with a warning.
+
 Without `flock(1)` (including stock macOS), build slots run unserialized and
 `lean-cache slots` reports serialization unavailable. Cache operations still
 lock: install/uninstall share a version mutex, and publishing, seeding, and
@@ -165,6 +171,8 @@ Env var beats config file beats built-in default.
 | BIN | `LEAN_CACHE_BIN` | realpath of the running `lean-cache` |
 | INSTALL_LAKE_SHIM | `LEAN_CACHE_INSTALL_LAKE_SHIM` | `0` (no `lake` shim) |
 | LOG_DIR | `LEAN_CACHE_LOG_DIR` | `$ROOT/log` |
+| BUILD_CPUS | `LEAN_CACHE_BUILD_CPUS` | empty (no pinning) |
+| BUILD_NICE | `LEAN_CACHE_BUILD_NICE` | empty (niceness unchanged) |
 
 If `LEAN_CACHE_CONF` is set it is the only config file read. Otherwise the
 first existing of `~/.config/lean-cache/lean-cache.conf`,

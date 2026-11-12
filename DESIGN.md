@@ -517,6 +517,13 @@ held (fd 8) until the process exits; a child build inherits
 `LEAN_CACHE_BUILD_SLOT_HELD` and rides the parent's slot rather than deadlocking
 on it. `LEAN_CACHE_BUILD_SLOTS=0` disables serialization.
 
+Independently of slots, every lake build the policy runs goes through one helper
+(`build_limit_prefix`, used by `run_lake_build`) that prefixes the real lake
+with `taskset -c $LEAN_CACHE_BUILD_CPUS` and/or `nice -n $LEAN_CACHE_BUILD_NICE`
+when set, so builds can be kept off cores that benchmarks are pinned to. Values
+are validated at build start and fail the build when malformed; a host without
+`taskset` warns once and runs unpinned, like the flock fallback.
+
 Without `flock(1)`, build slots run unserialized with a warning. Correctness
 mutexes use atomic `mkdir` instead: install and uninstall share a version lock,
 and publishers, seeders, and pruning share `$BUILDS/.store.lock.d`. With flock,

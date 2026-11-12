@@ -1427,6 +1427,52 @@ check "stored-warm build classifies as warm (fg)" "1" "$(grep -c '^lake build' "
 check "stored-warm build does not bail"          "0" "$rc"
 }
 
+group_buildlimit() {
+new_cache
+STUB="$TMP/stub"; write_lake_stub "$STUB"
+P="$TMP/proj"; new_hooked_project "$P"
+mkdir -p "$P/.lake/build/lib/lean/Proj"; printf 'OLE' > "$P/.lake/build/lib/lean/Proj/A.olean"
+# taskset and nice stubs record their argv, then run the rest of the command. Only
+# calls that wrap the build (next word is env or nice) count: the host's find
+# wrapper also runs under nice.
+for t in taskset nice; do
+  printf '#!/usr/bin/env bash\n[[ "$3" == env || "$3" == nice ]] && echo "%s $1 $2" >> "$LIMIT_LOG"\nshift 2; exec "$@"\n' "$t" > "$STUB/$t"
+  chmod +x "$STUB/$t"
+done
+
+echo "== build CPU/nice limits (hermetic) =="
+: > "$TMP/lim.log"; : > "$TMP/lim.lake"
+PATH="$STUB:$PATH" LIMIT_LOG="$TMP/lim.log" LAKE_LOG="$TMP/lim.lake" "$CLI" build "$P" >/dev/null 2>&1
+check "no limits set: no taskset/nice"           "" "$(cat "$TMP/lim.log")"
+PATH="$STUB:$PATH" LIMIT_LOG="$TMP/lim.log" LAKE_LOG="$TMP/lim.lake" \
+  LEAN_CACHE_BUILD_CPUS=0,2-3 LEAN_CACHE_BUILD_NICE=7 "$CLI" build "$P" >/dev/null 2>&1
+check "limits wrap the build in taskset+nice"    "taskset -c 0,2-3
+nice -n 7" "$(cat "$TMP/lim.log")"
+check "wrapped build still runs lake"            "2" "$(grep -c '^lake build' "$TMP/lim.lake")"
+check "config prints resolved limits"            "0,2-3 7" \
+  "$(LEAN_CACHE_BUILD_CPUS=0,2-3 LEAN_CACHE_BUILD_NICE=7 "$CLI" config | awk '$1=="cpus:"{c=$2} $1=="nice:"{n=$2} END{print c" "n}')"
+
+: > "$TMP/lim.lake"; rc=0
+out="$(PATH="$STUB:$PATH" LAKE_LOG="$TMP/lim.lake" LEAN_CACHE_BUILD_CPUS=a,b "$CLI" build "$P" 2>&1)" || rc=$?
+check "garbage CPU list fails the build"         "1" "$rc"
+check "garbage CPU list names the value"         "yes" "$(grep -q "'a,b'" <<<"$out" && echo yes || echo no)"
+check "garbage CPU list runs no lake"            "0" "$(grep -c '^lake build' "$TMP/lim.lake")"
+rc=0; PATH="$STUB:$PATH" LAKE_LOG="$TMP/lim.lake" LEAN_CACHE_BUILD_NICE=high "$CLI" build "$P" >/dev/null 2>&1 || rc=$?
+check "garbage nice fails the build"             "1" "$rc"
+
+# Without taskset: warn, run unpinned. Hide the real one behind a PATH of symlinks.
+rm -f "$STUB/taskset"
+NT="$TMP/notaskset"; mkdir -p "$NT"
+for d in /usr/bin /bin; do
+  for f in "$d"/*; do [[ "${f##*/}" == taskset ]] || ln -sf "$f" "$NT/${f##*/}" 2>/dev/null; done
+done
+: > "$TMP/lim.lake"; rc=0
+out="$(PATH="$STUB:$NT" LAKE_LOG="$TMP/lim.lake" LEAN_CACHE_BUILD_CPUS=0 "$CLI" build "$P" 2>&1)" || rc=$?
+check "no taskset: build still succeeds"         "0" "$rc"
+check "no taskset: build runs lake"              "1" "$(grep -c '^lake build' "$TMP/lim.lake")"
+check "no taskset: warns"                        "yes" "$(grep -q 'taskset(1) not found' <<<"$out" && echo yes || echo no)"
+}
+
 group_shim() {
 new_cache
 STUB="$TMP/stub"; write_lake_stub "$STUB"
@@ -1803,7 +1849,7 @@ check "wrong-owner deploy writes nothing"            "no" "$([[ -e "$BADROOT" ||
 # ------------------------------------------------------------------ runner ---
 # Groups are hermetic, so they run concurrently; their output is buffered and
 # replayed in declaration order so a parallel run reads like a serial one.
-SUITES=(review_regressions static deploy overlay_reset overlay_pick overlay_file overlay_hooks overlay_uninst multiproj hookmono pinnedroot elanwire elancmds install slots noflock seed commithint greenguard store hostslot policy shim selfheal events verify)
+SUITES=(review_regressions static deploy overlay_reset overlay_pick overlay_file overlay_hooks overlay_uninst multiproj hookmono pinnedroot elanwire elancmds install slots noflock seed commithint greenguard store hostslot buildlimit policy shim selfheal events verify)
 # Deferred to the nightly tier: end-to-end round-trips whose core behaviour a
 # fast-tier group already covers, and which the deploy gate should not pay for.
 # No whole group currently qualifies; see the `if slow ...` cases for the

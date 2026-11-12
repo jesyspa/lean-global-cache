@@ -33,3 +33,8 @@ INSTALL_LAKE_SHIM=1
 # $ROOT/log; deploy.sh provisions it setgid+sticky so each group member writes
 # only its own events.<user>.log. Uncomment to relocate.
 # LOG_DIR=/opt/bots/lean/log
+
+# Confine every policy-run lake build to a CPU set and/or niceness (empty = no
+# change). BUILD_CPUS is a taskset CPU list.
+# BUILD_CPUS=0,1,4,5
+# BUILD_NICE=10

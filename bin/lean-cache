@@ -85,6 +85,12 @@ BUILDS="${LEAN_CACHE_BUILDS:-${BUILDS:-${XDG_CACHE_HOME:-$HOME/.cache}/lean-glob
 # this many days ago is pruned. Override with LEAN_CACHE_BUILD_KEEP_DAYS.
 BUILD_KEEP_DAYS="${LEAN_CACHE_BUILD_KEEP_DAYS:-${BUILD_KEEP_DAYS:-7}}"
 
+# CPU confinement for every lake build the policy runs: a taskset CPU list
+# (e.g. 0,1,4,5) and a nice increment. Empty means no pinning / no change.
+# Same env > config > default precedence; validated when a build starts.
+BUILD_CPUS="${LEAN_CACHE_BUILD_CPUS:-${BUILD_CPUS:-}}"
+BUILD_NICE="${LEAN_CACHE_BUILD_NICE:-${BUILD_NICE:-}}"
+
 # Append-only event log (telemetry for the warm-build machinery). The dir is
 # shared like the cache, but every user writes only its OWN file
 # ($LOG_DIR/events.<user>.log), so the single-writer model holds: one writer per
@@ -300,7 +306,7 @@ Usage: $PROG <command> [args]
   list                  List installed versions with disk usage.
   resolve <version>     Print the normalized toolchain / rev / slug for a
                         version string (no side effects).
-  config                Print the four resolved config values (owner/group/root/bin).
+  config                Print the resolved config values (owner/group/root/bin/builds/cpus/nice).
   check-env             Check that this user's environment is wired to the cache
                         (toolchain on PATH, cache readable, repos git-trusted).
   verify                Read-only sweep of the shared cache's invariants: oleans
@@ -619,6 +625,30 @@ real_lake() {
   printf '%s' "$REAL_LAKE"
 }
 
+# Fill LIMIT_CMD with the taskset/nice prefix for BUILD_CPUS/BUILD_NICE. Dies
+# on a malformed value; without taskset(1) (macOS) warns once and leaves the
+# CPU list unapplied.
+LIMIT_CMD=()
+_WARNED_NO_TASKSET=0
+build_limit_prefix() {
+  LIMIT_CMD=()
+  if [[ -n "$BUILD_CPUS" ]]; then
+    [[ "$BUILD_CPUS" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] \
+      || die "invalid LEAN_CACHE_BUILD_CPUS '$BUILD_CPUS' (want a taskset CPU list like 0,1,4-5)"
+    if command -v taskset >/dev/null 2>&1; then
+      LIMIT_CMD+=(taskset -c "$BUILD_CPUS")
+    elif [[ "$_WARNED_NO_TASKSET" -eq 0 ]]; then
+      _WARNED_NO_TASKSET=1
+      log "WARNING: taskset(1) not found; running unpinned, ignoring LEAN_CACHE_BUILD_CPUS=$BUILD_CPUS"
+    fi
+  fi
+  if [[ -n "$BUILD_NICE" ]]; then
+    [[ "$BUILD_NICE" =~ ^-?[0-9]+$ ]] \
+      || die "invalid LEAN_CACHE_BUILD_NICE '$BUILD_NICE' (want an integer)"
+    LIMIT_CMD+=(nice -n "$BUILD_NICE")
+  fi
+}
+
 # Run `lake build` in $1 with git's hook-injected environment scrubbed and a
 # heartbeat line every 30s, so a session watching a silent non-TTY pipe can tell
 # a minutes-long build is alive. The scrub matters when we run under a git hook
@@ -629,7 +659,8 @@ real_lake() {
 run_lake_build() { # args: root message-prefix [lake build args...]
   local root="$1" who="$2" pid hb rc=0 lake; shift 2
   lake="$(real_lake)"
-  ( cd "$root" && env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX \
+  build_limit_prefix
+  ( cd "$root" && ${LIMIT_CMD[@]+"${LIMIT_CMD[@]}"} env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX \
       -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY -u GIT_QUARANTINE_PATH "$lake" build "$@" ) &
   pid=$!
   # The heartbeat (and the sleep it is in the middle of when killed) must not
@@ -2081,8 +2112,8 @@ cmd_commit_hint() {
 
 cmd_config() {
   [[ $# -eq 0 ]] || usage
-  printf 'owner:  %s\ngroup:  %s\nroot:   %s\nbin:    %s\nbuilds: %s\n' \
-    "$OWNER" "$GROUP" "$ROOT" "$BIN" "$BUILDS"
+  printf 'owner:  %s\ngroup:  %s\nroot:   %s\nbin:    %s\nbuilds: %s\ncpus:   %s\nnice:   %s\n' \
+    "$OWNER" "$GROUP" "$ROOT" "$BIN" "$BUILDS" "$BUILD_CPUS" "$BUILD_NICE"
 }
 
 # Summarize the event log: read every readable events.*.log, keep events within

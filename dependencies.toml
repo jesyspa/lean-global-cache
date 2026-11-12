@@ -3,4 +3,4 @@ repo = "lean-global-cache"
 requires = ["substrate", "wisp-api"]
 
 [python]
-packages = ["lean_global_cache"]
+packages = { lean_global_cache = "lean_global_cache" }

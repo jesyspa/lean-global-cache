@@ -19,6 +19,13 @@ if [[ -z "${BOTS_PRIVATE_SCRATCH:-}" ]]; then
 fi
 python3 -I "$_scratch_lib/substrate/testkit/private_scratch.py" verify
 unset _scratch_lib
+
+# Test scopes: docs/substrate/testing.md § Test scopes.
+scope_selection="$(PYTHONPATH="${BOTS_HOST_SOURCE_ROOT:-${BOTS_LIB:-/opt/bots/lib}}" python3 -P -m substrate.test_scope select)"
+if [[ "$scope_selection" != all ]]; then
+  echo "no tests selected at this scope"
+  exit 0
+fi
 CLI="$REPO_DIR/bin/lean-cache"
 
 # The cold-build policy reads CLAUDE_BASH_MODE *and* CLAUDECODE (see
